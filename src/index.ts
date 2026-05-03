@@ -2,8 +2,8 @@
 // © 2026 Michael Maurizi Jr.
 
 /**
- * ctopo — cloud-optimized container + topojson-style primitives. Holds
- * a quantized topology, per-layer geometry, and per-feature properties
+ * cloud-topo — cloud-optimized container + topojson-style primitives.
+ * Holds a quantized topology, per-layer geometry, and per-feature properties
  * in one HTTP-Range-friendly file; primitives mirror topojson-client
  * (`merge`, `mergeArcs`, `neighbors`, `feature`, `bbox`, …) but fetch
  * only the arc coord slices they need.
@@ -33,13 +33,17 @@ export {
 } from "./reader";
 export {
   CtopoClient,
+  openContainer,
+  type OpenContainerOptions,
+} from "./client";
+export {
+  type FetchPriority,
+  type MultiRangeResult,
+  type RangeFetcher,
   makeBufferFetcher,
   makeHttpFetcher,
   makeRangeFetcher,
-  openContainer,
-  type OpenContainerOptions,
-  type RangeFetcher,
-} from "./client";
+} from "./fetcher";
 export {
   bbox,
   merge,

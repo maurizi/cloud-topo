@@ -6,6 +6,7 @@ import { describe, expect, it } from "vitest";
 import { type Topology } from "topojson-specification";
 
 import { encodeContainer, rewriteContainer } from "../encode";
+import { CtopoClient, makeBufferFetcher } from "../client";
 import {
   MAGIC,
   VERSION_MAJOR,
@@ -128,6 +129,73 @@ function fixtureTopology(): Topology {
   };
 }
 
+// Two-layer fixture used by the tier-reorder + spatial-sort tests:
+// 4 base units arranged in a 2×2 row grouped into 2 top-layer
+// parents (left half + right half). Arcs are non-quantized with
+// distinct first-x coordinates so any one can be recovered from
+// arc_coords by index. Tier classification:
+//   0..3: top-layer outside edges  (count=1 in top arc_refs → tier 0)
+//   4..5: top-layer inner boundary (count=2 in top arc_refs → tier 1)
+//   6..7: base-only boundaries     (only in base arc_refs    → tier 2)
+function makeSpatialSortFixture(): Topology {
+  return {
+    type: "Topology",
+    arcs: [
+      [
+        [10, 0],
+        [10, 1],
+      ],
+      [
+        [20, 0],
+        [20, 1],
+      ],
+      [
+        [30, 0],
+        [30, 1],
+      ],
+      [
+        [40, 0],
+        [40, 1],
+      ],
+      [
+        [50, 0],
+        [50, 1],
+      ],
+      [
+        [60, 0],
+        [60, 1],
+      ],
+      [
+        [70, 0],
+        [70, 1],
+      ],
+      [
+        [80, 0],
+        [80, 1],
+      ],
+    ],
+    bbox: [0, 0, 100, 1],
+    objects: {
+      block: {
+        type: "GeometryCollection",
+        geometries: [
+          { type: "Polygon", arcs: [[6, 0]], properties: { id: "A" } },
+          { type: "Polygon", arcs: [[~6, 4, 1]], properties: { id: "B" } },
+          { type: "Polygon", arcs: [[7, ~4, 2]], properties: { id: "C" } },
+          { type: "Polygon", arcs: [[~7, 5, 3]], properties: { id: "D" } },
+        ],
+      },
+      county: {
+        type: "GeometryCollection",
+        geometries: [
+          { type: "Polygon", arcs: [[0, 4, 2, ~5]], properties: { id: "L" } },
+          { type: "Polygon", arcs: [[~5, 1, 4, ~3]], properties: { id: "R" } },
+        ],
+      },
+    },
+  };
+}
+
 describe("ctopo format", () => {
   it("writes magic + version in the front header and section_count in the footer", async () => {
     const buf = await encodeContainer(fixtureTopology());
@@ -205,13 +273,12 @@ describe("ctopo format", () => {
     expect(ids.get(0)).toBe("L");
     expect(ids.get(1)).toBe("R");
 
-    // arc_coords — opaque blob; varint-encoded so length depends on
-    // delta magnitudes. Just check dtype + non-empty + matches the
-    // last arcOffsets entry.
+    // arc_coords — block-compressed blob. The on-disk length is the
+    // compressed size (smaller than the logical size arc_offsets
+    // indexes into). Just check dtype + non-empty.
     const arcCoordsEntry = sections.find((s) => s.name === "arc_coords")!;
     expect(arcCoordsEntry.dtype).toBe("blob");
     expect(arcCoordsEntry.length).toBeGreaterThan(0);
-    expect(arcOffsets[arcOffsets.length - 1]).toBe(arcCoordsEntry.length);
   });
 
   it("places front-loaded sections (CSR triples + arc_coords) before lazy properties", async () => {
@@ -221,6 +288,7 @@ describe("ctopo format", () => {
     // open-time prefetch GET can cover them. arc_coords is included
     // because its tier-ordered prefix holds the skeleton blocks.
     const frontLoadedNames = [
+      "arc_coord_blocks",
       "arc_offsets",
       "block/poly_offsets",
       "block/ring_offsets",
@@ -254,184 +322,105 @@ describe("ctopo format", () => {
     );
   });
 
-  it("reorders arcs by tier so coarser-layer boundaries land first", async () => {
+  it("reorders arcs in visit order (top layer first, then base-only)", async () => {
     // Two-layer fixture: 4 base units arranged in a 2×2 grid grouped
     // into 2 top-layer parents (left half + right half). Arcs:
-    //   0..3: top-layer outside edges  (count=1 in top arc_refs → tier 0)
-    //   4..5: top-layer inner boundary (count=2 in top arc_refs → tier 1)
-    //   6..7: base-only boundaries     (only in base arc_refs    → tier 2)
+    //   0..3: top-layer outside edges
+    //   4..5: top-layer inner boundary
+    //   6..7: base-only boundaries
     //
-    // Topology gives them out-of-order; encoder should pack tier 0 →
-    // tier 1 → tier 2 in arc_coords.
-    const topology: Topology = {
-      type: "Topology",
-      arcs: [
-        // Use distinct, identifiable points so we can recover original
-        // arc identity from the encoded coords.
-        [
-          [10, 0],
-          [10, 1],
-        ],
-        [
-          [20, 0],
-          [20, 1],
-        ],
-        [
-          [30, 0],
-          [30, 1],
-        ],
-        [
-          [40, 0],
-          [40, 1],
-        ],
-        [
-          [50, 0],
-          [50, 1],
-        ],
-        [
-          [60, 0],
-          [60, 1],
-        ],
-        [
-          [70, 0],
-          [70, 1],
-        ],
-        [
-          [80, 0],
-          [80, 1],
-        ],
-      ],
-      bbox: [0, 0, 100, 1],
-      objects: {
-        block: {
-          type: "GeometryCollection",
-          geometries: [
-            { type: "Polygon", arcs: [[6, 0]], properties: { id: "A" } },
-            { type: "Polygon", arcs: [[~6, 4, 1]], properties: { id: "B" } },
-            { type: "Polygon", arcs: [[7, ~4, 2]], properties: { id: "C" } },
-            { type: "Polygon", arcs: [[~7, 5, 3]], properties: { id: "D" } },
-          ],
-        },
-        county: {
-          type: "GeometryCollection",
-          geometries: [
-            { type: "Polygon", arcs: [[0, 4, 2, ~5]], properties: { id: "L" } },
-            {
-              type: "Polygon",
-              arcs: [[~5, 1, 4, ~3]],
-              properties: { id: "R" },
-            },
-          ],
-        },
-      },
-    };
+    // Topology gives them out-of-order; encoder walks layers top
+    // (county) → base (block), assigning visit numbers in walk
+    // order, so county arcs land before base-only arcs.
+    const topology = makeSpatialSortFixture();
     const buf = await encodeContainer(topology);
-    const { sections } = parseContainer(buf);
-
-    // Walk arc_offsets to read each new-arc's first point and recover
-    // the original arc index. arc_offsets is gzipped on disk.
-    const arcOffsets = viewSectionAuto(
-      buf,
-      sections.find((s) => s.name === "arc_offsets")!,
-      0,
-    ) as Uint32Array;
-    const coordsEntry = sections.find((s) => s.name === "arc_coords")!;
-    const coordsBytes = viewSection(buf, coordsEntry, 0) as Uint8Array;
-    const view = new DataView(
-      coordsBytes.buffer,
-      coordsBytes.byteOffset,
-      coordsBytes.byteLength,
-    );
-    // Each point is 2×float64 = 16 bytes (no transform).
+    // Use CtopoClient to read through the block-decompression path
+    // (the refactored encoder always block-compresses arc_coords).
+    const client = await CtopoClient.openWith(makeBufferFetcher(buf));
+    const arcIds = Array.from({ length: 8 }, (_, i) => i);
+    const arcBytes = await client.fetchArcs(arcIds);
+    // Each arc has 2 points × 2 float64 = 32 bytes. The first
+    // float64 is the x coordinate; x ∈ {10..80} → original arc = x/10-1.
     const recoveredOrder: number[] = [];
-    for (let newId = 0; newId < arcOffsets.length - 1; newId++) {
-      const x = view.getFloat64(arcOffsets[newId], true);
-      // x ∈ {10, 20, 30, 40, 50, 60, 70, 80} → original arc id is x/10 - 1
+    for (const newId of arcIds) {
+      const bytes = arcBytes.get(newId)!;
+      const dv = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+      const x = dv.getFloat64(0, true);
       recoveredOrder.push(x / 10 - 1);
     }
-    // Within a tier, encoder sorts by first-encounter visit order
-    // (walking county→block, geom→ring→arc). For this fixture:
-    //   visit  : arc 0=0, 4=1, 2=2, 5=3, 1=4, 3=5, 6=6, 7=7
-    //   tier 0 arcs (county outside-edges, count=1 in top): {0,1,2,3}
-    //              sorted by visit → 0, 2, 1, 3
-    //   tier 1 arcs (county interior, count=2):             {4,5}
-    //              sorted by visit → 4, 5
-    //   tier 2 arcs (block-only):                           {6,7}
-    //              sorted by visit → 6, 7
-    expect(recoveredOrder).toEqual([0, 2, 1, 3, 4, 5, 6, 7]);
+    // Encoder front-loads world-outline arcs (arcs whose forward
+    // and reverse reference counts across every geom in every
+    // layer don't cancel — same identity topojson's mergeArcs
+    // uses to compute a union outline). Within each group, ties
+    // break by visit order.
+    // Visit order from the layer walk (county→block):
+    //   county L (arcs [0, 4, 2, ~5]) → visits 0=0, 4=1, 2=2, 5=3
+    //   county R (arcs [~5, 1, 4, ~3]) → 1=4, 3=5
+    //   block layer (Hilbert): A → 6=6, C → 7=7
+    // Outline (fwd≠rev) arcs by visit: 0, 4, 2, 5, 1 →
+    // Non-outline arcs by visit: 3, 6, 7
+    expect(recoveredOrder).toEqual([0, 4, 2, 5, 1, 3, 6, 7]);
   });
 
-  it("emits tierByteOffsets so the client can size an exact skeleton prefetch", async () => {
-    // Same 2-layer fixture as above. Tier 0 = 4 arcs, tier 1 = 2 arcs,
-    // tier 2 = 2 arcs. No transform → float64 points = 16 bytes/pt,
-    // and each arc has 2 points = 32 bytes/arc, so:
-    //   tier 0 ends at byte 4 × 32 = 128
-    //   tier 1 ends at byte 6 × 32 = 192
-    //   tier 2 ends at byte 8 × 32 = 256
-    const topology: Topology = {
-      type: "Topology",
-      arcs: [
-        [
-          [10, 0],
-          [10, 1],
-        ],
-        [
-          [20, 0],
-          [20, 1],
-        ],
-        [
-          [30, 0],
-          [30, 1],
-        ],
-        [
-          [40, 0],
-          [40, 1],
-        ],
-        [
-          [50, 0],
-          [50, 1],
-        ],
-        [
-          [60, 0],
-          [60, 1],
-        ],
-        [
-          [70, 0],
-          [70, 1],
-        ],
-        [
-          [80, 0],
-          [80, 1],
-        ],
-      ],
-      bbox: [0, 0, 100, 1],
-      objects: {
-        block: {
-          type: "GeometryCollection",
-          geometries: [
-            { type: "Polygon", arcs: [[6, 0]], properties: { id: "A" } },
-            { type: "Polygon", arcs: [[~6, 4, 1]], properties: { id: "B" } },
-            { type: "Polygon", arcs: [[7, ~4, 2]], properties: { id: "C" } },
-            { type: "Polygon", arcs: [[~7, 5, 3]], properties: { id: "D" } },
-          ],
-        },
-        county: {
-          type: "GeometryCollection",
-          geometries: [
-            { type: "Polygon", arcs: [[0, 4, 2, ~5]], properties: { id: "L" } },
-            {
-              type: "Polygon",
-              arcs: [[~5, 1, 4, ~3]],
-              properties: { id: "R" },
-            },
-          ],
-        },
-      },
-    };
-    const buf = await encodeContainer(topology);
-    const { meta } = parseContainer(buf);
-    expect(meta.tierByteOffsets).toEqual([128, 192, 256]);
+  it("spatialSort='hilbert' (explicit) produces byte-identical output to default", async () => {
+    // Default has no spatialSort; the explicit value must take the
+    // same code path. Bit-equality across the whole container guards
+    // against any silent regression in the dispatch refactor.
+    const topology = makeSpatialSortFixture();
+    const defBuf = await encodeContainer(topology);
+    const explicitBuf = await encodeContainer(topology, {
+      spatialSort: "hilbert",
+    });
+    expect(Array.from(explicitBuf)).toEqual(Array.from(defBuf));
   });
+
+  // Two invariants every spatialSort variant must hold:
+  //   (1) The output is a valid permutation of the input arcs
+  //       (no duplicates, none missing).
+  //   (2) Top-layer arcs come before base-only arcs in arc_coords.
+  //       The encoder assigns visit numbers top-down across layers
+  //       so deeper-only arcs end up at the file tail. Variants
+  //       differ in WITHIN-layer ordering only.
+  // Exact within-layer order isn't asserted: the fixture is too
+  // small (4 geoms per layer) for the hierarchical variants'
+  // precinct-grouping or within-component walks to differ
+  // meaningfully from Hilbert. The bench is the right tool for
+  // that.
+  for (const sort of [
+    "hierarchical-hilbert",
+    "hierarchical-greedy-path",
+    "hierarchical-str",
+  ] as const) {
+    it(`spatialSort='${sort}' produces a valid permutation; deeper-only arcs come last`, async () => {
+      const topology = makeSpatialSortFixture();
+      const buf = await encodeContainer(topology, { spatialSort: sort });
+      const client = await CtopoClient.openWith(makeBufferFetcher(buf));
+      const arcIds = Array.from({ length: 8 }, (_, i) => i);
+      const arcBytes = await client.fetchArcs(arcIds);
+      const recoveredOrder: number[] = [];
+      for (const newId of arcIds) {
+        const bytes = arcBytes.get(newId)!;
+        const dv = new DataView(
+          bytes.buffer,
+          bytes.byteOffset,
+          bytes.byteLength,
+        );
+        const x = dv.getFloat64(0, true);
+        recoveredOrder.push(x / 10 - 1);
+      }
+      // Exactly the 8 input arcs, no duplicates, no missing.
+      expect(recoveredOrder).toHaveLength(8);
+      expect(new Set(recoveredOrder).size).toBe(8);
+      expect([...recoveredOrder].sort((a, b) => a - b)).toEqual([
+        0, 1, 2, 3, 4, 5, 6, 7,
+      ]);
+      // County-layer arcs (= 0..5) all come before base-only arcs (= 6,7).
+      expect(new Set(recoveredOrder.slice(0, 6))).toEqual(
+        new Set([0, 1, 2, 3, 4, 5]),
+      );
+      expect(new Set(recoveredOrder.slice(6, 8))).toEqual(new Set([6, 7]));
+    });
+  }
 
   it("delta-encodes cumulative-monotone u32 sections; reader undoes it", async () => {
     const buf = await encodeContainer(fixtureTopology());
@@ -470,20 +459,13 @@ describe("ctopo format", () => {
     ).toEqual([0, 4, 8]);
   });
 
-  it("omits tierByteOffsets on single-layer topologies (no tier reordering)", async () => {
-    const buf = await encodeContainer(fixtureTopology());
-    const { meta } = parseContainer(buf);
-    expect(meta.tierByteOffsets).toBeUndefined();
-  });
-
   it("block-compresses arc_coords; tiny inputs skip dict training (sample threshold)", async () => {
     // Trained dict via `zstd --train` requires ≥100 samples (we
     // hard-coded MIN_SAMPLES). The 7-arc fixture only produces a
     // handful of blocks, so the encoder skips the dict entirely
     // and emits arcCoordsBlocks META without dictSection. Reader
-    // back-compat path handles that.
+    // handles this with the no-dict decode path.
     const buf = await encodeContainer(fixtureTopology(), {
-      blockCompressArcCoords: true,
       arcCoordBlockBytes: 32,
     });
     const { meta, sections } = parseContainer(buf);

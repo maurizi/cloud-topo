@@ -95,12 +95,6 @@ export interface ContainerMeta {
   // FlatGeobuf-style escape hatch — JSON-string blob for caller-defined
   // metadata.
   readonly metadata?: string;
-  // Cumulative byte position in arc_coords where each tier ends. Tier 0 =
-  // top-layer outside-edge, tier 1 = top-layer interior, tiers 2..N =
-  // lower layers (highest = base). Lets the client size an exact
-  // "skeleton prefetch" (e.g. tier-0+tier-1 bytes) instead of guessing.
-  // Absent on single-layer topologies (no tier reordering).
-  readonly tierByteOffsets?: ReadonlyArray<number>;
   // When set, arc_coords is block-compressed with zstd: the section's
   // bytes are a concatenation of independently-decodable zstd frames
   // (one per block), each compressed against a shared raw-content
@@ -111,11 +105,10 @@ export interface ContainerMeta {
   // ~60 µs/block extra vs no-dict, recovered many times over by
   // 8-10% smaller arc_coords on the wire.
   //
-  // arc_offsets and tierByteOffsets still reference *logical*
-  // (uncompressed) arc-coord byte positions; the client maps those
-  // through arcCoordsBlocks to find which physical blocks to fetch
-  // and decompress. Absent when arc_coords is stored raw (the
-  // pre-#12 layout).
+  // arc_offsets references *logical* (uncompressed) arc-coord byte
+  // positions; the client maps those through arcCoordsBlocks to find
+  // which physical blocks to fetch and decompress. Absent when
+  // arc_coords is stored raw (the pre-#12 layout).
   readonly arcCoordsBlocks?: {
     // Section name carrying the shared raw-content dictionary
     // (just sample bytes — not a `zstd --train` output). Reader

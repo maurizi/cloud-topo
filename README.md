@@ -90,10 +90,7 @@ import { writeContainer, encodeContainer } from "cloud-topo/encode";
 await writeContainer("output.ctopo", topology);
 
 // Or get a Buffer
-const buf = await encodeContainer(topology, {
-  blockCompressArcCoords: true,   // zstd block compression with shared dict
-  arcCoordDictBytes: 110_000,     // dictionary size
-});
+const buf = await encodeContainer(topology);
 ```
 
 The input is a standard [TopoJSON Topology](https://github.com/topojson/topojson-specification) object. The encoder:

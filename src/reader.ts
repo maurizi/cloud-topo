@@ -80,8 +80,8 @@ export function parseFrontHeader(bytes: Uint8Array): void {
 }
 
 // Parse a footer buffer (section_count + meta_length + section_table
-// + meta_json) into the same shape as the legacy front-header parser
-// produced. The buffer must start at the footer's first byte and be
+// + meta_json) into a ParsedHeader. The buffer must start at the
+// footer's first byte and be
 // at least footer_length bytes long.
 export function parseFooter(footerBytes: Uint8Array): ParsedHeader {
   if (footerBytes.byteLength < FOOTER_PREFIX_SIZE) {

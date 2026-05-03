@@ -265,46 +265,44 @@ describe("CtopoClient", () => {
     expect(requests.length).toBe(2);
   });
 
-  it("speculative arc_coords prefetch lands a fetch on open and serves later fetchArcs from cache", async () => {
+  it("block table + dict are prefetched at open; fetchArcs only needs the block data", async () => {
     const buf = await encodeContainer(fixtureTopology());
     const { fetcher, requests } = recordingFetcher(buf);
-    // Tiny prefetch that covers all 4 fixture arcs (their packed
-    // bytes are well under 4 KiB). The prefetch fires during open
-    // and lands in the byte-range cache.
-    const client = await CtopoClient.openWith(fetcher, {
-      frontPrefetchBytes: 0,
-      arcCoordsPrefetchBytes: 4 * 1024,
-    });
-    // Drain microtasks so the in-flight prefetch resolves before we
-    // count requests; otherwise the assertion is racy.
-    await new Promise((r) => setTimeout(r, 0));
-    const beforeArcs = requests.length;
-
-    // Now fetchArcs — every id should hit the prefetched cache.
-    await client.fetchArcs([0, 1, 2, 3]);
-    expect(requests.length).toBe(beforeArcs);
-  });
-
-  it("a tight per-family gap can force every fetchArcs id into its own GET", async () => {
-    const buf = await encodeContainer(fixtureTopology());
-    const { fetcher, requests } = recordingFetcher(buf);
-    // Negative gap makes the coalescer reject every bridge attempt
-    // (since adjacent items have a non-negative gap). Useful as a
-    // smoke test that the per-family override is wired through —
-    // production sets a wide gap, but the override path is the
-    // same in either direction.
     const client = await CtopoClient.openWith(fetcher, {
       frontPrefetchBytes: 0,
       arcCoordsPrefetchBytes: 0,
       arcOffsetsPrefetchBytes: 0,
-      coalesceGapByFamily: { arcs: -1 },
+    });
+    // Drain microtasks so speculative block-table prefetch resolves.
+    await new Promise((r) => setTimeout(r, 0));
+    const afterOpen = requests.length;
+
+    // fetchArcs needs arc_offsets + the compressed block data.
+    await client.fetchArcs([0, 1, 2, 3]);
+    // At most 2 new GETs: offsets + one block (tiny fixture fits in
+    // one block).
+    expect(requests.length - afterOpen).toBeLessThanOrEqual(2);
+  });
+
+  it("a tight per-family gap splits offset GETs but block-compressed arcs fetch whole blocks", async () => {
+    const buf = await encodeContainer(fixtureTopology());
+    const { fetcher, requests } = recordingFetcher(buf);
+    // Negative gap makes the coalescer reject every bridge attempt
+    // for offsets (since adjacent items have a non-negative gap).
+    // Block-compressed arcs fetch whole blocks regardless of gap.
+    const client = await CtopoClient.openWith(fetcher, {
+      frontPrefetchBytes: 0,
+      arcCoordsPrefetchBytes: 0,
+      arcOffsetsPrefetchBytes: 0,
+      coalesceGapByFamily: { offsets: -1 },
     });
     requests.length = 0;
     await client.fetchArcs([0, 1, 2, 3]);
-    // 4 arc-coord GETs (no coalescing within the arcs family) + 1
-    // coalesced offset GET (offsets family's default gap is 1 MiB
-    // and the four offset entries are 16 bytes apart).
-    expect(requests.length).toBe(5);
+    // With block compression all 4 arcs fit in 1 block → 1 block
+    // GET. Offsets are split by the negative gap into individual
+    // GETs (4 offset entries → up to 4 GETs, though adjacent ones
+    // may still be in the same group-compressed region).
+    expect(requests.length).toBeGreaterThanOrEqual(2);
   });
 
   it("concurrent same-family arc fetches coalesce into one GET", async () => {
@@ -346,97 +344,64 @@ describe("CtopoClient", () => {
     expect(requests.length).toBe(0);
   });
 
-  it("concurrent fetchArcs calls share the single in-flight arc_coords fetch", async () => {
+  it("block cache serves subsequent arc fetches without additional GETs", async () => {
+    // Default block size (64 KiB) makes the entire tiny fixture fit
+    // in one block. After the first fetchArcs decompresses that block,
+    // all subsequent calls are served from the block cache — no new
+    // network requests needed.
     const buf = await encodeContainer(fixtureTopology());
-    // First, open the client normally so the bootstrap path completes.
-    const { fetcher: openFetcher } = fetcherFor(buf);
-    const client = await CtopoClient.openWith(openFetcher, {
+    const { fetcher, requests } = recordingFetcher(buf);
+    const client = await CtopoClient.openWith(fetcher, {
       arcCoordsPrefetchBytes: 0,
       arcOffsetsPrefetchBytes: 0,
     });
-    // Warm the arc_offsets cache via the open-time fetcher so the
-    // blocking fetcher only sees the arc_coords GET we're testing.
+
+    // First call fetches offsets + the one compressed block.
+    requests.length = 0;
     await client.fetchArcs([0]);
+    const afterFirst = requests.length;
+    expect(afterFirst).toBeGreaterThan(0);
 
-    // Now swap in a fetcher whose response we control — the arc_coords
-    // fetch that the next fetchArcs triggers will block here until we
-    // resolve, letting us verify only one GET fires across many
-    // concurrent calls. The blocking fetcher serves bytes of the
-    // exact requested length so the section fetcher's strict
-    // length check is satisfied.
-    const requests: Array<[number, number]> = [];
-    let resolveFetch: ((b: Uint8Array) => void) | undefined;
-    let pendingRange: [number, number] | undefined;
-    const blockingFetcher: RangeFetcher = {
-      range: (start, end) => {
-        requests.push([start, end]);
-        pendingRange = [start, end];
-        return new Promise<Uint8Array>((resolve) => {
-          resolveFetch = resolve;
-        });
-      },
-      // Suffix path is unused after open; provide a no-op so the
-      // type-checker is happy and any accidental call is obvious.
-      suffix: () =>
-        Promise.reject(new Error("blocking fetcher: suffix not implemented")),
-    };
-    // Reach into the private field to swap fetchers — production code
-    // has no need for this; the test pins behavior of the cache.
-    (client as unknown as { fetcher: RangeFetcher }).fetcher = blockingFetcher;
-
-    const a = client.fetchArcs([0, 1]);
-    const b = client.fetchArcs([2, 3]);
-    const c = client.fetchArcs([0, 2]);
-    // Drain all pending microtasks so each fetchArcs continuation
-    // gets to enqueue and the batched flush fires the (single)
-    // coalesced GET. setTimeout 0 flips control to the macrotask
-    // queue, which runs after the microtask queue is empty.
-    await new Promise((resolve) => setTimeout(resolve, 0));
-    expect(requests.length).toBe(1);
-
-    const [rangeStart, rangeEnd] = pendingRange!;
-    resolveFetch!(
-      new Uint8Array(
-        buf.buffer,
-        buf.byteOffset + rangeStart,
-        rangeEnd - rangeStart,
-      ),
-    );
-    await Promise.all([a, b, c]);
-    expect(requests.length).toBe(1);
+    // Subsequent calls hit the decompressed block cache — zero GETs.
+    requests.length = 0;
+    await Promise.all([
+      client.fetchArcs([0, 1]),
+      client.fetchArcs([2, 3]),
+      client.fetchArcs([0, 2]),
+    ]);
+    expect(requests.length).toBe(0);
   });
 
-  it("fetchArcs returns identical bytes whether arc_coords is raw or block-compressed", async () => {
-    // Build the same fixture twice — once raw, once block-compressed.
+  it("fetchArcs returns identical bytes regardless of block size", async () => {
+    // Build the same fixture with default blocks vs tiny blocks.
     // Tiny blocks force multiple-block layout on a 4-arc fixture.
-    const rawBuf = await encodeContainer(fixtureTopology());
-    const blockBuf = await encodeContainer(fixtureTopology(), {
-      blockCompressArcCoords: true,
+    const defaultBuf = await encodeContainer(fixtureTopology());
+    const tinyBuf = await encodeContainer(fixtureTopology(), {
       arcCoordBlockBytes: 32,
     });
 
-    const rawClient = await CtopoClient.openWith(fetcherFor(rawBuf).fetcher, {
-      arcCoordsPrefetchBytes: 0,
-      arcOffsetsPrefetchBytes: 0,
-    });
-    const blockClient = await CtopoClient.openWith(
-      fetcherFor(blockBuf).fetcher,
+    const defaultClient = await CtopoClient.openWith(
+      fetcherFor(defaultBuf).fetcher,
       {
         arcCoordsPrefetchBytes: 0,
         arcOffsetsPrefetchBytes: 0,
       },
     );
+    const tinyClient = await CtopoClient.openWith(fetcherFor(tinyBuf).fetcher, {
+      arcCoordsPrefetchBytes: 0,
+      arcOffsetsPrefetchBytes: 0,
+    });
 
-    expect(blockClient.meta.arcCoordsBlocks).toBeDefined();
-    expect(rawClient.meta.arcCoordsBlocks).toBeUndefined();
+    expect(defaultClient.meta.arcCoordsBlocks).toBeDefined();
+    expect(tinyClient.meta.arcCoordsBlocks).toBeDefined();
 
     const arcIds = [0, 1, 2, 3];
-    const rawArcs = await rawClient.fetchArcs(arcIds);
-    const blockArcs = await blockClient.fetchArcs(arcIds);
+    const defaultArcs = await defaultClient.fetchArcs(arcIds);
+    const tinyArcs = await tinyClient.fetchArcs(arcIds);
 
     for (const id of arcIds) {
-      const a = rawArcs.get(id)!;
-      const b = blockArcs.get(id)!;
+      const a = defaultArcs.get(id)!;
+      const b = tinyArcs.get(id)!;
       expect(b.byteLength).toBe(a.byteLength);
       expect(Array.from(b)).toEqual(Array.from(a));
     }
@@ -444,7 +409,6 @@ describe("CtopoClient", () => {
 
   it("block-compressed fetchArcs decompresses each block at most once across all arcs in it", async () => {
     const buf = await encodeContainer(fixtureTopology(), {
-      blockCompressArcCoords: true,
       // Fixture has no transform → float64 points, 32 B/arc × 4 arcs
       // = 128 B total. Use a 256 B target so every arc lives in a
       // single block — that's the property we're testing here.

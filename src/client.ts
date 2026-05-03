@@ -39,58 +39,29 @@ import {
   type LayerGeometry,
   type SectionEntry,
 } from "./types";
+import {
+  type FetchPriority,
+  type RangeFetcher,
+  makeHttpFetcher,
+  perfLog,
+} from "./fetcher";
+import {
+  decompressSection,
+  loadZstdWasmDecode,
+  preloadZstdWasmIfNeeded,
+} from "./decompress";
+import { runWithConcurrency } from "./util";
 
-// HTTP/2 priority hint passed through to fetch()'s `priority` option
-// (Fetch Priority API — Chrome 102+/Firefox 119+/Safari 17+). The
-// browser tags streams with these hints so the server allocates more
-// bandwidth to "high" while letting "low" yield. We use "high" for
-// the small open-path critical fetches (footer, arc_offsets, dict,
-// block table) so they don't get throttled behind bulk property
-// GETs on shared HTTP/2 connections. Backends that don't support
-// priority are expected to ignore it.
-export type FetchPriority = "high" | "low" | "auto";
+// Re-export fetcher types so existing `import { ... } from "./client"`
+// in downstream code and tests keeps working.
+export {
+  type FetchPriority,
+  type RangeFetcher,
+  makeHttpFetcher,
+} from "./fetcher";
+export { makeRangeFetcher, makeBufferFetcher } from "./fetcher";
 
-// Single fetcher abstraction: the open path needs both an absolute
-// `[start, end)` range and a suffix-range "last N bytes" form, and
-// real backends (HTTP, S3 SDK, in-memory test buffers) implement both
-// the same way — one Range header value goes in, bytes come out.
-//
-// `range(start, end)` must return exactly `end - start` bytes.
-// `suffix(length)` returns the last `length` bytes (or the whole
-// file if it's shorter than `length`).
-export interface RangeFetcher {
-  range(
-    start: number,
-    end: number,
-    signal?: AbortSignal,
-    priority?: FetchPriority,
-  ): Promise<Uint8Array>;
-  suffix(
-    length: number,
-    signal?: AbortSignal,
-    priority?: FetchPriority,
-  ): Promise<Uint8Array>;
-}
-
-// Lift a "fetch this Range header value" callback into a RangeFetcher.
-// Most backends already speak HTTP Range — this helper hands them the
-// header string and they hand back bytes, so callers don't have to
-// duplicate the start/end vs. suffix-length wiring. The priority hint
-// is forwarded so HTTP-based backends can pass it to fetch().
-export function makeRangeFetcher(
-  byHeader: (
-    rangeHeader: string,
-    signal?: AbortSignal,
-    priority?: FetchPriority,
-  ) => Promise<Uint8Array>,
-): RangeFetcher {
-  return {
-    range: (start, end, signal, priority) =>
-      byHeader(`bytes=${start}-${end - 1}`, signal, priority),
-    suffix: (length, signal, priority) =>
-      byHeader(`bytes=-${length}`, signal, priority),
-  };
-}
+// --- Types ---
 
 // Snapshot of bench-only counters captured by the client. These
 // run alongside the existing perfLog/BroadcastChannel path so
@@ -125,21 +96,6 @@ export interface CtopoClientStats {
   readonly perFamily: Readonly<
     Record<string, { requests: number; requestBytes: number }>
   >;
-}
-
-// In-memory backed fetcher — for tests and any caller that already
-// has the entire file in a buffer. Ignores priority (no network).
-export function makeBufferFetcher(buf: Uint8Array): RangeFetcher {
-  return {
-    range: (start, end) => {
-      const clampedEnd = Math.min(end, buf.byteLength);
-      return Promise.resolve(buf.subarray(start, clampedEnd));
-    },
-    suffix: (length) => {
-      const clamped = Math.min(length, buf.byteLength);
-      return Promise.resolve(buf.subarray(buf.byteLength - clamped));
-    },
-  };
 }
 
 export interface OpenContainerOptions {
@@ -221,7 +177,68 @@ export interface OpenContainerOptions {
   // section.length, and a single coalesced GET in the background
   // keeps merges round-trip-free for the offset half. 0 disables.
   readonly arcOffsetsPrefetchBytes?: number;
+  // Maximum number of disjoint byte ranges to combine into a single
+  // multi-range HTTP request. CloudFront supports multiple ranges in
+  // one request (ascending, non-overlapping); grouping reduces total
+  // request count at the cost of multipart response parsing overhead.
+  // Only takes effect when the fetcher implements `multiRange`. 20 by
+  // default.
+  readonly maxRangesPerRequest?: number;
+  // Hard off-switch for multi-range packing. Default true. When false,
+  // every disjoint chunk dispatches as its own range request even if
+  // the fetcher implements `multiRange`. Setting `maxRangesPerRequest:
+  // 1` is not equivalent — the dispatch gate is `chunks.length > 1`,
+  // not the per-request cap, so size-1 packs still take the multi-
+  // range path. Use this for A/B benchmarking the consolidation feature
+  // or for backends where multipart parsing is more expensive than the
+  // RTTs it saves.
+  readonly multiRangeEnabled?: boolean;
 }
+
+interface PendingSectionFetch {
+  readonly family: string;
+  readonly start: number;
+  readonly end: number;
+  readonly priority: FetchPriority;
+  readonly signal?: AbortSignal;
+  readonly resolve: (bytes: Uint8Array) => void;
+  readonly reject: (err: unknown) => void;
+}
+
+interface LogicalRange {
+  readonly family: string;
+  readonly start: number;
+  end: number;
+  readonly items: PendingSectionFetch[];
+  // Highest-urgency priority among constituent items — coalesced
+  // chunks inherit it so a small high-priority fetch upgrades any
+  // bulk fetches it gets fused with.
+  priority: FetchPriority;
+  // Filled in as chunks complete. Length = number of chunks.
+  chunkBytes: Uint8Array[];
+  error: unknown;
+}
+
+interface ChunkTask {
+  readonly logical: LogicalRange;
+  readonly index: number;
+  readonly start: number;
+  readonly end: number;
+}
+
+interface CachedByteRange {
+  readonly start: number;
+  readonly end: number;
+  readonly bytes: Uint8Array;
+}
+
+interface InFlightRange {
+  readonly start: number;
+  readonly end: number;
+  readonly promise: Promise<Uint8Array>;
+}
+
+// --- Constants ---
 
 // Default front-prefetch is OFF — callers explicitly opt in based on
 // their front-loaded set size. Open path still works without it: the
@@ -235,7 +252,14 @@ const DEFAULT_FRONT_PREFETCH = 0;
 const DEFAULT_BACK_PREFETCH = 256 * 1024;
 const DEFAULT_COALESCE_GAP = 64 * 1024;
 // Arcs default — see doc on OpenContainerOptions.coalesceGapByFamily.
-const DEFAULT_ARCS_COALESCE_GAP = 1 * 1024 * 1024;
+// 8 KiB matches the smaller arcCoordBlockBytes default (16 KiB) closely
+// enough that most needed arcs are within a single block of each
+// other, while still letting the coalescer merge truly-adjacent
+// requests. Wider gaps (1 MiB, the previous default) collapsed nearly
+// every arcs fetch into one giant range that pulled all of arc_coords;
+// the median-of-3 sweep showed shrinking to 8 KiB cuts 13-34% of merge
+// wall-clock without regressing on mobile (100ms RTT).
+const DEFAULT_ARCS_COALESCE_GAP = 8 * 1024;
 // Offsets default — same width. Bridge bytes here are 4B per arc id,
 // so even a generous gap pulls only kilobytes of unrelated entries
 // (vs the 6.7 MiB eager load it replaces).
@@ -256,10 +280,13 @@ const DEFAULT_MAX_PARALLEL_RANGES = 8;
 // structural sections (arc_offsets, CSR triples) before they're
 // re-read by stitching.
 const DEFAULT_BYTE_RANGE_CACHE = 128 * 1024 * 1024;
-// Fallback when META lacks tierByteOffsets (legacy files or
-// single-layer topologies). 512 KiB comfortably covers a state's
-// tier 0 + tier 1 with headroom — see defaultArcCoordsPrefetch for
-// the precise path.
+// Multi-range request defaults.
+const DEFAULT_MAX_RANGES_PER_REQUEST = 20;
+// Open-time prefetch size for arc_coords. The encoder front-loads
+// top-layer boundary arcs (state outline + county boundaries) by
+// virtue of the visit-order assignment. 512 KiB comfortably covers
+// those for state-sized regions; the rest is fetched on demand by
+// the merge.
 const DEFAULT_ARC_COORDS_PREFETCH = 512 * 1024;
 // Number.MAX_SAFE_INTEGER — the whole arc_offsets section.
 // prefetchPrefix clamps to section.length, so this just means "all of
@@ -267,6 +294,22 @@ const DEFAULT_ARC_COORDS_PREFETCH = 512 * 1024;
 // dramatically larger callers should set arcOffsetsPrefetchBytes
 // down to keep open fast.
 const DEFAULT_ARC_OFFSETS_PREFETCH = Number.MAX_SAFE_INTEGER;
+
+// Sentinel placeholder used to mark an arc id as "claimed" in the
+// fetchArcs result map before its real bytes arrive — keeps the
+// dedupe loop synchronous without storing a second tracking set.
+const EMPTY_BYTES = new Uint8Array(0);
+
+// --- Public API ---
+
+export async function openContainer(
+  url: string,
+  opts: OpenContainerOptions = {},
+): Promise<CtopoClient> {
+  return CtopoClient.open(url, opts);
+}
+
+// --- CtopoClient ---
 
 export class CtopoClient {
   readonly meta: ContainerMeta;
@@ -290,6 +333,8 @@ export class CtopoClient {
   private readonly coalesceGapByFamily: Readonly<Record<string, number>>;
   private readonly maxChunkBytes: number;
   private readonly maxParallelRanges: number;
+  private readonly maxRangesPerRequest: number;
+  private readonly multiRangeEnabled: boolean;
   private readonly byteRangeCacheBytes: number;
   // De-dupe in-flight property/strings/layer fetches via Promise maps.
   // The Promise itself is the cache entry — concurrent callers awaiting
@@ -314,9 +359,9 @@ export class CtopoClient {
   // decompress, so both fetches are kicked off speculatively at
   // open time and run in parallel with the rest of bootstrap.
   private arcCoordBlocksPromise: Promise<Uint32Array> | undefined;
-  // Resolves to undefined for legacy files (block-compressed
-  // pre-#20) that didn't ship a dict — caller passes that straight
-  // through to the decoder, which uses the no-dict path.
+  // Resolves to undefined when the file has no shared dict (too few
+  // blocks to train one) — caller passes that straight through to the
+  // decoder, which uses the no-dict path.
   private arcCoordDictPromise: Promise<Uint8Array | undefined> | undefined;
   // Decompressed block bytes per block index. fetchArcs typically
   // touches many arcs in a small set of blocks; caching the
@@ -336,6 +381,7 @@ export class CtopoClient {
   // addition to the cache) so a request that lands while another GET
   // covering it is still in flight attaches to that GET's Promise
   // instead of firing a duplicate.
+  private multiRangeDisabled = false;
   private inFlightRanges: InFlightRange[] = [];
   // Byte-range cache: every coalesced GET lands here so that future
   // requests whose [start, end) falls inside an already-fetched range
@@ -370,6 +416,8 @@ export class CtopoClient {
     coalesceGapByFamily: Readonly<Record<string, number>>;
     maxChunkBytes: number;
     maxParallelRanges: number;
+    maxRangesPerRequest: number;
+    multiRangeEnabled: boolean;
     byteRangeCacheBytes: number;
   }) {
     this.fetcher = args.fetcher;
@@ -381,6 +429,8 @@ export class CtopoClient {
     this.coalesceGapByFamily = args.coalesceGapByFamily;
     this.maxChunkBytes = args.maxChunkBytes;
     this.maxParallelRanges = args.maxParallelRanges;
+    this.maxRangesPerRequest = args.maxRangesPerRequest;
+    this.multiRangeEnabled = args.multiRangeEnabled;
     this.byteRangeCacheBytes = args.byteRangeCacheBytes;
 
     const arcCoords = this.sectionByName.get("arc_coords");
@@ -425,6 +475,9 @@ export class CtopoClient {
     const maxChunkBytes = opts.maxChunkBytes ?? DEFAULT_MAX_CHUNK;
     const maxParallelRanges =
       opts.maxParallelRanges ?? DEFAULT_MAX_PARALLEL_RANGES;
+    const maxRangesPerRequest =
+      opts.maxRangesPerRequest ?? DEFAULT_MAX_RANGES_PER_REQUEST;
+    const multiRangeEnabled = opts.multiRangeEnabled ?? true;
     const byteRangeCacheBytes =
       opts.byteRangeCacheBytes ?? DEFAULT_BYTE_RANGE_CACHE;
     const arcOffsetsPrefetchBytes =
@@ -477,6 +530,8 @@ export class CtopoClient {
       coalesceGapByFamily,
       maxChunkBytes,
       maxParallelRanges,
+      maxRangesPerRequest,
+      multiRangeEnabled,
       byteRangeCacheBytes,
     });
 
@@ -492,13 +547,12 @@ export class CtopoClient {
       });
     }
 
-    // Skeleton prefetch sizing: when META carries tier-byte-offsets
-    // we use end-of-tier-1 (top-layer outline + interior) for an
-    // exact skeleton — no slack on small regions, no truncation on
-    // large ones. Falls back to the empirical 512 KiB guess when
-    // tier info isn't present (legacy files or single-layer).
+    // Skeleton prefetch sizing: the encoder front-loads top-layer
+    // boundary arcs by visit-order assignment, so a fixed 512 KiB
+    // prefetch covers most state-sized regions' top-layer arcs
+    // without needing per-file tier metadata.
     const arcCoordsPrefetchBytes =
-      opts.arcCoordsPrefetchBytes ?? defaultArcCoordsPrefetch(parsed.meta);
+      opts.arcCoordsPrefetchBytes ?? DEFAULT_ARC_COORDS_PREFETCH;
 
     // Speculative skeleton prefetch — fills any gaps in what the
     // front prefetch already covers. With a generous frontPrefetchBytes
@@ -546,28 +600,6 @@ export class CtopoClient {
     return client;
   }
 
-  // Speculative prefetch of the first `bytes` of a named section.
-  // Lands in the byte-range cache via the same coalesce pipeline as
-  // a real fetch, so a concurrent fetcher covering the prefix
-  // attaches to the in-flight GET instead of duplicating it.
-  // Fire-and-forget — exceptions are swallowed.
-  private prefetchPrefix(
-    sectionName: string,
-    family: string,
-    bytes: number,
-    priority: FetchPriority = "auto",
-  ): void {
-    if (this.closed || bytes <= 0) return;
-    const section = this.sectionByName.get(sectionName);
-    if (section === undefined) return;
-    const start = section.offset;
-    const end = Math.min(start + bytes, start + section.length);
-    if (end <= start) return;
-    this.enqueueSectionFetch(family, start, end, priority).catch(() => {
-      // Silent — prefetch failures don't fail open or surface.
-    });
-  }
-
   // --- Lazy section accessors ---
 
   async property(name: string, signal?: AbortSignal): Promise<ArrayBufferView> {
@@ -605,62 +637,6 @@ export class CtopoClient {
       return new StringArray(bytes);
     })();
     this.stringsCache.set(name, promise);
-    return promise;
-  }
-
-  // Fetch a section's on-disk bytes through the range pipeline,
-  // decompressing if the section declares a codec. The returned
-  // Uint8Array is always the *uncompressed* bytes for the section
-  // (sliced out of its group when the section is a group member).
-  private async fetchSectionBytes(
-    entry: SectionEntry,
-    signal?: AbortSignal,
-  ): Promise<Uint8Array> {
-    throwIfAborted(signal);
-    if (entry.groupOffset !== undefined && entry.groupLength !== undefined) {
-      // Group member — share the decompressed group's bytes across
-      // every member access. Multiple sections that share the same
-      // physical (offset, length) hit the same cache entry.
-      const group = await this.fetchDecompressedGroup(entry, signal);
-      return group.subarray(
-        entry.groupOffset,
-        entry.groupOffset + entry.groupLength,
-      );
-    }
-    const bytes = await this.enqueueSectionFetch(
-      `section:${entry.name}`,
-      entry.offset,
-      entry.offset + entry.length,
-      "auto",
-      signal,
-    );
-    if (entry.compression === undefined) return bytes;
-    return this.decompressSectionTracked(bytes, entry);
-  }
-
-  // Fetch + decompress a compression group's bytes, cached by the
-  // group's physical (offset, length) so members of the same group
-  // share one decompression. Concurrent calls for sibling members
-  // attach to the same in-flight Promise via the cache.
-  private fetchDecompressedGroup(
-    entry: SectionEntry,
-    signal?: AbortSignal,
-  ): Promise<Uint8Array> {
-    const key = `${entry.offset}:${entry.length}`;
-    const cached = this.decompressedGroupCache.get(key);
-    if (cached !== undefined) return cached;
-    const promise = (async () => {
-      const bytes = await this.enqueueSectionFetch(
-        `group:${key}`,
-        entry.offset,
-        entry.offset + entry.length,
-        "auto",
-        signal,
-      );
-      if (entry.compression === undefined) return bytes;
-      return decompressSection(bytes, entry);
-    })();
-    this.decompressedGroupCache.set(key, promise);
     return promise;
   }
 
@@ -720,6 +696,160 @@ export class CtopoClient {
       return this.fetchArcsFromBlocks(arcIds, arcOffsets);
     }
     return this.fetchArcsFromRaw(arcIds, arcOffsets);
+  }
+
+  // --- Stats ---
+
+  // Bench instrumentation: snapshot of fetch / decompress / cache
+  // counters since open or the last resetStats().
+  getStats(): CtopoClientStats {
+    const perFamily: Record<
+      string,
+      { requests: number; requestBytes: number }
+    > = {};
+    for (const [k, v] of this.statPerFamily) {
+      perFamily[k] = { requests: v.requests, requestBytes: v.requestBytes };
+    }
+    return {
+      requests: this.statRequests,
+      requestBytes: this.statRequestBytes,
+      decompressMs: this.statDecompressMs,
+      decompressBytes: this.statDecompressBytes,
+      byteRangeCacheHits: this.statByteRangeCacheHits,
+      byteRangeCacheMisses: this.statByteRangeCacheMisses,
+      inFlightHits: this.statInFlightHits,
+      perFamily,
+    };
+  }
+
+  // Zero out all stats counters. Useful when a bench wants to
+  // separate open-time work (header + prefetch) from per-merge
+  // work without spinning up a fresh client.
+  resetStats(): void {
+    this.statRequests = 0;
+    this.statRequestBytes = 0;
+    this.statDecompressMs = 0;
+    this.statDecompressBytes = 0;
+    this.statByteRangeCacheHits = 0;
+    this.statByteRangeCacheMisses = 0;
+    this.statInFlightHits = 0;
+    this.statPerFamily.clear();
+  }
+
+  close(): void {
+    if (this.closed) return;
+    this.closed = true;
+    this.closeController.abort();
+    this.propertyCache.clear();
+    this.stringsCache.clear();
+    this.layerGeometryCache.clear();
+    this.decompressedGroupCache.clear();
+    this.decompressedArcCoordBlockCache.clear();
+    this.arcCoordBlocksPromise = undefined;
+    this.arcCoordDictPromise = undefined;
+    this.byteRangeCache = [];
+    this.byteRangeCacheUsedBytes = 0;
+    this.inFlightRanges = [];
+  }
+
+  // --- Private: section bytes ---
+
+  // Fetch a section's on-disk bytes through the range pipeline,
+  // decompressing if the section declares a codec. The returned
+  // Uint8Array is always the *uncompressed* bytes for the section
+  // (sliced out of its group when the section is a group member).
+  private async fetchSectionBytes(
+    entry: SectionEntry,
+    signal?: AbortSignal,
+  ): Promise<Uint8Array> {
+    throwIfAborted(signal);
+    if (entry.groupOffset !== undefined && entry.groupLength !== undefined) {
+      // Group member — share the decompressed group's bytes across
+      // every member access. Multiple sections that share the same
+      // physical (offset, length) hit the same cache entry.
+      const group = await this.fetchDecompressedGroup(entry, signal);
+      return group.subarray(
+        entry.groupOffset,
+        entry.groupOffset + entry.groupLength,
+      );
+    }
+    const bytes = await this.enqueueSectionFetch(
+      `section:${entry.name}`,
+      entry.offset,
+      entry.offset + entry.length,
+      "auto",
+      signal,
+    );
+    if (entry.compression === undefined) return bytes;
+    return this.decompressSectionTracked(bytes, entry);
+  }
+
+  // Fetch + decompress a compression group's bytes, cached by the
+  // group's physical (offset, length) so members of the same group
+  // share one decompression. Concurrent calls for sibling members
+  // attach to the same in-flight Promise via the cache.
+  private fetchDecompressedGroup(
+    entry: SectionEntry,
+    signal?: AbortSignal,
+  ): Promise<Uint8Array> {
+    const key = `${entry.offset}:${entry.length}`;
+    const cached = this.decompressedGroupCache.get(key);
+    if (cached !== undefined) return cached;
+    const promise = (async () => {
+      const bytes = await this.enqueueSectionFetch(
+        `group:${key}`,
+        entry.offset,
+        entry.offset + entry.length,
+        "auto",
+        signal,
+      );
+      if (entry.compression === undefined) return bytes;
+      return decompressSection(bytes, entry);
+    })();
+    this.decompressedGroupCache.set(key, promise);
+    return promise;
+  }
+
+  // Wrapper around the freestanding decompressSection that bumps
+  // the client's stats counters. Both the section path and the
+  // group path go through here.
+  private async decompressSectionTracked(
+    bytes: Uint8Array,
+    entry: SectionEntry,
+  ): Promise<Uint8Array> {
+    const t0 = performance.now();
+    const out = await decompressSection(bytes, entry);
+    this.statDecompressMs += performance.now() - t0;
+    this.statDecompressBytes += out.byteLength;
+    return out;
+  }
+
+  // Public alias for offline analyzers that need raw arc byte
+  // offsets to compute packing-quality metrics (gap stats, span,
+  // etc.). Bench-only — production code paths use fetchArcs.
+  arcOffsets(): Promise<Uint32Array> {
+    return this.getArcOffsets();
+  }
+
+  // --- Private: arc offsets + block-compressed arc_coords ---
+
+  // Lazy + cached arc_offsets accessor. The first call fetches the
+  // whole arc_offsets section through the standard fetchSectionBytes
+  // path (which transparently decompresses if the section is
+  // gzipped) and wraps the result as a Uint32Array. Subsequent
+  // calls return the same Promise, so the underlying buffer is
+  // shared across every fetchArcs call.
+  private getArcOffsets(): Promise<Uint32Array> {
+    if (this.arcOffsetsPromise === undefined) {
+      const entry = this.sectionByName.get("arc_offsets");
+      if (entry === undefined) {
+        throw new Error("ctopo: container is missing the arc_offsets section");
+      }
+      this.arcOffsetsPromise = this.fetchSectionBytes(entry).then((bytes) =>
+        viewU32WithDelta(bytes, entry.delta === true),
+      );
+    }
+    return this.arcOffsetsPromise;
   }
 
   private async fetchArcsFromRaw(
@@ -818,10 +948,9 @@ export class CtopoClient {
   }
 
   // Returns the shared dict bytes when this file has one, or
-  // undefined for legacy files (block-compressed pre-#20) that
-  // didn't ship a dict. Caller passes the (possibly-undefined)
-  // result to the decoder, which uses the no-dict path when
-  // absent.
+  // undefined when there's no shared dict (too few blocks to train
+  // one). Caller passes the (possibly-undefined) result to the
+  // decoder, which uses the no-dict path when absent.
   private getArcCoordDict(): Promise<Uint8Array | undefined> {
     if (this.arcCoordDictPromise === undefined) {
       const meta = this.meta.arcCoordsBlocks;
@@ -831,7 +960,7 @@ export class CtopoClient {
         );
       }
       if (meta.dictSection === undefined) {
-        // Legacy block-compressed file with no shared dict.
+        // No shared dict (too few blocks to train one).
         this.arcCoordDictPromise = Promise.resolve(undefined);
         return this.arcCoordDictPromise;
       }
@@ -917,100 +1046,46 @@ export class CtopoClient {
     return promise;
   }
 
-  // Lazy + cached arc_offsets accessor. The first call fetches the
-  // whole arc_offsets section through the standard fetchSectionBytes
-  // path (which transparently decompresses if the section is
-  // gzipped) and wraps the result as a Uint32Array. Subsequent
-  // calls return the same Promise, so the underlying buffer is
-  // shared across every fetchArcs call.
-  private getArcOffsets(): Promise<Uint32Array> {
-    if (this.arcOffsetsPromise === undefined) {
-      const entry = this.sectionByName.get("arc_offsets");
-      if (entry === undefined) {
-        throw new Error("ctopo: container is missing the arc_offsets section");
-      }
-      this.arcOffsetsPromise = this.fetchSectionBytes(entry).then((bytes) =>
-        viewU32WithDelta(bytes, entry.delta === true),
-      );
-    }
-    return this.arcOffsetsPromise;
+  // --- Private: prefetch helpers ---
+
+  // Speculative prefetch of the first `bytes` of a named section.
+  // Lands in the byte-range cache via the same coalesce pipeline as
+  // a real fetch, so a concurrent fetcher covering the prefix
+  // attaches to the in-flight GET instead of duplicating it.
+  // Fire-and-forget — exceptions are swallowed.
+  private prefetchPrefix(
+    sectionName: string,
+    family: string,
+    bytes: number,
+    priority: FetchPriority = "auto",
+  ): void {
+    if (this.closed || bytes <= 0) return;
+    const section = this.sectionByName.get(sectionName);
+    if (section === undefined) return;
+    const start = section.offset;
+    const end = Math.min(start + bytes, start + section.length);
+    if (end <= start) return;
+    this.enqueueSectionFetch(family, start, end, priority).catch(() => {
+      // Silent — prefetch failures don't fail open or surface.
+    });
   }
 
-  // Wrapper around the freestanding decompressSection that bumps
-  // the client's stats counters. Both the section path and the
-  // group path go through here.
-  private async decompressSectionTracked(
-    bytes: Uint8Array,
-    entry: SectionEntry,
+  // Issue a Range fetch for [start, end) through the standard
+  // pipeline — chunks at maxChunkBytes and fires up to
+  // maxParallelRanges physical GETs in parallel; bytes land in the
+  // byte-range cache automatically. Used by the open path to
+  // prefetch front-loaded sections without serializing on a single
+  // big GET (which throttles on a single HTTP/2 stream).
+  prefetchRange(
+    family: string,
+    start: number,
+    end: number,
+    priority: FetchPriority = "auto",
   ): Promise<Uint8Array> {
-    const t0 = performance.now();
-    const out = await decompressSection(bytes, entry);
-    this.statDecompressMs += performance.now() - t0;
-    this.statDecompressBytes += out.byteLength;
-    return out;
+    return this.enqueueSectionFetch(family, start, end, priority);
   }
 
-  // Bench instrumentation: snapshot of fetch / decompress / cache
-  // counters since open or the last resetStats().
-  getStats(): CtopoClientStats {
-    const perFamily: Record<
-      string,
-      { requests: number; requestBytes: number }
-    > = {};
-    for (const [k, v] of this.statPerFamily) {
-      perFamily[k] = { requests: v.requests, requestBytes: v.requestBytes };
-    }
-    return {
-      requests: this.statRequests,
-      requestBytes: this.statRequestBytes,
-      decompressMs: this.statDecompressMs,
-      decompressBytes: this.statDecompressBytes,
-      byteRangeCacheHits: this.statByteRangeCacheHits,
-      byteRangeCacheMisses: this.statByteRangeCacheMisses,
-      inFlightHits: this.statInFlightHits,
-      perFamily,
-    };
-  }
-
-  // Zero out all stats counters. Useful when a bench wants to
-  // separate open-time work (header + prefetch) from per-merge
-  // work without spinning up a fresh client.
-  resetStats(): void {
-    this.statRequests = 0;
-    this.statRequestBytes = 0;
-    this.statDecompressMs = 0;
-    this.statDecompressBytes = 0;
-    this.statByteRangeCacheHits = 0;
-    this.statByteRangeCacheMisses = 0;
-    this.statInFlightHits = 0;
-    this.statPerFamily.clear();
-  }
-
-  close(): void {
-    if (this.closed) return;
-    this.closed = true;
-    this.closeController.abort();
-    this.propertyCache.clear();
-    this.stringsCache.clear();
-    this.layerGeometryCache.clear();
-    this.decompressedGroupCache.clear();
-    this.decompressedArcCoordBlockCache.clear();
-    this.arcCoordBlocksPromise = undefined;
-    this.arcCoordDictPromise = undefined;
-    this.byteRangeCache = [];
-    this.byteRangeCacheUsedBytes = 0;
-    this.inFlightRanges = [];
-  }
-
-  // --- Private helpers ---
-
-  private sectionEntry(name: string): SectionEntry {
-    const entry = this.sectionByName.get(name);
-    if (entry === undefined) {
-      throw new Error(`ctopo: section "${name}" not in container`);
-    }
-    return entry;
-  }
+  // --- Private: batched fetch pipeline ---
 
   // Enqueue an exact byte interval into the next-microtask drain. The
   // returned Promise resolves with the section's bytes once the batch
@@ -1063,21 +1138,6 @@ export class CtopoClient {
         });
       }
     });
-  }
-
-  // Issue a Range fetch for [start, end) through the standard
-  // pipeline — chunks at maxChunkBytes and fires up to
-  // maxParallelRanges physical GETs in parallel; bytes land in the
-  // byte-range cache automatically. Used by the open path to
-  // prefetch front-loaded sections without serializing on a single
-  // big GET (which throttles on a single HTTP/2 stream).
-  prefetchRange(
-    family: string,
-    start: number,
-    end: number,
-    priority: FetchPriority = "auto",
-  ): Promise<Uint8Array> {
-    return this.enqueueSectionFetch(family, start, end, priority);
   }
 
   private lookupInFlightRange(
@@ -1197,71 +1257,128 @@ export class CtopoClient {
       }
     }
 
-    perfLog(
-      `[ctopo] flush: ${logicals.length} logical range(s) → ${chunks.length} chunk(s) ` +
-        `(${this.maxParallelRanges} max parallel, ${this.maxChunkBytes >> 10} KiB cap)`,
-    );
+    // Group chunks into dispatch tasks. When the fetcher supports
+    // multi-range, pack multiple disjoint chunks (same family) into a
+    // single HTTP request to reduce request count. Otherwise each
+    // chunk dispatches as its own GET.
+    type DispatchTask =
+      | { kind: "single"; chunk: ChunkTask; priority: FetchPriority }
+      | { kind: "multi"; chunks: ChunkTask[]; priority: FetchPriority };
 
-    // Fire chunks in parallel up to maxParallelRanges. Errors are
-    // captured per logical range — a failure in any chunk of a
-    // logical fails only that logical, leaving siblings to complete.
-    await runWithLimit(chunks, this.maxParallelRanges, async (chunk) => {
-      const logical = chunk.logical;
-      // Register this physical chunk as in-flight so a concurrent
-      // enqueueSectionFetch whose interval lies inside it attaches to
-      // this Promise instead of firing a duplicate GET.
-      let resolveChunk!: (bytes: Uint8Array) => void;
-      let rejectChunk!: (err: unknown) => void;
-      const chunkPromise = new Promise<Uint8Array>((res, rej) => {
-        resolveChunk = res;
-        rejectChunk = rej;
-      });
-      chunkPromise.catch(() => {});
-      const inFlightEntry: InFlightRange = {
-        start: chunk.start,
-        end: chunk.end,
-        promise: chunkPromise,
-      };
-      this.inFlightRanges.push(inFlightEntry);
+    const tasks: DispatchTask[] = [];
+    const canMultiRange =
+      this.multiRangeEnabled &&
+      !this.multiRangeDisabled &&
+      this.fetcher.multiRange !== undefined;
 
-      try {
-        const bytes = await this.fetcher.range(
-          chunk.start,
-          chunk.end,
-          this.closeController.signal,
-          logical.priority,
-        );
-        const expected = chunk.end - chunk.start;
-        if (bytes.byteLength !== expected) {
-          throw new Error(
-            `ctopo: short read at [${chunk.start}, ${chunk.end}) — got ${bytes.byteLength}, expected ${expected}`,
-          );
-        }
-        this.statRequests++;
-        this.statRequestBytes += bytes.byteLength;
-        const fam = this.statPerFamily.get(logical.family);
-        if (fam === undefined) {
-          this.statPerFamily.set(logical.family, {
-            requests: 1,
-            requestBytes: bytes.byteLength,
+    if (canMultiRange && chunks.length > 1) {
+      // Separate chunks into two buckets per family:
+      //  - Chunks from logical ranges that were split by maxChunkBytes
+      //    are contiguous pieces of one big range — dispatch them as
+      //    individual parallel GETs so they fan out over HTTP/2.
+      //  - Chunks that are the sole piece of their logical range are
+      //    small/sparse — pack them into multi-range requests to reduce
+      //    round trips.
+      //
+      // Multi-range packing stays within family boundaries so that
+      // independent UI operations don't block each other (e.g. a small
+      // string lookup for county names shouldn't wait on a large
+      // coordinate fetch for the whole state).
+      const candidatesByFamily = new Map<string, ChunkTask[]>();
+      for (const chunk of chunks) {
+        if (chunk.logical.chunkBytes.length > 1) {
+          tasks.push({
+            kind: "single",
+            chunk,
+            priority: chunk.logical.priority,
           });
         } else {
-          fam.requests++;
-          fam.requestBytes += bytes.byteLength;
+          const arr = candidatesByFamily.get(chunk.logical.family);
+          if (arr === undefined)
+            candidatesByFamily.set(chunk.logical.family, [chunk]);
+          else arr.push(chunk);
         }
-        this.cacheByteRange(chunk.start, chunk.end, bytes);
-        logical.chunkBytes[chunk.index] = bytes;
-        resolveChunk(bytes);
-      } catch (err) {
-        logical.error = err;
-        rejectChunk(err);
-      } finally {
-        const idx = this.inFlightRanges.indexOf(inFlightEntry);
-        if (idx >= 0) this.inFlightRanges.splice(idx, 1);
+      }
+
+      for (const familyChunks of candidatesByFamily.values()) {
+        let group: ChunkTask[] = [];
+        let groupBytes = 0;
+        let groupPriority: FetchPriority = "low";
+
+        for (const chunk of familyChunks) {
+          const chunkSize = chunk.end - chunk.start;
+          const wouldExceedRanges = group.length >= this.maxRangesPerRequest;
+          const wouldExceedBytes =
+            groupBytes + chunkSize > this.maxChunkBytes;
+
+          if (group.length > 0 && (wouldExceedRanges || wouldExceedBytes)) {
+            if (group.length === 1) {
+              tasks.push({
+                kind: "single",
+                chunk: group[0],
+                priority: groupPriority,
+              });
+            } else {
+              tasks.push({
+                kind: "multi",
+                chunks: group,
+                priority: groupPriority,
+              });
+            }
+            group = [];
+            groupBytes = 0;
+            groupPriority = "low";
+          }
+
+          group.push(chunk);
+          groupBytes += chunkSize;
+          groupPriority = mergePriority(groupPriority, chunk.logical.priority);
+        }
+
+        // Flush remaining
+        if (group.length === 1) {
+          tasks.push({
+            kind: "single",
+            chunk: group[0],
+            priority: groupPriority,
+          });
+        } else if (group.length > 1) {
+          tasks.push({
+            kind: "multi",
+            chunks: group,
+            priority: groupPriority,
+          });
+        }
+      }
+    } else {
+      // No multi-range support or only one chunk — dispatch individually
+      for (const chunk of chunks) {
+        tasks.push({
+          kind: "single",
+          chunk,
+          priority: chunk.logical.priority,
+        });
+      }
+    }
+
+    const multiRangeCount = tasks.filter((t) => t.kind === "multi").length;
+    perfLog(
+      `[ctopo] flush: ${logicals.length} logical range(s) → ${chunks.length} chunk(s) → ${tasks.length} task(s)` +
+        (multiRangeCount > 0 ? ` (${multiRangeCount} multi-range)` : "") +
+        ` (${this.maxParallelRanges} max parallel, ${this.maxChunkBytes >> 10} KiB cap)`,
+    );
+
+    // Fire tasks with bounded concurrency. Each task (single or multi-
+    // range) occupies one concurrency slot.
+    await runWithConcurrency(tasks, this.maxParallelRanges, async (task) => {
+      if (task.kind === "single") {
+        await this.dispatchSingleChunk(task.chunk, task.priority);
+      } else {
+        await this.dispatchMultiRange(task.chunks, task.priority);
       }
     });
 
-    // After all chunks: stitch each logical range back together
+    // After all tasks: stitch each logical range back together
     // (single-chunk case is a free passthrough) and resolve the
     // per-item promises with the right subarray.
     for (const logical of logicals) {
@@ -1288,40 +1405,211 @@ export class CtopoClient {
     }
   }
 
+  private async dispatchSingleChunk(
+    chunk: ChunkTask,
+    priority: FetchPriority,
+  ): Promise<void> {
+    const logical = chunk.logical;
+    let resolveChunk!: (bytes: Uint8Array) => void;
+    let rejectChunk!: (err: unknown) => void;
+    const chunkPromise = new Promise<Uint8Array>((res, rej) => {
+      resolveChunk = res;
+      rejectChunk = rej;
+    });
+    chunkPromise.catch(() => {});
+    const inFlightEntry: InFlightRange = {
+      start: chunk.start,
+      end: chunk.end,
+      promise: chunkPromise,
+    };
+    this.inFlightRanges.push(inFlightEntry);
+
+    try {
+      const bytes = await this.fetcher.range(
+        chunk.start,
+        chunk.end,
+        this.closeController.signal,
+        priority,
+      );
+      const expected = chunk.end - chunk.start;
+      if (bytes.byteLength !== expected) {
+        throw new Error(
+          `ctopo: short read at [${chunk.start}, ${chunk.end}) — got ${bytes.byteLength}, expected ${expected}`,
+        );
+      }
+      this.statRequests++;
+      this.statRequestBytes += bytes.byteLength;
+      const fam = this.statPerFamily.get(logical.family);
+      if (fam === undefined) {
+        this.statPerFamily.set(logical.family, {
+          requests: 1,
+          requestBytes: bytes.byteLength,
+        });
+      } else {
+        fam.requests++;
+        fam.requestBytes += bytes.byteLength;
+      }
+      this.cacheByteRange(chunk.start, chunk.end, bytes);
+      logical.chunkBytes[chunk.index] = bytes;
+      resolveChunk(bytes);
+    } catch (err) {
+      logical.error = err;
+      rejectChunk(err);
+    } finally {
+      const idx = this.inFlightRanges.indexOf(inFlightEntry);
+      if (idx >= 0) this.inFlightRanges.splice(idx, 1);
+    }
+  }
+
+  private async dispatchMultiRange(
+    chunks: ChunkTask[],
+    priority: FetchPriority,
+  ): Promise<void> {
+    // Register each chunk as in-flight individually so concurrent
+    // enqueueSectionFetch calls can attach to their promises.
+    const inFlightEntries: Array<{
+      entry: InFlightRange;
+      resolve: (bytes: Uint8Array) => void;
+      reject: (err: unknown) => void;
+    }> = [];
+
+    for (const chunk of chunks) {
+      let resolveChunk!: (bytes: Uint8Array) => void;
+      let rejectChunk!: (err: unknown) => void;
+      const chunkPromise = new Promise<Uint8Array>((res, rej) => {
+        resolveChunk = res;
+        rejectChunk = rej;
+      });
+      chunkPromise.catch(() => {});
+      const entry: InFlightRange = {
+        start: chunk.start,
+        end: chunk.end,
+        promise: chunkPromise,
+      };
+      this.inFlightRanges.push(entry);
+      inFlightEntries.push({
+        entry,
+        resolve: resolveChunk,
+        reject: rejectChunk,
+      });
+    }
+
+    try {
+      const ranges = chunks.map((c) => ({ start: c.start, end: c.end }));
+      const result = await this.fetcher.multiRange!(
+        ranges,
+        this.closeController.signal,
+        priority,
+      );
+
+      if (result.kind === "unsupported") {
+        // Server doesn't support multi-range — disable for this client
+        // and re-dispatch each chunk as an individual range request.
+        this.multiRangeDisabled = true;
+        perfLog(
+          `[ctopo] multi-range unsupported, falling back to single-range`,
+        );
+        // Clean up our in-flight entries — dispatchSingleChunk registers
+        // its own.
+        for (const { entry } of inFlightEntries) {
+          const idx = this.inFlightRanges.indexOf(entry);
+          if (idx >= 0) this.inFlightRanges.splice(idx, 1);
+        }
+        await runWithConcurrency(
+          chunks,
+          this.maxParallelRanges,
+          async (chunk) => {
+            await this.dispatchSingleChunk(chunk, priority);
+          },
+        );
+        return;
+      }
+
+      this.statRequests++;
+
+      // Match returned parts to chunks by start offset
+      const partsByStart = new Map<
+        number,
+        { start: number; end: number; bytes: Uint8Array }
+      >();
+      for (const part of result.parts) {
+        partsByStart.set(part.start, part);
+      }
+
+      let totalPartBytes = 0;
+      for (let i = 0; i < chunks.length; i++) {
+        const chunk = chunks[i];
+        const part = partsByStart.get(chunk.start);
+        if (part === undefined) {
+          const err = new Error(
+            `ctopo: multi-range response missing part for [${chunk.start}, ${chunk.end})`,
+          );
+          chunk.logical.error = err;
+          inFlightEntries[i].reject(err);
+          continue;
+        }
+        const expected = chunk.end - chunk.start;
+        if (part.bytes.byteLength !== expected) {
+          const err = new Error(
+            `ctopo: multi-range part size mismatch at [${chunk.start}, ${chunk.end}) — got ${part.bytes.byteLength}, expected ${expected}`,
+          );
+          chunk.logical.error = err;
+          inFlightEntries[i].reject(err);
+          continue;
+        }
+        totalPartBytes += part.bytes.byteLength;
+        this.cacheByteRange(chunk.start, chunk.end, part.bytes);
+        chunk.logical.chunkBytes[chunk.index] = part.bytes;
+        inFlightEntries[i].resolve(part.bytes);
+        const fam = this.statPerFamily.get(chunk.logical.family);
+        if (fam === undefined) {
+          this.statPerFamily.set(chunk.logical.family, {
+            requests: 0,
+            requestBytes: part.bytes.byteLength,
+          });
+        } else {
+          fam.requestBytes += part.bytes.byteLength;
+        }
+      }
+      this.statRequestBytes += totalPartBytes;
+    } catch (err) {
+      // Fail all chunks in this multi-range request
+      for (let i = 0; i < chunks.length; i++) {
+        chunks[i].logical.error = err;
+        inFlightEntries[i].reject(err);
+      }
+    } finally {
+      for (const { entry } of inFlightEntries) {
+        const idx = this.inFlightRanges.indexOf(entry);
+        if (idx >= 0) this.inFlightRanges.splice(idx, 1);
+      }
+    }
+  }
+
+  // --- Private: misc ---
+
+  private sectionEntry(name: string): SectionEntry {
+    const entry = this.sectionByName.get(name);
+    if (entry === undefined) {
+      throw new Error(`ctopo: section "${name}" not in container`);
+    }
+    return entry;
+  }
+
   private ensureOpen(): void {
     if (this.closed) throw new Error("ctopo: client is closed");
   }
 }
 
-interface PendingSectionFetch {
-  readonly family: string;
-  readonly start: number;
-  readonly end: number;
-  readonly priority: FetchPriority;
-  readonly signal?: AbortSignal;
-  readonly resolve: (bytes: Uint8Array) => void;
-  readonly reject: (err: unknown) => void;
-}
+// --- Module-level helpers ---
 
-interface LogicalRange {
-  readonly family: string;
-  readonly start: number;
-  end: number;
-  readonly items: PendingSectionFetch[];
-  // Highest-urgency priority among constituent items — coalesced
-  // chunks inherit it so a small high-priority fetch upgrades any
-  // bulk fetches it gets fused with.
-  priority: FetchPriority;
-  // Filled in as chunks complete. Length = number of chunks.
-  chunkBytes: Uint8Array[];
-  error: unknown;
-}
-
-interface ChunkTask {
-  readonly logical: LogicalRange;
-  readonly index: number;
-  readonly start: number;
-  readonly end: number;
+// Check a caller-supplied AbortSignal and throw if already aborted.
+// Used at the entry of every public method so pre-aborted signals
+// reject immediately without touching the cache or fetch pipeline.
+function throwIfAborted(signal?: AbortSignal): void {
+  if (signal?.aborted) {
+    throw signal.reason ?? new Error("aborted");
+  }
 }
 
 // Pick the more-urgent priority of two values. high > auto > low.
@@ -1345,219 +1633,6 @@ function stitchChunks(
   return out;
 }
 
-interface CachedByteRange {
-  readonly start: number;
-  readonly end: number;
-  readonly bytes: Uint8Array;
-}
-
-interface InFlightRange {
-  readonly start: number;
-  readonly end: number;
-  readonly promise: Promise<Uint8Array>;
-}
-
-// Sentinel placeholder used to mark an arc id as "claimed" in the
-// fetchArcs result map before its real bytes arrive — keeps the
-// dedupe loop synchronous without storing a second tracking set.
-const EMPTY_BYTES = new Uint8Array(0);
-
-// Check a caller-supplied AbortSignal and throw if already aborted.
-// Used at the entry of every public method so pre-aborted signals
-// reject immediately without touching the cache or fetch pipeline.
-function throwIfAborted(signal?: AbortSignal): void {
-  if (signal?.aborted) {
-    throw signal.reason ?? new Error("aborted");
-  }
-}
-
-// --- Convenience helpers ---
-
-export async function openContainer(
-  url: string,
-  opts: OpenContainerOptions = {},
-): Promise<CtopoClient> {
-  return CtopoClient.open(url, opts);
-}
-
-// --- Decompression ---
-
-// Decompress a section's bytes per its declared codec. zstd is the
-// default — native via DecompressionStream("zstd") on recent
-// browsers, falling back to @bokuweb/zstd-wasm (~50 KB wasm, ~16× faster than pure-JS) elsewhere. Brotli is
-// supported as an alternative codec for producers that prefer faster
-// encode at the cost of slightly worse ratio; reading "br" relies on
-// native DecompressionStream("brotli") (Firefox today, Chrome
-// rolling) — no JS fallback. Unknown codecs throw a clear error so
-// adding a new one is a one-place change.
-async function decompressSection(
-  bytes: Uint8Array,
-  entry: SectionEntry,
-): Promise<Uint8Array> {
-  const codec = entry.compression;
-  if (codec === undefined) return bytes;
-  // Perf instrumentation — log compressed/decompressed sizes and
-  // decode wall-clock for weighing wire savings vs CPU cost.
-  const t0 = performance.now();
-  let out: Uint8Array;
-  if (codec === "zst") {
-    out = await decompressZstd(bytes, entry);
-  } else if (codec === "br") {
-    out = await decompressNativeOrThrow(bytes, entry, "brotli");
-  } else {
-    throw new Error(
-      `ctopo: section "${entry.name}" has unknown codec "${codec as string}" — this build understands "zst" and "br"`,
-    );
-  }
-  const elapsed = performance.now() - t0;
-  perfLog(
-    `[ctopo] decompress "${entry.name}" (${codec}): ${bytes.byteLength}B → ` +
-      `${out.byteLength}B (ratio ${((bytes.byteLength / out.byteLength) * 100).toFixed(1)}%) ` +
-      `in ${elapsed.toFixed(1)}ms`,
-  );
-  return out;
-}
-
-async function decompressNativeOrThrow(
-  bytes: Uint8Array,
-  entry: SectionEntry,
-  format: string,
-): Promise<Uint8Array> {
-  if (typeof DecompressionStream === "undefined") {
-    throw new Error(
-      `ctopo: section "${entry.name}" is ${format}-compressed but DecompressionStream is unavailable in this runtime`,
-    );
-  }
-  let decompressor: DecompressionStream;
-  try {
-    decompressor = new DecompressionStream(format as CompressionFormat);
-  } catch (err) {
-    throw new Error(
-      `ctopo: section "${entry.name}" needs DecompressionStream("${format}") which this runtime rejected (${
-        (err as Error).message
-      }). Re-encode the region with a codec your user-base supports.`,
-    );
-  }
-  const stream = new ReadableStream<Uint8Array>({
-    start(controller) {
-      controller.enqueue(bytes);
-      controller.close();
-    },
-  }).pipeThrough(decompressor as ReadableWritablePair<Uint8Array, Uint8Array>);
-  return new Uint8Array(await new Response(stream).arrayBuffer());
-}
-
-async function decompressZstd(
-  bytes: Uint8Array,
-  entry: SectionEntry,
-): Promise<Uint8Array> {
-  if (zstdNativeOk()) return decompressNativeOrThrow(bytes, entry, "zstd");
-  const decode = await loadZstdWasmDecode(entry);
-  return decode(bytes, entry.uncompressedRegionLength);
-}
-
-// One-shot native-zstd capability probe. Memoized so repeat checks
-// are free.
-let zstdNativeChecked = false;
-let zstdNativeAvailable = false;
-function zstdNativeOk(): boolean {
-  if (zstdNativeChecked) return zstdNativeAvailable;
-  zstdNativeChecked = true;
-  if (typeof DecompressionStream === "undefined") return false;
-  try {
-    new DecompressionStream("zstd" as CompressionFormat);
-    zstdNativeAvailable = true;
-  } catch {
-    zstdNativeAvailable = false;
-  }
-  return zstdNativeAvailable;
-}
-
-// Triggered at openContainer time (not lazily on first decompress)
-// so the wasm-zstd init runs concurrently with the header round-trip
-// instead of gating the first compressed-section decompress.
-//
-// Always fires when the file uses block-compressed arc_coords —
-// per-block decode happens many times per merge, so even native
-// DecompressionStream("zstd") (which lacks a dict parameter, costs
-// a Stream-API setup per call, and is not yet on the dict path
-// for #20) loses to the synchronous wasm decoder. Otherwise fires
-// only as a fallback when the runtime lacks native zstd.
-// Idempotent.
-// Decoder takes the compressed bytes and an optional uncompressed-size
-// hint. The hint is required when the zstd frame header lacks FCS
-// (Node's async zstdCompress does this) — without it bokuweb's wasm
-// decoder defaults to a 1 MiB output buffer and -70's on anything
-// bigger. Our META carries the value per section as
-// `uncompressedRegionLength`.
-//
-// Two-arg shape covers both paths:
-//   - decode(bytes, hint)         — no shared dict (most sections)
-//   - decode(bytes, hint, dict)   — shared dict (arc_coord blocks)
-type WasmZstdDecode = (
-  bytes: Uint8Array,
-  uncompressedSizeHint?: number,
-  dict?: Uint8Array,
-) => Uint8Array;
-let wasmZstdReady: Promise<WasmZstdDecode> | undefined;
-function preloadZstdWasmIfNeeded(forceLoad: boolean = false): void {
-  if (wasmZstdReady !== undefined) return;
-  if (!forceLoad && zstdNativeOk()) return;
-  wasmZstdReady = (async () => {
-    const mod = await import("@bokuweb/zstd-wasm");
-    await mod.init();
-    // One DCtx for the lifetime of the module — shared across all
-    // dict-aware decompresses. bokuweb's decompressUsingDict still
-    // mallocs+memcopies the dict bytes on every call (~60 µs for a
-    // 1 MiB dict), but the savings on compressed bytes more
-    // than pay for it. A future bokuweb upgrade exposing
-    // ZSTD_DCtx_loadDictionary would let us skip the per-call copy.
-    const dctx = mod.createDCtx();
-    const slack = 64;
-    return (
-      bytes: Uint8Array,
-      uncompressedSizeHint?: number,
-      dict?: Uint8Array,
-    ) => {
-      const opts = {
-        defaultHeapSize:
-          uncompressedSizeHint !== undefined
-            ? uncompressedSizeHint + slack
-            : 32 * 1024 * 1024,
-      };
-      if (dict !== undefined) {
-        return mod.decompressUsingDict(dctx, bytes, dict, opts);
-      }
-      return mod.decompress(bytes, opts);
-    };
-  })().catch((err) => {
-    // Reset so a real decode attempt can produce a fresh error
-    // with section context, rather than caching a generic one.
-    wasmZstdReady = undefined;
-    throw err;
-  });
-}
-
-async function loadZstdWasmDecode(
-  entry: SectionEntry,
-): Promise<WasmZstdDecode> {
-  preloadZstdWasmIfNeeded(true);
-  if (wasmZstdReady === undefined) {
-    throw new Error(
-      `ctopo: section "${entry.name}" needs zstd decompression but neither DecompressionStream("zstd") nor the wasm fallback could be loaded`,
-    );
-  }
-  try {
-    return await wasmZstdReady;
-  } catch (err) {
-    throw new Error(
-      `ctopo: section "${entry.name}" needs zstd decompression but neither DecompressionStream("zstd") nor the wasm fallback is available (${
-        (err as Error).message
-      })`,
-    );
-  }
-}
-
 // Binary search the block table for the block containing a given
 // logical (uncompressed) byte offset. Block table is u32 triples
 // [uncEnd, compOff, compLen]; uncEnd is monotonically increasing and
@@ -1572,108 +1647,6 @@ function findArcCoordBlock(blocks: Uint32Array, logicalOffset: number): number {
     else hi = mid;
   }
   return lo;
-}
-
-// --- Internal utilities ---
-
-async function runWithLimit<T>(
-  items: ReadonlyArray<T>,
-  limit: number,
-  fn: (item: T) => Promise<void>,
-): Promise<void> {
-  let cursor = 0;
-  const next = async (): Promise<void> => {
-    while (cursor < items.length) {
-      const idx = cursor++;
-      await fn(items[idx]);
-    }
-  };
-  const n = Math.min(limit, items.length);
-  const workers: Promise<void>[] = [];
-  for (let i = 0; i < n; i++) workers.push(next());
-  await Promise.all(workers);
-}
-
-// Perf instrumentation — broadcasts every Range GET so the main
-// thread can mirror it to the page console.
-const perfChannel =
-  typeof BroadcastChannel === "undefined"
-    ? null
-    : new BroadcastChannel("ctopo-perf");
-function perfLog(msg: string): void {
-  if (perfChannel !== null) perfChannel.postMessage(msg);
-}
-
-// Default HTTP-based fetcher. Issues `fetch(url, { headers: { Range: ... } })`
-// for both range and suffix forms, with shared logging + per-call ids
-// so concurrent requests are easy to follow in the log. Forwards the
-// caller's priority hint via fetch()'s `priority` option (Fetch
-// Priority API).
-export function makeHttpFetcher(url: string): RangeFetcher {
-  let seq = 0;
-  perfLog(`[ctopo] open ${url}`);
-  const issue = async (
-    rangeHeader: string,
-    label: string,
-    expectedLength: number | undefined,
-    signal: AbortSignal | undefined,
-    priority: FetchPriority | undefined,
-  ): Promise<Uint8Array> => {
-    const id = ++seq;
-    const t0 = performance.now();
-    const prioLabel =
-      priority !== undefined && priority !== "auto" ? ` prio=${priority}` : "";
-    perfLog(`[ctopo] #${id} GET ${label}${prioLabel} start`);
-    const response = await fetch(url, {
-      headers: { Range: rangeHeader },
-      signal,
-      // Cast: `priority` is in lib.dom for modern TS but absent in
-      // older targets. Browsers without support ignore it.
-      ...(priority !== undefined ? { priority } : {}),
-    });
-    if (!response.ok && response.status !== 206) {
-      throw new Error(
-        `ctopo: HTTP ${response.status} fetching ${url} ${rangeHeader}`,
-      );
-    }
-    if (expectedLength !== undefined) {
-      const contentRange = response.headers.get("Content-Range");
-      if (contentRange !== null) {
-        const match = /bytes (\d+)-(\d+)\/(\d+|\*)/.exec(contentRange);
-        if (match !== null) {
-          const got = Number(match[2]) - Number(match[1]) + 1;
-          if (got !== expectedLength) {
-            throw new Error(
-              `ctopo: server returned ${got} bytes for ${rangeHeader}, expected ${expectedLength}`,
-            );
-          }
-        }
-      }
-    }
-    const buf = await response.arrayBuffer();
-    perfLog(
-      `[ctopo] #${id} GET ${label} done in ${(performance.now() - t0).toFixed(0)}ms (${buf.byteLength}B)`,
-    );
-    return new Uint8Array(buf);
-  };
-  return {
-    range: (start, end, signal, priority) =>
-      issue(
-        `bytes=${start}-${end - 1}`,
-        `[${start}, ${end}) (${end - start}B)`,
-        end - start,
-        signal,
-        priority,
-      ),
-    suffix: (length, signal, priority) =>
-      issue(
-        `bytes=-${length}`,
-        `bytes=-${length}`,
-        undefined,
-        signal,
-        priority,
-      ),
-  };
 }
 
 // Wrap section bytes as a Uint32Array, undoing first-order delta
@@ -1699,16 +1672,4 @@ function viewU32WithDelta(bytes: Uint8Array, delta: boolean): Uint32Array {
   dst[0] = src[0];
   for (let i = 1; i < src.length; i++) dst[i] = (dst[i - 1] + src[i]) >>> 0;
   return dst;
-}
-
-// Pick the arc_coords skeleton-prefetch size from META. Prefers the
-// exact "end of tier 1" byte position when the encoder emitted it
-// (top-layer outside-edge + interior — the skeleton every merge
-// touches). Falls back to the empirical default for legacy files
-// without tier offsets.
-function defaultArcCoordsPrefetch(meta: ContainerMeta): number {
-  const tiers = meta.tierByteOffsets;
-  if (tiers !== undefined && tiers.length >= 2) return tiers[1];
-  // Single-tier-only or legacy file: fall back to the guess.
-  return DEFAULT_ARC_COORDS_PREFETCH;
 }
