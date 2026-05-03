@@ -1,0 +1,65 @@
+{
+  "name": "cloud-topo",
+  "version": "0.1.0",
+  "description": "Cloud-optimized binary topology container with HTTP Range support and topojson-compatible primitives",
+  "license": "Apache-2.0",
+  "author": "Michael Maurizi Jr.",
+  "type": "module",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    },
+    "./encode": {
+      "types": "./dist/encode.d.ts",
+      "default": "./dist/encode.js"
+    }
+  },
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "typesVersions": {
+    "*": {
+      "encode": [
+        "./dist/encode.d.ts"
+      ]
+    }
+  },
+  "files": [
+    "dist",
+    "LICENSE",
+    "README.md"
+  ],
+  "scripts": {
+    "build": "tsup",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "typecheck": "tsc --noEmit",
+    "lint": "eslint 'src/**/*.ts'",
+    "prepublishOnly": "npm run build"
+  },
+  "dependencies": {
+    "@bokuweb/zstd-wasm": "^0.0.27"
+  },
+  "devDependencies": {
+    "@eslint/js": "^9.28.0",
+    "@types/geojson": "^7946.0.16",
+    "@types/node": "^22.0.0",
+    "@types/topojson-specification": "^1.0.1",
+    "eslint": "^9.28.0",
+    "eslint-config-prettier": "^10.1.0",
+    "eslint-plugin-prettier": "^5.5.0",
+    "prettier": "^3.8.0",
+    "tsup": "^8.0.0",
+    "typescript": "^5.8.3",
+    "typescript-eslint": "^8.33.0",
+    "vitest": "^4.1.5"
+  },
+  "keywords": [
+    "topojson",
+    "topology",
+    "geospatial",
+    "binary",
+    "range-fetch",
+    "cloud-optimized"
+  ]
+}

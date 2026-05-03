@@ -1,0 +1,276 @@
+// SPDX-License-Identifier: Apache-2.0
+// © 2026 Michael Maurizi Jr.
+
+/**
+ * Pure, isomorphic header / footer parser. No I/O —
+ * `client.ts` owns the Range fetcher and lazy section loading.
+ *
+ * Wire layout has two metadata regions: a 16-B HEADER at the front
+ * (magic + version) and a variable-size FOOTER at the end (section
+ * table + META + trailing length). Open path fetches both in
+ * parallel via `bytes=[0,N)` and `bytes=-M` to save one round-trip.
+ */
+
+import {
+  FOOTER_PREFIX_SIZE,
+  FOOTER_TRAILER_SIZE,
+  HEADER_SIZE,
+  MAGIC,
+  OFFSET_FOOTER_META_LENGTH,
+  OFFSET_FOOTER_SECTION_COUNT,
+  OFFSET_MAGIC,
+  OFFSET_VERSION,
+  SECTION_ENTRY_SIZE,
+  SECTION_NAME_SIZE,
+  VERSION_MAJOR,
+  unpackVersion,
+} from "./format";
+import { type ContainerMeta, type SectionEntry } from "./types";
+
+export interface ParsedHeader {
+  readonly meta: ContainerMeta;
+  readonly sections: ReadonlyArray<SectionEntry>;
+  // Byte offset where the data area begins (start of the first section).
+  // Always HEADER_SIZE (16) in the current format; preserved for callers
+  // that want to validate / inspect the layout.
+  readonly dataStart: number;
+}
+
+// Read the trailing 8-byte footer-length marker out of a buffer that
+// covers at least the last FOOTER_TRAILER_SIZE bytes of the file.
+// `bufferEndIsFileEnd` declares whether the buffer's last byte is also
+// the file's last byte, so we know where to read from.
+export function readFooterLength(buffer: Uint8Array): number {
+  if (buffer.byteLength < FOOTER_TRAILER_SIZE) {
+    throw new Error(
+      `ctopo: buffer too small for footer trailer (${buffer.byteLength} < ${FOOTER_TRAILER_SIZE})`,
+    );
+  }
+  const view = new DataView(
+    buffer.buffer,
+    buffer.byteOffset,
+    buffer.byteLength,
+  );
+  return readBigUint64AsNumber(view, buffer.byteLength - FOOTER_TRAILER_SIZE);
+}
+
+// Validate the front-of-file header. Cheap — only checks magic and
+// version. The actual section table + META live in the footer; use
+// parseFooter for those.
+export function parseFrontHeader(bytes: Uint8Array): void {
+  if (bytes.byteLength < HEADER_SIZE) {
+    throw new Error(
+      `ctopo: buffer too small for header (${bytes.byteLength} < ${HEADER_SIZE})`,
+    );
+  }
+  const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  const magic = view.getUint32(OFFSET_MAGIC, true);
+  if (magic !== MAGIC) {
+    throw new Error(
+      `ctopo: bad magic 0x${magic.toString(16).padStart(8, "0")} — not a .ctopo file`,
+    );
+  }
+  const version = view.getUint32(OFFSET_VERSION, true);
+  const v = unpackVersion(version);
+  if (v.major !== VERSION_MAJOR) {
+    throw new Error(
+      `ctopo: incompatible major version ${v.major} (this build understands ${VERSION_MAJOR})`,
+    );
+  }
+}
+
+// Parse a footer buffer (section_count + meta_length + section_table
+// + meta_json) into the same shape as the legacy front-header parser
+// produced. The buffer must start at the footer's first byte and be
+// at least footer_length bytes long.
+export function parseFooter(footerBytes: Uint8Array): ParsedHeader {
+  if (footerBytes.byteLength < FOOTER_PREFIX_SIZE) {
+    throw new Error(
+      `ctopo: footer too small for prefix (${footerBytes.byteLength} < ${FOOTER_PREFIX_SIZE})`,
+    );
+  }
+  const view = new DataView(
+    footerBytes.buffer,
+    footerBytes.byteOffset,
+    footerBytes.byteLength,
+  );
+
+  const sectionCount = view.getUint32(OFFSET_FOOTER_SECTION_COUNT, true);
+  const metaLength = view.getUint32(OFFSET_FOOTER_META_LENGTH, true);
+
+  const tableStart = FOOTER_PREFIX_SIZE;
+  const tableEnd = tableStart + sectionCount * SECTION_ENTRY_SIZE;
+  const metaStart = tableEnd;
+  const metaEnd = metaStart + metaLength;
+
+  if (footerBytes.byteLength < metaEnd) {
+    throw new Error(
+      `ctopo: footer truncated (${footerBytes.byteLength} < ${metaEnd}) — fetch more bytes`,
+    );
+  }
+
+  const metaJson = new TextDecoder("utf-8").decode(
+    footerBytes.subarray(metaStart, metaEnd),
+  );
+  const meta = JSON.parse(metaJson) as ContainerMeta;
+
+  if (meta.sections.length !== sectionCount) {
+    throw new Error(
+      `ctopo: META section count (${meta.sections.length}) disagrees with footer (${sectionCount})`,
+    );
+  }
+
+  // Walk the binary table to pick up offsets/lengths; pair each row
+  // with the META descriptor at the same index. The 16-byte name in
+  // the binary table is a diagnostic short identifier — META is
+  // authoritative.
+  const sections: SectionEntry[] = new Array(sectionCount);
+  let dataStart = Number.POSITIVE_INFINITY;
+  for (let i = 0; i < sectionCount; i++) {
+    const entryStart = tableStart + i * SECTION_ENTRY_SIZE;
+    const offset = readBigUint64AsNumber(view, entryStart + SECTION_NAME_SIZE);
+    const length = readBigUint64AsNumber(
+      view,
+      entryStart + SECTION_NAME_SIZE + 8,
+    );
+    if (offset < dataStart) dataStart = offset;
+    sections[i] = {
+      name: meta.sections[i].name,
+      dtype: meta.sections[i].type,
+      offset,
+      length,
+      compression: meta.sections[i].compression,
+      groupOffset: meta.sections[i].groupOffset,
+      groupLength: meta.sections[i].groupLength,
+      delta: meta.sections[i].delta,
+      uncompressedRegionLength: meta.sections[i].uncompressedRegionLength,
+    };
+  }
+  if (sectionCount === 0) dataStart = HEADER_SIZE;
+
+  return { meta, sections, dataStart };
+}
+
+// Convenience wrapper for callers that hold the entire file in memory
+// (tests, rewriteContainer's pass-through pipeline, build-tools). Validates
+// the front header, locates the footer via the trailing length marker,
+// and parses it.
+//
+// Network clients should use parseFrontHeader + parseFooter directly so
+// the front and back fetches can run in parallel.
+export function parseContainer(bytes: Uint8Array): ParsedHeader {
+  parseFrontHeader(bytes);
+  const footerLength = readFooterLength(bytes);
+  const footerStart = bytes.byteLength - FOOTER_TRAILER_SIZE - footerLength;
+  if (footerStart < HEADER_SIZE) {
+    throw new Error(
+      `ctopo: footer length ${footerLength} doesn't fit in buffer of ${bytes.byteLength} bytes`,
+    );
+  }
+  const footerBytes = bytes.subarray(footerStart, footerStart + footerLength);
+  return parseFooter(footerBytes);
+}
+
+function readBigUint64AsNumber(view: DataView, offset: number): number {
+  const big = view.getBigUint64(offset, true);
+  if (big > BigInt(Number.MAX_SAFE_INTEGER)) {
+    throw new Error(
+      `ctopo: section offset/length exceeds Number.MAX_SAFE_INTEGER`,
+    );
+  }
+  return Number(big);
+}
+
+// Slice the typed-array view of a section out of a buffer that already
+// contains the section's bytes (e.g. an encoded buffer in tests, or a
+// prefetched Range payload). Variable-width sections (`blob`, `strings`)
+// return raw Uint8Array views.
+//
+// For compressed sections, callers must decompress the on-disk bytes
+// first and pass the result via `viewDecompressedSection` — this
+// function operates on raw on-disk bytes and uses `entry.length` as
+// the wire length, which is the *compressed* length when
+// `entry.compression` is set.
+export function viewSection(
+  bytes: Uint8Array,
+  entry: SectionEntry,
+  baseOffset: number = 0,
+): TypedArray {
+  const start = entry.offset - baseOffset;
+  const end = start + entry.length;
+  if (start < 0 || end > bytes.byteLength) {
+    throw new Error(
+      `ctopo: section ${entry.name} not in slice (need [${start}, ${end}) in ${bytes.byteLength} bytes)`,
+    );
+  }
+  return viewBytesAsDtype(bytes.subarray(start, end), entry.dtype);
+}
+
+// Wrap an already-extracted (and, if applicable, decompressed)
+// Uint8Array as the typed view appropriate to a section's dtype.
+// Used by the client after fetching + decompressing a compressed
+// section's bytes — the caller knows the uncompressed length, so we
+// don't need entry.length here.
+export function viewDecompressedSection(
+  bytes: Uint8Array,
+  dtype: SectionEntry["dtype"],
+): TypedArray {
+  return viewBytesAsDtype(bytes, dtype);
+}
+
+type TypedArray =
+  | Int8Array
+  | Uint8Array
+  | Int16Array
+  | Uint16Array
+  | Int32Array
+  | Uint32Array
+  | Float64Array;
+
+function viewBytesAsDtype(
+  sectionBytes: Uint8Array,
+  dtype: SectionEntry["dtype"],
+): TypedArray {
+  switch (dtype) {
+    case "i8":
+      return new Int8Array(
+        sectionBytes.buffer,
+        sectionBytes.byteOffset,
+        sectionBytes.byteLength,
+      );
+    case "u8":
+    case "blob":
+    case "strings":
+      return sectionBytes;
+    case "i16":
+      return new Int16Array(
+        sectionBytes.buffer,
+        sectionBytes.byteOffset,
+        sectionBytes.byteLength / 2,
+      );
+    case "u16":
+      return new Uint16Array(
+        sectionBytes.buffer,
+        sectionBytes.byteOffset,
+        sectionBytes.byteLength / 2,
+      );
+    case "i32":
+      return new Int32Array(
+        sectionBytes.buffer,
+        sectionBytes.byteOffset,
+        sectionBytes.byteLength / 4,
+      );
+    case "u32":
+      return new Uint32Array(
+        sectionBytes.buffer,
+        sectionBytes.byteOffset,
+        sectionBytes.byteLength / 4,
+      );
+    case "f64":
+      return new Float64Array(
+        sectionBytes.buffer,
+        sectionBytes.byteOffset,
+        sectionBytes.byteLength / 8,
+      );
+  }
+}
