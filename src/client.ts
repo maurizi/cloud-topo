@@ -424,7 +424,7 @@ export class CtopoClient {
     this.meta = args.parsed.meta;
     this.sections = args.parsed.sections;
     this.transform = this.meta.transform;
-    this.sectionByName = new Map(this.sections.map((s) => [s.name, s]));
+    this.sectionByName = new Map(this.sections.map(s => [s.name, s]));
     this.coalesceGapBytes = args.coalesceGapBytes;
     this.coalesceGapByFamily = args.coalesceGapByFamily;
     this.maxChunkBytes = args.maxChunkBytes;
@@ -651,23 +651,35 @@ export class CtopoClient {
     const polyEntry = this.sectionEntry(`${layer}/poly_offsets`);
     const ringEntry = this.sectionEntry(`${layer}/ring_offsets`);
     const arcRefEntry = this.sectionEntry(`${layer}/arc_refs`);
+    // multi_poly_breaks is sparse — encoder omits the section entirely
+    // for layers with no multi-entry MultiPolygon features. Treat
+    // absence as an empty break list.
+    const breaksEntry = this.sectionByName.get(`${layer}/multi_poly_breaks`);
 
     const promise = (async () => {
-      // Fire all three section fetches concurrently — when they all
-      // share a compression group (the common case after grouping),
-      // they hit the same in-flight decompress via the group cache
-      // and resolve from one fetch. When they're independent
-      // sections (older files, or layers larger than one group),
-      // they parallelize through the normal range pipeline.
-      const [polyBytes, ringBytes, arcRefsBytes] = await Promise.all([
-        this.fetchSectionBytes(polyEntry, signal),
-        this.fetchSectionBytes(ringEntry, signal),
-        this.fetchSectionBytes(arcRefEntry, signal),
-      ]);
+      // Fire all section fetches concurrently — when they all share a
+      // compression group (the common case after grouping), they hit
+      // the same in-flight decompress via the group cache and resolve
+      // from one fetch. When they're independent sections (older
+      // files, or layers larger than one group), they parallelize
+      // through the normal range pipeline.
+      const [polyBytes, ringBytes, arcRefsBytes, breakBytes] =
+        await Promise.all([
+          this.fetchSectionBytes(polyEntry, signal),
+          this.fetchSectionBytes(ringEntry, signal),
+          this.fetchSectionBytes(arcRefEntry, signal),
+          breaksEntry !== undefined
+            ? this.fetchSectionBytes(breaksEntry, signal)
+            : Promise.resolve(undefined),
+        ]);
       return {
         polyOffsets: viewU32WithDelta(polyBytes, polyEntry.delta === true),
         ringOffsets: viewU32WithDelta(ringBytes, ringEntry.delta === true),
         arcRefs: viewDecompressedSection(arcRefsBytes, "i32") as Int32Array,
+        multiPolyBreaks:
+          breakBytes !== undefined
+            ? (viewDecompressedSection(breakBytes, "u32") as Uint32Array)
+            : new Uint32Array(0),
       };
     })();
     this.layerGeometryCache.set(layer, promise);
@@ -845,7 +857,7 @@ export class CtopoClient {
       if (entry === undefined) {
         throw new Error("ctopo: container is missing the arc_offsets section");
       }
-      this.arcOffsetsPromise = this.fetchSectionBytes(entry).then((bytes) =>
+      this.arcOffsetsPromise = this.fetchSectionBytes(entry).then(bytes =>
         viewU32WithDelta(bytes, entry.delta === true),
       );
     }
@@ -873,7 +885,7 @@ export class CtopoClient {
       const end = this.arcCoordsBase + arcOffsets[arcId + 1];
       out.set(arcId, EMPTY_BYTES);
       promises.push(
-        this.enqueueSectionFetch("arcs", start, end).then((bytes) => {
+        this.enqueueSectionFetch("arcs", start, end).then(bytes => {
           out.set(arcId, bytes);
         }),
       );
@@ -928,14 +940,12 @@ export class CtopoClient {
       }
       out.set(arcId, EMPTY_BYTES);
       promises.push(
-        this.getDecompressedArcCoordBlock(blockIdx, blocks).then(
-          (blockBytes) => {
-            out.set(
-              arcId,
-              blockBytes.subarray(offsetInBlock, offsetInBlock + lenInBlock),
-            );
-          },
-        ),
+        this.getDecompressedArcCoordBlock(blockIdx, blocks).then(blockBytes => {
+          out.set(
+            arcId,
+            blockBytes.subarray(offsetInBlock, offsetInBlock + lenInBlock),
+          );
+        }),
       );
     }
     if (uniqueCount > 0) {
@@ -990,7 +1000,7 @@ export class CtopoClient {
         );
       }
       this.arcCoordBlocksPromise = this.fetchSectionBytes(entry).then(
-        (bytes) =>
+        bytes =>
           new Uint32Array(bytes.buffer, bytes.byteOffset, bytes.byteLength / 4),
       );
     }
@@ -1149,7 +1159,7 @@ export class CtopoClient {
     for (let i = this.inFlightRanges.length - 1; i >= 0; i--) {
       const r = this.inFlightRanges[i];
       if (r.start <= start && end <= r.end) {
-        return r.promise.then((bytes) =>
+        return r.promise.then(bytes =>
           bytes.subarray(start - r.start, end - r.start),
         );
       }
@@ -1308,8 +1318,7 @@ export class CtopoClient {
         for (const chunk of familyChunks) {
           const chunkSize = chunk.end - chunk.start;
           const wouldExceedRanges = group.length >= this.maxRangesPerRequest;
-          const wouldExceedBytes =
-            groupBytes + chunkSize > this.maxChunkBytes;
+          const wouldExceedBytes = groupBytes + chunkSize > this.maxChunkBytes;
 
           if (group.length > 0 && (wouldExceedRanges || wouldExceedBytes)) {
             if (group.length === 1) {
@@ -1361,7 +1370,7 @@ export class CtopoClient {
       }
     }
 
-    const multiRangeCount = tasks.filter((t) => t.kind === "multi").length;
+    const multiRangeCount = tasks.filter(t => t.kind === "multi").length;
     perfLog(
       `[ctopo] flush: ${logicals.length} logical range(s) → ${chunks.length} chunk(s) → ${tasks.length} task(s)` +
         (multiRangeCount > 0 ? ` (${multiRangeCount} multi-range)` : "") +
@@ -1370,7 +1379,7 @@ export class CtopoClient {
 
     // Fire tasks with bounded concurrency. Each task (single or multi-
     // range) occupies one concurrency slot.
-    await runWithConcurrency(tasks, this.maxParallelRanges, async (task) => {
+    await runWithConcurrency(tasks, this.maxParallelRanges, async task => {
       if (task.kind === "single") {
         await this.dispatchSingleChunk(task.chunk, task.priority);
       } else {
@@ -1495,7 +1504,7 @@ export class CtopoClient {
     }
 
     try {
-      const ranges = chunks.map((c) => ({ start: c.start, end: c.end }));
+      const ranges = chunks.map(c => ({ start: c.start, end: c.end }));
       const result = await this.fetcher.multiRange!(
         ranges,
         this.closeController.signal,
@@ -1518,7 +1527,7 @@ export class CtopoClient {
         await runWithConcurrency(
           chunks,
           this.maxParallelRanges,
-          async (chunk) => {
+          async chunk => {
             await this.dispatchSingleChunk(chunk, priority);
           },
         );

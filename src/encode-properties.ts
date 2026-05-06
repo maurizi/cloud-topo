@@ -30,38 +30,55 @@ const INT16_MAX = 32767;
 
 // --- Public API ---
 
-// 3-level CSR encoded as geometry → ring → arc. The polygon level is
-// collapsed: a MultiPolygon's rings are flattened across its polygons.
-// Reconstruction (e.g. for `feature()`) groups rings into polygons by
-// area containment — largest ring is the exterior, smaller nested
-// rings are holes.
+// 2-level CSR (geometry → ring → arc) for the common case, plus a sparse
+// `multiPolyBreaks` side-table that records polygon boundaries inside any
+// MultiPolygon feature with more than one polygon entry. For typical
+// topologies (overwhelmingly single-Polygon features) the side-table is
+// empty, so we pay zero overhead in the dense offsets arrays.
+//
+// `multiPolyBreaks` is a flat Uint32Array of interleaved (geomIndex,
+// ringIndex) pairs, sorted by geomIndex. Each pair marks the ring index
+// at which a new polygon entry starts WITHIN a multi-entry MultiPolygon.
+// The first polygon of every geom is implicit (it starts at polyOffsets[g])
+// and is not listed.
 export function buildLayerCSR(
   geometries: ReadonlyArray<GeometryObject<Properties>>,
 ): {
   polyOffsets: Uint32Array;
   ringOffsets: Uint32Array;
   arcRefs: Int32Array;
+  multiPolyBreaks: Uint32Array;
 } {
   let totalRings = 0;
   let totalArcRefs = 0;
+  let totalBreaks = 0;
   for (const geom of geometries) {
-    for (const poly of polygonsOf(geom)) {
+    const polys = polygonsOf(geom);
+    for (const poly of polys) {
       totalRings += poly.length;
       for (const ring of poly) totalArcRefs += ring.length;
     }
+    if (polys.length > 1) totalBreaks += polys.length - 1;
   }
 
   const polyOffsets = new Uint32Array(geometries.length + 1);
   const ringOffsets = new Uint32Array(totalRings + 1);
   const arcRefs = new Int32Array(totalArcRefs);
+  const multiPolyBreaks = new Uint32Array(totalBreaks * 2);
 
   let ringCursor = 0;
   let arcCursor = 0;
+  let breakCursor = 0;
 
   for (let g = 0; g < geometries.length; g++) {
     polyOffsets[g] = ringCursor;
-    for (const poly of polygonsOf(geometries[g])) {
-      for (const ring of poly) {
+    const polys = polygonsOf(geometries[g]);
+    for (let p = 0; p < polys.length; p++) {
+      if (p > 0) {
+        multiPolyBreaks[breakCursor++] = g;
+        multiPolyBreaks[breakCursor++] = ringCursor;
+      }
+      for (const ring of polys[p]) {
         ringOffsets[ringCursor++] = arcCursor;
         for (const arcId of ring) arcRefs[arcCursor++] = arcId;
       }
@@ -70,7 +87,7 @@ export function buildLayerCSR(
   polyOffsets[geometries.length] = ringCursor;
   ringOffsets[totalRings] = arcCursor;
 
-  return { polyOffsets, ringOffsets, arcRefs };
+  return { polyOffsets, ringOffsets, arcRefs, multiPolyBreaks };
 }
 
 // Walk every geometry's `properties` for a layer. Each leaf path becomes one
@@ -155,6 +172,8 @@ export function buildPropertySection(
 // Other geometry types (Point, LineString, etc.) carry no polygon arcs and
 // are encoded as zero-polygon entries — they still consume a slot in
 // poly_offsets so geometry indices align with the layer's geometries array.
+// Geoms with polys.length > 1 also contribute to the layer's multi_poly_breaks
+// section (one entry per polygon beyond the first).
 function polygonsOf(
   geom: GeometryObject<Properties>,
 ): ReadonlyArray<ReadonlyArray<ReadonlyArray<number>>> {

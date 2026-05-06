@@ -54,11 +54,15 @@ import { CtopoClient, merge, neighbors, bbox } from "cloud-topo";
 // Open — issues two parallel Range GETs (front + suffix)
 const client = await CtopoClient.open("https://example.com/region.ctopo");
 
-// Merge a subset of features into a single MultiPolygon
+// Merge a subset of features
 const boundary = await merge(client, [
   { layer: "blocks", indices: [0, 1, 5, 12] }
 ]);
-// → GeoJSON MultiPolygon with merged outer ring
+// → GeoJSON MultiPolygon. One output polygon per connected component
+// of the input (polygons sharing arcs merge; disconnected groups stay
+// separate). Within each component the largest-area ring is the
+// exterior; smaller rings are holes. Matches topojson-client's
+// `merge` semantics.
 
 // Find adjacency (which features share an arc)
 const adj = await neighbors(client, "blocks");
@@ -128,8 +132,8 @@ Non-overridden sections pass through byte-for-byte; only the named properties ar
 | `client.layerGeometry(layer, signal?)` | method | Fetch CSR geometry for a layer |
 | `client.fetchArcs(ids, signal?)` | method | Fetch raw arc coordinate bytes |
 | `openContainer(url, opts?)` | function | Shorthand for `CtopoClient.open` |
-| `merge(client, selections, signal?)` | function | Merge features → GeoJSON MultiPolygon |
-| `mergeArcs(client, selections, signal?)` | function | Merge features → arc-id MultiPolygon (no coord decode) |
+| `merge(client, selections, signal?)` | function | Merge features → GeoJSON MultiPolygon (one polygon per connected component; largest-area ring is exterior, rest are holes) |
+| `mergeArcs(client, selections, signal?)` | function | Same grouping as `merge`, but returns signed arc-id rings instead of decoded coords |
 | `neighbors(client, layer, signal?)` | function | Per-feature adjacency via shared arcs |
 | `bbox(client)` | function | Container bounding box `[minX, minY, maxX, maxY]` |
 | `transform(t)` | function | Returns quantization transform function |
@@ -160,7 +164,7 @@ Non-overridden sections pass through byte-for-byte; only the named properties ar
 |---|---|
 | `encodeContainer(topology, opts?)` | TopoJSON → `.ctopo` Buffer |
 | `writeContainer(path, topology, opts?)` | Encode and write to file |
-| `rewriteContainer(inPath, outPath, overrides?)` | Mutate properties in an existing container |
+| `rewriteContainer(inPath, outPath, overrides, opts?)` | Mutate named property sections in an existing container; `opts.frontLoadedSectionNames` adds extras to the front-load set |
 
 ## License
 

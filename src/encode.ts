@@ -7,6 +7,7 @@
  * Walks a TopoJSON Topology and emits one container with:
  *   - global arcs (arc_offsets + arc_coords)
  *   - per-layer geometry CSR triples (poly_offsets, ring_offsets, arc_refs)
+ *     plus an optional sparse multi_poly_breaks section per layer
  *   - per-layer per-property sections (auto-detected dtype)
  *   - per-layer string sections for non-numeric properties
  *
@@ -59,6 +60,7 @@ import {
   invertPermutation,
   remapArcRefs,
   typedArrayBytes,
+  type SpatialSort,
 } from "./encode-arcs";
 export type { SpatialSort } from "./encode-arcs";
 import {
@@ -177,7 +179,7 @@ export interface EncodeOptions {
   // Within-tier visit-order algorithm for arc_coords packing.
   // Default 'hilbert'. See SpatialSort docs for the alternatives;
   // hierarchical-hilbert is the production winner.
-  readonly spatialSort?: import("./encode-arcs").SpatialSort;
+  readonly spatialSort?: SpatialSort;
   // Bench instrumentation hooks. Both fire synchronously and should
   // stay cheap. No-op when omitted; no behavior change.
   readonly onSectionEncoded?: (event: SectionEncodedEvent) => void;
@@ -407,6 +409,17 @@ export async function encodeContainer(
       bytes: typedArrayBytes(csr.arcRefs),
       frontLoad: true,
     });
+    // multi_poly_breaks: sparse — typically empty for layers without
+    // multi-entry MultiPolygon features. Front-loaded so merge() can
+    // recover the original polygon grouping without an extra round trip.
+    if (csr.multiPolyBreaks.length > 0) {
+      sections.push({
+        name: `${layerName}/multi_poly_breaks`,
+        dtype: "u32",
+        bytes: typedArrayBytes(csr.multiPolyBreaks),
+        frontLoad: true,
+      });
+    }
     perLayerProperties.push({
       name: layerName,
       props: collectPropertySections(layerName, geometries),
@@ -619,7 +632,8 @@ function shouldCompressSection(name: string, dtype: DType): boolean {
   if (
     name.endsWith("/poly_offsets") ||
     name.endsWith("/ring_offsets") ||
-    name.endsWith("/arc_refs")
+    name.endsWith("/arc_refs") ||
+    name.endsWith("/multi_poly_breaks")
   ) {
     return true;
   }
@@ -641,6 +655,7 @@ function isStructurallyFrontLoaded(name: string): boolean {
   if (name.endsWith("/poly_offsets")) return true;
   if (name.endsWith("/ring_offsets")) return true;
   if (name.endsWith("/arc_refs")) return true;
+  if (name.endsWith("/multi_poly_breaks")) return true;
   return false;
 }
 

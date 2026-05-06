@@ -34,6 +34,7 @@ export {
 export {
   CtopoClient,
   openContainer,
+  type CtopoClientStats,
   type OpenContainerOptions,
 } from "./client";
 export {

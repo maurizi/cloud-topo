@@ -187,11 +187,17 @@ export class StringArray {
   }
 }
 
-// Per-layer geometry triple (CSR-encoded MultiPolygon → polygon → ring → arc).
+// Per-layer geometry triple (CSR-encoded geometry → ring → arc), plus a
+// sparse `multiPolyBreaks` side-table marking polygon boundaries WITHIN
+// any geometry whose source is a MultiPolygon with more than one polygon
+// entry. Encoded as flat (geomIndex, ringIndex) u32 pairs (sorted by
+// geomIndex). Empty for typical layers where every feature is a single
+// Polygon — the implicit polygon at ring polyOffsets[g] is never recorded.
 export interface LayerGeometry {
   readonly polyOffsets: Uint32Array;
   readonly ringOffsets: Uint32Array;
   readonly arcRefs: Int32Array;
+  readonly multiPolyBreaks: Uint32Array;
 }
 
 // Property override for rewriteContainer — pass raw arrays and the encoder

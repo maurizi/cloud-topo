@@ -15,7 +15,7 @@ import { type MultiPolygon } from "geojson";
 
 import { type CtopoClient } from "./client";
 import { readVarintZigzag } from "./format";
-import { type LayerSelection } from "./types";
+import { type LayerGeometry, type LayerSelection } from "./types";
 
 // Topojson arcs are global across layers, so cancellation works
 // uniformly even for multi-layer inputs.
@@ -37,58 +37,92 @@ export async function mergeArcs(
   inputs: ReadonlyArray<LayerSelection>,
   signal?: AbortSignal,
 ): Promise<MultiPolygonArcs> {
-  const boundaryArcs = await collectBoundaryArcs(client, inputs, signal);
-  if (boundaryArcs.length === 0) {
-    return { type: "MultiPolygon", arcs: [] };
-  }
-  const arcBytes = await client.fetchArcs(absArcIds(boundaryArcs), signal);
+  const polygons = await buildInputPolygons(client, inputs, signal);
+  if (polygons.length === 0) return { type: "MultiPolygon", arcs: [] };
+
+  const polygonsByArc = buildPolygonsByArc(polygons);
+  const groups = groupPolygonsByConnectivity(polygons, polygonsByArc);
+
+  // Collect every group's exterior arcs in one go so we can fetch
+  // arc-endpoint bytes in a single batched call rather than one
+  // fetch per group.
+  const allExteriorArcs: number[] = [];
+  const groupExteriorArcs: number[][] = groups.map((group) => {
+    const ext = exteriorArcsForGroup(group, polygonsByArc);
+    for (const a of ext) allExteriorArcs.push(a);
+    return ext;
+  });
+  if (allExteriorArcs.length === 0) return { type: "MultiPolygon", arcs: [] };
+
+  const arcBytes = await client.fetchArcs(absArcIds(allExteriorArcs), signal);
   const endpoints = makeEndpointLookup(arcBytes, client);
-  const rings = stitchArcs(boundaryArcs, endpoints);
-  // No coord decode here — arc-id rings only. Group into one polygon
-  // per ring (callers can re-group by area if they care about
-  // exterior/hole classification at the topology level).
-  return {
-    type: "MultiPolygon",
-    arcs: rings.map((ring) => [ring]),
-  };
+
+  const out: number[][][] = [];
+  for (const ext of groupExteriorArcs) {
+    if (ext.length === 0) continue;
+    const rings = stitchArcs(ext, endpoints);
+    if (rings.length === 0) continue;
+    // At most one ring in a connected group can be the exterior;
+    // pick the largest by area. Rest become holes of the same
+    // polygon. Area is computed from the arc-id stitching using
+    // arc endpoints — but to avoid decoding coords here we defer
+    // ordering to the callers of mergeArcs that actually care.
+    // Topojson-client's mergeArcs returns arcs in stitch order;
+    // we match that contract — `merge` does the area-ordered
+    // exterior selection.
+    out.push(rings);
+  }
+  return { type: "MultiPolygon", arcs: out };
 }
 
 // `merge` — union of inputs as decoded GeoJSON MultiPolygon. Fetches
-// boundary arc coord bytes, stitches into rings, decodes, and groups
-// rings into polygons by area (largest = exterior).
+// boundary arc coord bytes, stitches into rings, decodes, and assembles
+// one output polygon per connected component of input polygons (matches
+// topojson-client's `merge` semantics). Within each component the
+// largest-area stitched ring becomes the exterior; the rest are holes.
 export async function merge(
   client: CtopoClient,
   inputs: ReadonlyArray<LayerSelection>,
   signal?: AbortSignal,
 ): Promise<MultiPolygon> {
-  const boundaryArcs = await collectBoundaryArcs(client, inputs, signal);
-  if (boundaryArcs.length === 0) {
-    return { type: "MultiPolygon", coordinates: [] };
-  }
-  const arcBytes = await client.fetchArcs(absArcIds(boundaryArcs), signal);
-  const endpoints = makeEndpointLookup(arcBytes, client);
-  const rings = stitchArcs(boundaryArcs, endpoints);
-  const decoded = rings
-    .map((ring) => decodeRing(ring, arcBytes, client))
-    .filter((r) => r.length >= 4);
-  if (decoded.length === 0) return { type: "MultiPolygon", coordinates: [] };
+  const polygons = await buildInputPolygons(client, inputs, signal);
+  if (polygons.length === 0) return { type: "MultiPolygon", coordinates: [] };
 
-  // Group rings into polygons by area: largest ring is the exterior;
-  // smaller rings nested inside it are holes. For inputs that resolve
-  // to multiple disconnected components this collapses to a single
-  // polygon with all smaller rings as holes — callers that need true
-  // polygon decomposition (point-in-polygon containment) should run
-  // the rings through a downstream classifier, or call merge once per
-  // component instead.
-  if (decoded.length === 1) {
-    return { type: "MultiPolygon", coordinates: [decoded] };
+  const polygonsByArc = buildPolygonsByArc(polygons);
+  const groups = groupPolygonsByConnectivity(polygons, polygonsByArc);
+
+  const allExteriorArcs: number[] = [];
+  const groupExteriorArcs: number[][] = groups.map((group) => {
+    const ext = exteriorArcsForGroup(group, polygonsByArc);
+    for (const a of ext) allExteriorArcs.push(a);
+    return ext;
+  });
+  if (allExteriorArcs.length === 0)
+    return { type: "MultiPolygon", coordinates: [] };
+
+  const arcBytes = await client.fetchArcs(absArcIds(allExteriorArcs), signal);
+  const endpoints = makeEndpointLookup(arcBytes, client);
+
+  const coordinates: number[][][][] = [];
+  for (const ext of groupExteriorArcs) {
+    if (ext.length === 0) continue;
+    const rings = stitchArcs(ext, endpoints);
+    const decoded = rings
+      .map((ring) => decodeRing(ring, arcBytes, client))
+      .filter((r) => r.length >= 4);
+    if (decoded.length === 0) continue;
+    if (decoded.length === 1) {
+      coordinates.push(decoded);
+      continue;
+    }
+    // Largest area = exterior; others are holes inside it. In planar
+    // topology this is exact — a hole strictly contained in the
+    // exterior is necessarily smaller in area.
+    const indexed = decoded.map((r, i) => ({ area: ringArea(r), idx: i }));
+    indexed.sort((a, b) => b.area - a.area);
+    coordinates.push(indexed.map((x) => decoded[x.idx]));
   }
-  const indexed = decoded.map((r, i) => ({ area: ringArea(r), idx: i }));
-  indexed.sort((a, b) => b.area - a.area);
-  return {
-    type: "MultiPolygon",
-    coordinates: [indexed.map((x) => decoded[x.idx])],
-  };
+  return { type: "MultiPolygon", coordinates };
 }
 
 // --- neighbors ---
@@ -191,47 +225,163 @@ export function untransform(
 // (negative ref ~i) increments revCount[i]. An arc that ends up with
 // fwdCount === revCount is interior (cancels). Otherwise it's a
 // boundary arc, signed by its dominant direction in the input.
-async function collectBoundaryArcs(
+// One TopoJSON polygon entry as a list of arc rings. Distinct entries
+// of the same MultiPolygon (e.g. island-in-lake) are kept separate so
+// connectivity grouping can recover the original polygon structure.
+interface InputPolygon {
+  readonly rings: ReadonlyArray<ReadonlyArray<number>>;
+}
+
+async function buildInputPolygons(
   client: CtopoClient,
   inputs: ReadonlyArray<LayerSelection>,
   signal: AbortSignal | undefined,
-): Promise<number[]> {
+): Promise<InputPolygon[]> {
   if (inputs.length === 0) return [];
-  const numArcs = client.meta.numArcs;
-  const fwdCount = new Int32Array(numArcs);
-  const revCount = new Int32Array(numArcs);
-
-  // Load every needed layer's CSR in parallel.
   const layerCsr = await Promise.all(
     inputs.map((input) => client.layerGeometry(input.layer, signal)),
   );
-
+  const polygons: InputPolygon[] = [];
   for (let i = 0; i < inputs.length; i++) {
-    const csr = layerCsr[i];
-    for (const geomIdx of inputs[i].indices) {
-      const ringStart = csr.polyOffsets[geomIdx];
-      const ringEnd = csr.polyOffsets[geomIdx + 1];
-      for (let r = ringStart; r < ringEnd; r++) {
-        const arcStart = csr.ringOffsets[r];
-        const arcEnd = csr.ringOffsets[r + 1];
-        for (let a = arcStart; a < arcEnd; a++) {
-          const signed = csr.arcRefs[a];
-          if (signed >= 0) fwdCount[signed]++;
-          else revCount[~signed]++;
+    expandLayerPolygons(layerCsr[i], inputs[i].indices, polygons);
+  }
+  return polygons;
+}
+
+function expandLayerPolygons(
+  csr: LayerGeometry,
+  geomIndices: Iterable<number>,
+  out: InputPolygon[],
+): void {
+  // Index the sparse multi_poly_breaks table by geom for O(1) lookup
+  // per geom we visit. Empty in the typical single-Polygon-only case.
+  const breaksByGeom = new Map<number, number[]>();
+  for (let i = 0; i < csr.multiPolyBreaks.length; i += 2) {
+    const g = csr.multiPolyBreaks[i];
+    const r = csr.multiPolyBreaks[i + 1];
+    let list = breaksByGeom.get(g);
+    if (list === undefined) {
+      list = [];
+      breaksByGeom.set(g, list);
+    }
+    list.push(r);
+  }
+
+  for (const g of geomIndices) {
+    const ringStart = csr.polyOffsets[g];
+    const ringEnd = csr.polyOffsets[g + 1];
+    if (ringStart === ringEnd) continue; // non-polygon geom
+    const breaks = breaksByGeom.get(g);
+    if (breaks === undefined) {
+      out.push(makeInputPolygon(csr, ringStart, ringEnd));
+      continue;
+    }
+    // Polygon entry boundaries within geom g: ringStart, *breaks, ringEnd.
+    let prev = ringStart;
+    for (const b of breaks) {
+      out.push(makeInputPolygon(csr, prev, b));
+      prev = b;
+    }
+    out.push(makeInputPolygon(csr, prev, ringEnd));
+  }
+}
+
+function makeInputPolygon(
+  csr: LayerGeometry,
+  ringStart: number,
+  ringEnd: number,
+): InputPolygon {
+  const rings: number[][] = [];
+  for (let r = ringStart; r < ringEnd; r++) {
+    const arcStart = csr.ringOffsets[r];
+    const arcEnd = csr.ringOffsets[r + 1];
+    const ring = new Array<number>(arcEnd - arcStart);
+    for (let a = arcStart; a < arcEnd; a++) ring[a - arcStart] = csr.arcRefs[a];
+    rings.push(ring);
+  }
+  return { rings };
+}
+
+// Map unsigned arc id → indices of the InputPolygons that reference it.
+// An arc with a single membership is on the exterior of its group; an
+// arc with ≥2 memberships is interior (cancels during merge).
+function buildPolygonsByArc(
+  polygons: ReadonlyArray<InputPolygon>,
+): Map<number, number[]> {
+  const m = new Map<number, number[]>();
+  for (let p = 0; p < polygons.length; p++) {
+    for (const ring of polygons[p].rings) {
+      for (const signed of ring) {
+        const id = signed < 0 ? ~signed : signed;
+        let arr = m.get(id);
+        if (arr === undefined) {
+          arr = [];
+          m.set(id, arr);
+        }
+        arr.push(p);
+      }
+    }
+  }
+  return m;
+}
+
+// BFS: two input polygons are connected iff they share any arc.
+// Each connected component becomes one polygon in the merged output —
+// preserving the original topology's polygon grouping (an island sitting
+// in a lake remains its own polygon, separate from the surrounding mass).
+function groupPolygonsByConnectivity(
+  polygons: ReadonlyArray<InputPolygon>,
+  polygonsByArc: ReadonlyMap<number, ReadonlyArray<number>>,
+): InputPolygon[][] {
+  const visited = new Uint8Array(polygons.length);
+  const groups: InputPolygon[][] = [];
+  for (let start = 0; start < polygons.length; start++) {
+    if (visited[start] !== 0) continue;
+    visited[start] = 1;
+    const group: InputPolygon[] = [];
+    const stack: number[] = [start];
+    while (stack.length > 0) {
+      const idx = stack.pop() as number;
+      group.push(polygons[idx]);
+      for (const ring of polygons[idx].rings) {
+        for (const signed of ring) {
+          const id = signed < 0 ? ~signed : signed;
+          const neighbors = polygonsByArc.get(id);
+          if (neighbors === undefined) continue;
+          for (const other of neighbors) {
+            if (visited[other] === 0) {
+              visited[other] = 1;
+              stack.push(other);
+            }
+          }
+        }
+      }
+    }
+    groups.push(group);
+  }
+  return groups;
+}
+
+// Within a connected group, an arc is on the exterior boundary iff it
+// belongs to exactly one input polygon. Arcs with ≥2 memberships are
+// interior (shared between two polygons in the group) and cancel.
+function exteriorArcsForGroup(
+  group: ReadonlyArray<InputPolygon>,
+  polygonsByArc: ReadonlyMap<number, ReadonlyArray<number>>,
+): number[] {
+  const out: number[] = [];
+  for (const poly of group) {
+    for (const ring of poly.rings) {
+      for (const signed of ring) {
+        const id = signed < 0 ? ~signed : signed;
+        const memberships = polygonsByArc.get(id);
+        if (memberships !== undefined && memberships.length < 2) {
+          out.push(signed);
         }
       }
     }
   }
-
-  const boundary: number[] = [];
-  for (let i = 0; i < numArcs; i++) {
-    const fwd = fwdCount[i];
-    const rev = revCount[i];
-    if (fwd === rev) continue;
-    if (fwd > rev) boundary.push(i);
-    else boundary.push(~i);
-  }
-  return boundary;
+  return out;
 }
 
 function absArcIds(signed: ReadonlyArray<number>): number[] {

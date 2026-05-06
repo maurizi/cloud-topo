@@ -16,11 +16,7 @@
  * when there's only one layer).
  */
 
-import {
-  type GeometryObject,
-  type Properties,
-  type Topology,
-} from "topojson-specification";
+import { type Topology } from "topojson-specification";
 
 import { VARINT_MAX_BYTES, writeVarintZigzag } from "./format";
 

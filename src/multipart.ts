@@ -16,9 +16,7 @@ export interface ByteRangePart {
   bytes: Uint8Array;
 }
 
-const CRLF = [0x0d, 0x0a]; // \r\n
 const DOUBLE_CRLF = [0x0d, 0x0a, 0x0d, 0x0a]; // \r\n\r\n
-const DASH_DASH = [0x2d, 0x2d]; // --
 
 /**
  * Extract the boundary string from a Content-Type header value like:

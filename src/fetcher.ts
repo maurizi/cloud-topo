@@ -157,7 +157,7 @@ export function makeHttpFetcher(url: string): RangeFetcher {
       // Server ignored the Range header and returned the full object.
       // Consuming it would give the caller the entire file instead of
       // the requested slice, corrupting every section read. Abort early.
-      response.body?.cancel();
+      void response.body?.cancel();
       throw new Error(
         `ctopo: server does not support Range requests (returned 200 for ${rangeHeader})`,
       );
@@ -233,7 +233,7 @@ export function makeHttpFetcher(url: string): RangeFetcher {
       // download (could be the entire file) and signal the client to
       // fall back to individual range requests.
       if (response.status === 200) {
-        response.body?.cancel();
+        void response.body?.cancel();
         perfLog(
           `[ctopo] #${id} MULTI-GET got 200 (no multi-range support), aborting after ${(performance.now() - t0).toFixed(0)}ms`,
         );
@@ -262,9 +262,7 @@ export function makeHttpFetcher(url: string): RangeFetcher {
       }
       const match = /bytes (\d+)-(\d+)\/(\d+|\*)/.exec(contentRange);
       if (match === null) {
-        throw new Error(
-          `ctopo: unparseable Content-Range: ${contentRange}`,
-        );
+        throw new Error(`ctopo: unparseable Content-Range: ${contentRange}`);
       }
       const start = Number(match[1]);
       const end = Number(match[2]) + 1;
