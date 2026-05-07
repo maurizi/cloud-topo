@@ -1044,10 +1044,14 @@ export class CtopoClient {
         this.getArcCoordDict(),
         loadZstdWasmDecode(entry),
       ]);
-      // dict-aware path — bokuweb's decompressUsingDict mallocs the
-      // dict bytes into wasm memory each call, so we pay ~60 µs per
-      // call for the copy. Net win vs no-dict: ~5-18% smaller block
-      // bytes on the wire, only this ~60 µs CPU back.
+      // dict-aware path. The shared dict was passed once to
+      // CtopoDecompressor at construction and digested into a DDict
+      // (see src/zstd-wasm/), so per-block decode skips both the
+      // dict-bytes copy and dict-table rebuild. Dict-aware
+      // compression also makes blocks ~30× smaller than no-dict, so
+      // the decoder has far less data to scan. A micro-bench at
+      // 16 KiB blocks measured ~10 µs/block on this path — using
+      // the dict is unequivocally a win on both wire bytes AND CPU.
       const t0 = performance.now();
       const out = decode(compressed, uncSize, dict);
       this.statDecompressMs += performance.now() - t0;

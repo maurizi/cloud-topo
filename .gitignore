@@ -1,3 +1,11 @@
 node_modules/
 dist/
 *.tgz
+
+# Rust subproject build artifacts. The wasm + JS glue in
+# src/zstd-wasm/ is checked in so consumers don't need a Rust
+# toolchain; regenerate via `npm run build:wasm` when crate source
+# changes.
+crates/*/target/
+crates/*/pkg/
+crates/*/Cargo.lock
