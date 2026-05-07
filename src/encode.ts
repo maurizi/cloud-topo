@@ -102,7 +102,7 @@ export interface BuiltSection {
 // log lines or a spinner so long zstd-L19 encode passes show
 // activity instead of looking hung.
 export interface EncodeProgress {
-  // Stage label: "tier-order" | "build-arcs" | "build-properties" |
+  // Stage label: "arc-order" | "build-arcs" | "build-properties" |
   // "compress-group". Free-form so we can add new stages without
   // breaking listeners.
   readonly stage: string;
@@ -146,7 +146,7 @@ export interface SectionEncodedEvent {
 // down encode wall-clock without touching the encoder internals.
 export interface PhaseTimingEvent {
   // Free-form so new phases can be added without a breaking change.
-  // Current values: "build-csr" | "tier-order" | "build-arcs" |
+  // Current values: "build-csr" | "arc-order" | "build-arcs" |
   // "block-compress" | "build-properties" | "assemble".
   readonly stage: string;
   readonly elapsedMs: number;
@@ -165,7 +165,7 @@ export interface EncodeOptions {
   // decodable zstd block within arc_coords. Smaller blocks reduce
   // wasted bandwidth on selective per-arc fetches; larger blocks
   // improve compression ratio. Aligned to whole-arc boundaries at
-  // emit time. Defaults to 64 KiB.
+  // emit time. Defaults to DEFAULT_ARC_COORD_BLOCK_BYTES (16 KiB).
   readonly arcCoordBlockBytes?: number;
   // App-specific sections to front-load alongside the encoder's
   // structural front-loaded set (arc_coords_dict, arc_coord_blocks,
@@ -611,10 +611,12 @@ export async function rewriteContainer(
 // --- Internal: section classification ---
 
 // Sections that contain typed numeric data or strings — everything
-// callers always read whole — get compressed. Only arc_coords stays
-// uncompressed because it's range-fetched in slices; its
-// compression needs the blocked-format work. arc_offsets is read
-// whole at open time, so it compresses freely.
+// callers always read whole — get compressed. Three sections stay
+// uncompressed: arc_coords (range-fetched in slices, compressed
+// per-block instead), arc_coord_blocks (the block table — fetched
+// eagerly), and arc_coords_dict (a trained zstd dict, won't
+// compress further). arc_offsets is read whole at open, so it
+// compresses freely.
 function shouldCompressSection(name: string, dtype: DType): boolean {
   if (name === "arc_coords") return false;
   // Block-compressed arc_coords block table: small (~12 bytes per
@@ -622,9 +624,10 @@ function shouldCompressSection(name: string, dtype: DType): boolean {
   // compression so it serves directly out of one Range fetch with
   // no decompressor setup.
   if (name === "arc_coord_blocks") return false;
-  // Shared dict is sample bytes already; would barely compress
-  // further, and must be available before any block can decompress
-  // (chicken-and-egg if it were compressed against another dict).
+  // Shared dict is a trained zstd dict (output of `zstd --train`);
+  // would barely compress further, and must be available before any
+  // block can decompress (chicken-and-egg if it were compressed
+  // against another dict).
   if (name === "arc_coords_dict") return false;
   // CSR triples (poly_offsets, ring_offsets, arc_refs per layer) are
   // small (~few MB for large topologies) and read whole, so compressing them is a
@@ -1171,7 +1174,6 @@ async function assembleContainer(input: AssembleInput): Promise<Buffer> {
   const view = new DataView(out.buffer, out.byteOffset, out.byteLength);
 
   // Header (16 B): magic + version + 8 reserved bytes (already zero).
-  // Header.
   view.setUint32(OFFSET_MAGIC, MAGIC, true);
   view.setUint32(OFFSET_VERSION, VERSION, true);
 
@@ -1182,7 +1184,6 @@ async function assembleContainer(input: AssembleInput): Promise<Buffer> {
 
   // Footer at the end of the file: section_count, meta_length,
   // section table, meta_json.
-  // Footer.
   const footerStart = dataStart + dataAreaSize;
   view.setUint32(footerStart + OFFSET_FOOTER_SECTION_COUNT, sectionCount, true);
   view.setUint32(
@@ -1208,7 +1209,6 @@ async function assembleContainer(input: AssembleInput): Promise<Buffer> {
 
   // Trailing 8 B: footer length so suffix-range readers can locate
   // the footer start without a HEAD round trip.
-  // Trailing footer length.
   writeBigUint64(view, totalSize - FOOTER_TRAILER_SIZE, footerLength);
 
   stderrLog(`[assemble] regions copied; returning ${memSnapshot()}`);

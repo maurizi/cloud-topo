@@ -220,7 +220,7 @@ describe("ctopo format", () => {
     expect(meta.layers).toEqual([{ name: "block", numGeometries: 2 }]);
 
     // arc_offsets — 8 entries (numArcs+1) of u32. The section is
-    // gzipped on disk; viewSectionAuto handles decompression.
+    // compressed on disk; viewSectionAuto handles decompression.
     const arcOffsetsEntry = sections.find((s) => s.name === "arc_offsets");
     expect(arcOffsetsEntry).toBeDefined();
     expect(arcOffsetsEntry?.dtype).toBe("u32");
@@ -604,7 +604,6 @@ describe("ctopo format", () => {
     writeFileSync(
       inPath,
       await encodeContainer(fixtureTopology(), {
-        blockCompressArcCoords: true,
         arcCoordBlockBytes: 32,
       }),
     );

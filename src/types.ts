@@ -19,7 +19,10 @@ export type DType =
   | "strings";
 
 // Per-section compression algorithm. `undefined` means the section
-// is stored uncompressed (currently only arc_coords, until #12).
+// is stored uncompressed — used for arc_coords (range-fetched in
+// slices), arc_coord_blocks (block table fetched eagerly), and
+// arc_coords_dict (already a trained zstd dict, won't compress
+// further and must be decodable before any block decompresses).
 //
 // "zst" is the default — best ratio on our data and ships with a
 // tiny (~7 KB) pure-JS fallback decoder (fzstd), preloaded in
@@ -108,14 +111,14 @@ export interface ContainerMeta {
   // arc_offsets references *logical* (uncompressed) arc-coord byte
   // positions; the client maps those through arcCoordsBlocks to find
   // which physical blocks to fetch and decompress. Absent when
-  // arc_coords is stored raw (the pre-#12 layout).
+  // arc_coords is stored raw (no block layout).
   readonly arcCoordsBlocks?: {
-    // Section name carrying the shared raw-content dictionary
-    // (just sample bytes — not a `zstd --train` output). Reader
-    // fetches it eagerly at open and reuses for every block decode.
-    // Optional — pre-#20 files that block-compressed without a
-    // shared dict omit this field; readers fall back to plain
-    // (no-dict) decode when it's absent.
+    // Section name carrying the shared trained zstd dictionary
+    // (output of `zstd --train` over a sample of arc-coord blocks).
+    // Reader fetches it eagerly at open and reuses for every block
+    // decode. Optional — files where the encoder skipped dict
+    // training (e.g., too few blocks for a stable train) omit this
+    // field; readers fall back to plain (no-dict) decode.
     readonly dictSection?: string;
     // Section name carrying the block table — a u32 array of triples
     // [uncompressedEnd, compressedOffset, compressedLength] per

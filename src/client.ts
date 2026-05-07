@@ -65,8 +65,8 @@ export { makeRangeFetcher, makeBufferFetcher } from "./fetcher";
 
 // Snapshot of bench-only counters captured by the client. These
 // run alongside the existing perfLog/BroadcastChannel path so
-// turning them on adds no extra logging — the bench just calls
-// getStats() at end of run and stashes the numbers in CSV.
+// turning them on adds no extra logging — callers snapshot the
+// numbers at end of run via getStats().
 export interface CtopoClientStats {
   // Total successful Range GETs fired through the fetcher. Cache
   // hits and in-flight de-dupe hits are NOT counted here.
@@ -171,9 +171,9 @@ export interface OpenContainerOptions {
   // to round-trip for the matching offset entries before it can
   // use the cached coord bytes — and that round-trip lands on the
   // critical path of the merge (eager-loaded offsets ran in
-  // parallel with header parsing instead). For state-sized
-  // regions arc_offsets is only ~6.7 MiB, so the default is
-  // effectively "the whole section": prefetchPrefix clamps to
+  // parallel with header parsing instead). For typical
+  // topologies arc_offsets is single-digit MiB, so the default
+  // is effectively "the whole section": prefetchPrefix clamps to
   // section.length, and a single coalesced GET in the background
   // keeps merges round-trip-free for the offset half. 0 disables.
   readonly arcOffsetsPrefetchBytes?: number;
@@ -283,16 +283,16 @@ const DEFAULT_BYTE_RANGE_CACHE = 128 * 1024 * 1024;
 // Multi-range request defaults.
 const DEFAULT_MAX_RANGES_PER_REQUEST = 20;
 // Open-time prefetch size for arc_coords. The encoder front-loads
-// top-layer boundary arcs (state outline + county boundaries) by
-// virtue of the visit-order assignment. 512 KiB comfortably covers
-// those for state-sized regions; the rest is fetched on demand by
-// the merge.
+// top-layer boundary arcs (outer perimeter + parent-layer interior
+// boundaries) by virtue of the visit-order assignment. 512 KiB
+// comfortably covers those for typical topologies; the rest is
+// fetched on demand by the merge.
 const DEFAULT_ARC_COORDS_PREFETCH = 512 * 1024;
 // Number.MAX_SAFE_INTEGER — the whole arc_offsets section.
 // prefetchPrefix clamps to section.length, so this just means "all of
-// it." For state-sized regions arc_offsets is ~6.7 MiB; for anything
-// dramatically larger callers should set arcOffsetsPrefetchBytes
-// down to keep open fast.
+// it." For typical topologies arc_offsets is single-digit MiB; for
+// anything dramatically larger callers should set
+// arcOffsetsPrefetchBytes down to keep open fast.
 const DEFAULT_ARC_OFFSETS_PREFETCH = Number.MAX_SAFE_INTEGER;
 
 // Sentinel placeholder used to mark an arc id as "claimed" in the
@@ -549,7 +549,7 @@ export class CtopoClient {
 
     // Skeleton prefetch sizing: the encoder front-loads top-layer
     // boundary arcs by visit-order assignment, so a fixed 512 KiB
-    // prefetch covers most state-sized regions' top-layer arcs
+    // prefetch covers most typical topologies' top-layer arcs
     // without needing per-file tier metadata.
     const arcCoordsPrefetchBytes =
       opts.arcCoordsPrefetchBytes ?? DEFAULT_ARC_COORDS_PREFETCH;
@@ -660,9 +660,9 @@ export class CtopoClient {
       // Fire all section fetches concurrently — when they all share a
       // compression group (the common case after grouping), they hit
       // the same in-flight decompress via the group cache and resolve
-      // from one fetch. When they're independent sections (older
-      // files, or layers larger than one group), they parallelize
-      // through the normal range pipeline.
+      // from one fetch. When they're independent sections (layers
+      // larger than one group), they parallelize through the normal
+      // range pipeline.
       const [polyBytes, ringBytes, arcRefsBytes, breakBytes] =
         await Promise.all([
           this.fetchSectionBytes(polyEntry, signal),
@@ -1292,8 +1292,8 @@ export class CtopoClient {
       //
       // Multi-range packing stays within family boundaries so that
       // independent UI operations don't block each other (e.g. a small
-      // string lookup for county names shouldn't wait on a large
-      // coordinate fetch for the whole state).
+      // string-section lookup shouldn't wait on a large coordinate
+      // fetch).
       const candidatesByFamily = new Map<string, ChunkTask[]>();
       for (const chunk of chunks) {
         if (chunk.logical.chunkBytes.length > 1) {
@@ -1662,8 +1662,8 @@ function findArcCoordBlock(blocks: Uint32Array, logicalOffset: number): number {
 // encoding when the section was emitted that way. Non-delta path
 // shares the underlying buffer (zero copy); delta path runs a
 // running prefix sum into a fresh buffer with u32 wraparound that
-// mirrors the encoder side. ~6.7 MiB / 1.7M entries = ~5ms one-time
-// cost on a state-sized arc_offsets.
+// mirrors the encoder side. Roughly a few ms one-time cost per
+// million entries on a multi-MiB arc_offsets.
 function viewU32WithDelta(bytes: Uint8Array, delta: boolean): Uint32Array {
   if (!delta)
     return new Uint32Array(

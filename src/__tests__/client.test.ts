@@ -345,9 +345,9 @@ describe("CtopoClient", () => {
   });
 
   it("block cache serves subsequent arc fetches without additional GETs", async () => {
-    // Default block size (64 KiB) makes the entire tiny fixture fit
-    // in one block. After the first fetchArcs decompresses that block,
-    // all subsequent calls are served from the block cache — no new
+    // The tiny fixture fits in one block at the default block size.
+    // After the first fetchArcs decompresses that block, all
+    // subsequent calls are served from the block cache — no new
     // network requests needed.
     const buf = await encodeContainer(fixtureTopology());
     const { fetcher, requests } = recordingFetcher(buf);

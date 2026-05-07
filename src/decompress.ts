@@ -84,11 +84,10 @@ export async function decompressSection(
 //
 // Always fires when the file uses block-compressed arc_coords —
 // per-block decode happens many times per merge, so even native
-// DecompressionStream("zstd") (which lacks a dict parameter, costs
-// a Stream-API setup per call, and is not yet on the dict path
-// for #20) loses to the synchronous wasm decoder.
-// Otherwise fires only as a fallback when the runtime lacks native
-// zstd. Idempotent.
+// DecompressionStream("zstd") (which lacks a dict parameter and
+// costs a Stream-API setup per call) loses to the synchronous
+// wasm decoder. Otherwise fires only as a fallback when the
+// runtime lacks native zstd. Idempotent.
 export function preloadZstdWasmIfNeeded(forceLoad: boolean = false): void {
   if (wasmZstdReady !== undefined) return;
   if (!forceLoad && zstdNativeOk()) return;

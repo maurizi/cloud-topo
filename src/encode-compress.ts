@@ -53,12 +53,13 @@ export interface BlockCompressedArcCoords {
 // --- Constants ---
 
 // Default block size for block-compressed arc_coords. Aligned to
-// whole arcs at emit time. The merge-sweep bench (median-of-3,
-// 4 states x 2 latencies x 6 chambers) showed 16 KiB blocks paired
-// with an 8 KiB client coalesce-gap save 13-34% of merge wall-clock
-// vs. 64 KiB blocks + 1 MiB gap, with a sub-1% file-size penalty.
-// Smaller still (8 KiB blocks) saves marginally more time but adds
-// per-block-header overhead; 16 KiB is the inflection.
+// whole arcs at emit time. The merge-sweep bench (median-of-3
+// across a matrix of fixtures and latency profiles) showed 16 KiB
+// blocks paired with an 8 KiB client coalesce-gap save 13-34% of
+// merge wall-clock vs. 64 KiB blocks + 1 MiB gap, with a sub-1%
+// file-size penalty. Smaller still (8 KiB blocks) saves marginally
+// more time but adds per-block-header overhead; 16 KiB is the
+// inflection.
 export const DEFAULT_ARC_COORD_BLOCK_BYTES = 16 * 1024;
 
 // Auto-pick dict size from arc_coords uncompressed length.
@@ -160,22 +161,15 @@ export async function blockCompressArcCoords(
     options.dictBytes,
   );
 
-  // Compress blocks through the libuv thread pool with bounded
-  // concurrency — `Promise.all` over the full block list would
-  // materialize one Promise + closure per block, which is fine for
-  // tens of blocks but catastrophic at scale (large topologies have
-  // 1700+ blocks and we've also seen this called with 50K-100K
-  // blocks for tighter targets — million-Promise allocations
-  // OOM-killed the host on a 62 GB box). The worker pool keeps queue depth
-  // bounded to BLOCK_COMPRESS_CONCURRENCY, so memory stays linear
-  // in pool size, not block count.
+  // Build BLOCK_COMPRESS_CONCURRENCY persistent streams sharing the
+  // picked dict, then run a worker loop per stream pulling blocks off
+  // a shared cursor. Each stream registers its dict once and emits one
+  // independent zstd frame per block via flush(ZSTD_e_end) — no
+  // per-block CDict rebuild, no per-block leak. Replaces the previous
+  // `runWithConcurrency` + `promisify(zstdCompress)` pattern, which
+  // leaked ~600 KB per call on large dicts and was OOM-killing
+  // encode-sweep at the 384 KiB-dict presets.
   const compressedBlocks = new Array<Buffer>(blockSpecs.length);
-  // TEMP: progress + memory instrumentation while we're chasing a
-  // suspected off-heap leak in the dict-aware async compress path.
-  // Uses fs.writeSync(2, ...) so output is unbuffered — Node's
-  // process.stderr.write is block-buffered through the docker pipe
-  // and the lines get swallowed if the process is killed before
-  // the buffer flushes. Remove once #20 is stable.
   const PROGRESS_EVERY = 100;
   const t0 = Date.now();
   let completed = 0;
@@ -272,7 +266,7 @@ function trainArcCoordsDict(
   targetDictBytes: number,
 ): Uint8Array | undefined {
   // zstd --train needs ≥~100 samples for stable output. For tiny
-  // regions (test fixtures, single-county states) we skip the dict
+  // inputs (test fixtures, very small topologies) we skip the dict
   // entirely — the savings would be tiny anyway, and the encoder
   // emits arcCoordsBlocks META without dictSection so the reader
   // falls back to no-dict decode.
