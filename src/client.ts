@@ -20,9 +20,7 @@
  *
  * Arc coord lookups go through one whole-section fetch of
  * `arc_coords`, cached for the lifetime of the client — slicing per
- * arc id is then a free subarray view. This matches the pre-ctopo
- * behavior where the entire `arc-coords.bin` was downloaded once and
- * reused across every render.
+ * arc id is then a free subarray view.
  */
 
 import {
@@ -51,15 +49,6 @@ import {
   preloadZstdWasmIfNeeded,
 } from "./decompress";
 import { runWithConcurrency } from "./util";
-
-// Re-export fetcher types so existing `import { ... } from "./client"`
-// in downstream code and tests keeps working.
-export {
-  type FetchPriority,
-  type RangeFetcher,
-  makeHttpFetcher,
-} from "./fetcher";
-export { makeRangeFetcher, makeBufferFetcher } from "./fetcher";
 
 // --- Types ---
 
@@ -155,28 +144,27 @@ export interface OpenContainerOptions {
   // fresh GET. 32 MiB by default.
   readonly byteRangeCacheBytes?: number;
   // Speculatively fetch this many bytes from the start of arc_coords
-  // immediately after openContainer parses the header. The producer
-  // packs arcs by tier (top-layer perimeter → top-layer interior →
-  // lower-layer interiors) and by Hilbert key within each tier, so
-  // the front of arc_coords is the topology's "skeleton" — arcs
-  // every typical merge needs. The prefetch fires in the background
-  // and lands in the byte-range cache, so by the time a merge calls
-  // fetchArcs much of the working set is already local. 0 disables.
-  // 512 KiB by default. Pairs with arcOffsetsPrefetchBytes — both
-  // are needed for fetchArcs on skeleton arcs to skip the network
-  // entirely.
+  // immediately after openContainer parses the header. Block-
+  // compressed arc_coords is read by fetchArcs through the byte-range
+  // cache, so warming the cache with the section's prefix lets the
+  // first N blocks' compressed bytes serve from memory without per-
+  // block GETs. The encoder front-loads top-layer skeleton arcs at
+  // the start of arc_coords (visit-order assignment), so a 512 KiB
+  // prefix covers the topology's "skeleton" — arcs every typical
+  // merge needs. 0 disables. 512 KiB by default. Pairs with
+  // arcOffsetsPrefetch — both are needed for fetchArcs on skeleton
+  // arcs to skip the network entirely.
   readonly arcCoordsPrefetchBytes?: number;
-  // Speculatively fetch this many bytes from the start of
-  // arc_offsets at open time. Without this, every fetchArcs has
-  // to round-trip for the matching offset entries before it can
-  // use the cached coord bytes — and that round-trip lands on the
-  // critical path of the merge (eager-loaded offsets ran in
-  // parallel with header parsing instead). For typical
-  // topologies arc_offsets is single-digit MiB, so the default
-  // is effectively "the whole section": prefetchPrefix clamps to
-  // section.length, and a single coalesced GET in the background
-  // keeps merges round-trip-free for the offset half. 0 disables.
-  readonly arcOffsetsPrefetchBytes?: number;
+  // Speculatively fetch arc_offsets at open time. Without this,
+  // every fetchArcs has to round-trip for the matching offset
+  // entries before it can use the cached coord bytes — that round-
+  // trip lands on the critical path of the merge (eager-loaded
+  // offsets ran in parallel with header parsing instead). For
+  // typical topologies arc_offsets is single-digit MiB, fetched
+  // whole in a single coalesced background GET. Default true; set
+  // false to skip the prefetch entirely (round-trip moves into the
+  // first fetchArcs).
+  readonly arcOffsetsPrefetch?: boolean;
   // Maximum number of disjoint byte ranges to combine into a single
   // multi-range HTTP request. CloudFront supports multiple ranges in
   // one request (ascending, non-overlapping); grouping reduces total
@@ -187,11 +175,12 @@ export interface OpenContainerOptions {
   // Hard off-switch for multi-range packing. Default true. When false,
   // every disjoint chunk dispatches as its own range request even if
   // the fetcher implements `multiRange`. Setting `maxRangesPerRequest:
-  // 1` is not equivalent — the dispatch gate is `chunks.length > 1`,
-  // not the per-request cap, so size-1 packs still take the multi-
-  // range path. Use this for A/B benchmarking the consolidation feature
-  // or for backends where multipart parsing is more expensive than the
-  // RTTs it saves.
+  // 1` produces the same observable behavior — both gate-skip the
+  // multi-range path entirely. Use this knob for A/B benchmarking the
+  // consolidation feature or for backends where multipart parsing is
+  // more expensive than the RTTs it saves. Flipped to false at runtime
+  // if the server returns "unsupported" from a multiRange call, so
+  // subsequent requests don't repeat the failed probe.
   readonly multiRangeEnabled?: boolean;
 }
 
@@ -262,7 +251,6 @@ const DEFAULT_COALESCE_GAP = 64 * 1024;
 const DEFAULT_ARCS_COALESCE_GAP = 8 * 1024;
 // Offsets default — same width. Bridge bytes here are 4B per arc id,
 // so even a generous gap pulls only kilobytes of unrelated entries
-// (vs the 6.7 MiB eager load it replaces).
 const DEFAULT_OFFSETS_COALESCE_GAP = 1 * 1024 * 1024;
 const DEFAULT_GAP_BY_FAMILY: Readonly<Record<string, number>> = {
   arcs: DEFAULT_ARCS_COALESCE_GAP,
@@ -282,18 +270,14 @@ const DEFAULT_MAX_PARALLEL_RANGES = 8;
 const DEFAULT_BYTE_RANGE_CACHE = 128 * 1024 * 1024;
 // Multi-range request defaults.
 const DEFAULT_MAX_RANGES_PER_REQUEST = 20;
-// Open-time prefetch size for arc_coords. The encoder front-loads
-// top-layer boundary arcs (outer perimeter + parent-layer interior
-// boundaries) by virtue of the visit-order assignment. 512 KiB
-// comfortably covers those for typical topologies; the rest is
-// fetched on demand by the merge.
+// Open-time prefetch size for arc_coords. Block-compressed arc_coords
+// is read through the byte-range cache; warming the section's prefix
+// lets the first N blocks' compressed bytes serve from memory. The
+// encoder front-loads top-layer boundary arcs (outer perimeter +
+// parent-layer interior boundaries) by virtue of the visit-order
+// assignment, so 512 KiB comfortably covers those for typical
+// topologies; the rest is fetched on demand by the merge.
 const DEFAULT_ARC_COORDS_PREFETCH = 512 * 1024;
-// Number.MAX_SAFE_INTEGER — the whole arc_offsets section.
-// prefetchPrefix clamps to section.length, so this just means "all of
-// it." For typical topologies arc_offsets is single-digit MiB; for
-// anything dramatically larger callers should set
-// arcOffsetsPrefetchBytes down to keep open fast.
-const DEFAULT_ARC_OFFSETS_PREFETCH = Number.MAX_SAFE_INTEGER;
 
 // Sentinel placeholder used to mark an arc id as "claimed" in the
 // fetchArcs result map before its real bytes arrive — keeps the
@@ -324,17 +308,20 @@ export class CtopoClient {
   // arc_offsets is fetched whole on first access and decompressed
   // once. The resulting Uint32Array is cached for the client's
   // lifetime — fetchArcs needs random access into it for every
-  // arc-id lookup, which is incompatible with range-fetching of
-  // compressed bytes. The default arcOffsetsPrefetchBytes warms
-  // this fetch in the background at open time so the first merge
-  // doesn't pay the round trip.
+  // arc-id lookup, so we can't range-fetch slices of the compressed
+  // bytes. The default arcOffsetsPrefetch=true warms this fetch in
+  // the background at open time so the first merge doesn't pay the
+  // round trip.
   private arcOffsetsPromise: Promise<Uint32Array> | undefined;
   private readonly coalesceGapBytes: number;
   private readonly coalesceGapByFamily: Readonly<Record<string, number>>;
   private readonly maxChunkBytes: number;
   private readonly maxParallelRanges: number;
   private readonly maxRangesPerRequest: number;
-  private readonly multiRangeEnabled: boolean;
+  // Mutable: starts at the user's option (default true) and flips
+  // to false at runtime if the server returns "unsupported" from a
+  // multiRange call.
+  private multiRangeEnabled: boolean;
   private readonly byteRangeCacheBytes: number;
   // De-dupe in-flight property/strings/layer fetches via Promise maps.
   // The Promise itself is the cache entry — concurrent callers awaiting
@@ -381,7 +368,6 @@ export class CtopoClient {
   // addition to the cache) so a request that lands while another GET
   // covering it is still in flight attaches to that GET's Promise
   // instead of firing a duplicate.
-  private multiRangeDisabled = false;
   private inFlightRanges: InFlightRange[] = [];
   // Byte-range cache: every coalesced GET lands here so that future
   // requests whose [start, end) falls inside an already-fetched range
@@ -467,6 +453,11 @@ export class CtopoClient {
     const frontPrefetchBytes =
       opts.frontPrefetchBytes ?? DEFAULT_FRONT_PREFETCH;
     const backPrefetchBytes = opts.backPrefetchBytes ?? DEFAULT_BACK_PREFETCH;
+    if (backPrefetchBytes < FOOTER_TRAILER_SIZE) {
+      throw new Error(
+        `ctopo: backPrefetchBytes (${backPrefetchBytes}) must be >= FOOTER_TRAILER_SIZE (${FOOTER_TRAILER_SIZE}) so the suffix GET captures at least the footer-length marker`,
+      );
+    }
     const coalesceGapBytes = opts.coalesceGapBytes ?? DEFAULT_COALESCE_GAP;
     const coalesceGapByFamily = {
       ...DEFAULT_GAP_BY_FAMILY,
@@ -480,8 +471,7 @@ export class CtopoClient {
     const multiRangeEnabled = opts.multiRangeEnabled ?? true;
     const byteRangeCacheBytes =
       opts.byteRangeCacheBytes ?? DEFAULT_BYTE_RANGE_CACHE;
-    const arcOffsetsPrefetchBytes =
-      opts.arcOffsetsPrefetchBytes ?? DEFAULT_ARC_OFFSETS_PREFETCH;
+    const arcOffsetsPrefetch = opts.arcOffsetsPrefetch ?? true;
     const signal = opts.signal;
 
     // Kick off the zstd JS-fallback module load now (no-op when the
@@ -490,17 +480,21 @@ export class CtopoClient {
     // any compressed-section decompress, off the critical path.
     preloadZstdWasmIfNeeded();
 
-    // Fire the suffix GET and the front-header validation GET in
-    // parallel. The suffix delivers the footer (section table + META);
-    // the 16-byte header GET validates magic + version. Both are on the
-    // critical open path so an incompatible file fails at open, not on
-    // the first merge.
-    const [headerBytes, suffixBytes] = await Promise.all([
-      fetcher.range(0, HEADER_SIZE, signal, "high"),
+    // Fire the front-prefix GET and the suffix GET in parallel. The
+    // front GET covers at minimum the 16-byte header (for magic/version
+    // validation) and, if frontPrefetchBytes > 0, extends to cover the
+    // front-loaded sections so subsequent section fetches in that
+    // region hit the byte-range cache. The suffix GET delivers the
+    // footer (section table + META). Both are on the critical open
+    // path so an incompatible file fails at open, not on the first
+    // merge.
+    const frontGetSize = Math.max(HEADER_SIZE, frontPrefetchBytes);
+    const [frontBytes, suffixBytes] = await Promise.all([
+      fetcher.range(0, frontGetSize, signal, "high"),
       fetcher.suffix(backPrefetchBytes, signal, "high"),
     ]);
 
-    parseFrontHeader(headerBytes);
+    parseFrontHeader(frontBytes.subarray(0, HEADER_SIZE));
 
     // Locate the footer within the suffix bytes via the trailing 8-byte
     // length marker. If the footer overflows the suffix, refetch with a
@@ -535,16 +529,12 @@ export class CtopoClient {
       byteRangeCacheBytes,
     });
 
-    // Optional front prefetch — pre-warms the byte-range cache with
-    // the encoder's front-loaded sections so subsequent section
-    // fetches in the prefetched range hit cache. Routed through the
-    // standard pipeline so it chunks at maxChunkBytes and fires
-    // multiple parallel GETs.
+    // Seed the byte-range cache with the front bytes we already fetched
+    // so subsequent section fetches in the front-loaded region hit
+    // cache. Only seed when frontPrefetchBytes > 0 — a 16-byte header-
+    // only fetch isn't worth a cache entry.
     if (frontPrefetchBytes > 0) {
-      void client.prefetchRange("front", 0, frontPrefetchBytes).catch(() => {
-        // Prefetch failures don't fail open; surface on the first
-        // dependent section fetch instead.
-      });
+      client.cacheByteRange(0, frontGetSize, frontBytes);
     }
 
     // Skeleton prefetch sizing: the encoder front-loads top-layer
@@ -564,36 +554,40 @@ export class CtopoClient {
     // entire boundary-compute / fetchArcs path blocks on them, so we
     // want HTTP/2 to prioritize their bandwidth over the bulk
     // property GETs that callers fire immediately after open.
-    if (arcOffsetsPrefetchBytes > 0) {
+    if (arcOffsetsPrefetch) {
+      // prefetchPrefix clamps to section.length, so this just means
+      // "the whole arc_offsets section."
       client.prefetchPrefix(
         "arc_offsets",
         "offsets",
-        arcOffsetsPrefetchBytes,
-        "high",
-      );
-    }
-    if (parsed.meta.arcCoordsBlocks !== undefined) {
-      // Block-compressed arc_coords: start the dict + block-table
-      // fetches speculatively at "high" priority so they overlap
-      // with the rest of open without contending with bulk property
-      // GETs. Both must arrive before any per-block decompress can
-      // happen, but they don't block each other.
-      const blocksMeta = parsed.meta.arcCoordsBlocks;
-      client.prefetchPrefix(
-        blocksMeta.blockTableSection,
-        "arc_coord_blocks",
         Number.MAX_SAFE_INTEGER,
         "high",
       );
-      if (blocksMeta.dictSection !== undefined) {
-        client.prefetchPrefix(
-          blocksMeta.dictSection,
-          "arc_coords_dict",
-          Number.MAX_SAFE_INTEGER,
-          "high",
-        );
-      }
-    } else if (arcCoordsPrefetchBytes > 0) {
+    }
+    // Block-compressed arc_coords: start the dict + block-table
+    // fetches speculatively at "high" priority so they overlap
+    // with the rest of open without contending with bulk property
+    // GETs. Both must arrive before any per-block decompress can
+    // happen, but they don't block each other.
+    const blocksMeta = parsed.meta.arcCoordsBlocks;
+    client.prefetchPrefix(
+      blocksMeta.blockTableSection,
+      "arc_coord_blocks",
+      Number.MAX_SAFE_INTEGER,
+      "high",
+    );
+    if (blocksMeta.dictSection !== undefined) {
+      client.prefetchPrefix(
+        blocksMeta.dictSection,
+        "arc_coords_dict",
+        Number.MAX_SAFE_INTEGER,
+        "high",
+      );
+    }
+    // arc_coords prefix prefetch — warms the byte-range cache so
+    // fetchArcs on top-layer skeleton arcs reads compressed-block
+    // bytes from memory instead of issuing per-block GETs.
+    if (arcCoordsPrefetchBytes > 0) {
       client.prefetchPrefix("arc_coords", "arcs", arcCoordsPrefetchBytes);
     }
 
@@ -704,10 +698,7 @@ export class CtopoClient {
     this.ensureOpen();
     throwIfAborted(signal);
     const arcOffsets = await this.getArcOffsets();
-    if (this.meta.arcCoordsBlocks !== undefined) {
-      return this.fetchArcsFromBlocks(arcIds, arcOffsets);
-    }
-    return this.fetchArcsFromRaw(arcIds, arcOffsets);
+    return this.fetchArcsFromBlocks(arcIds, arcOffsets);
   }
 
   // --- Stats ---
@@ -864,45 +855,6 @@ export class CtopoClient {
     return this.arcOffsetsPromise;
   }
 
-  private async fetchArcsFromRaw(
-    arcIds: Iterable<number>,
-    arcOffsets: Uint32Array,
-  ): Promise<Map<number, Uint8Array>> {
-    const out = new Map<number, Uint8Array>();
-    // Perf instrumentation — track arc-id span and unique count per
-    // fetchArcs call.
-    let minId = Number.POSITIVE_INFINITY;
-    let maxId = Number.NEGATIVE_INFINITY;
-    let uniqueCount = 0;
-
-    const promises: Promise<void>[] = [];
-    for (const arcId of arcIds) {
-      if (out.has(arcId)) continue;
-      uniqueCount++;
-      if (arcId < minId) minId = arcId;
-      if (arcId > maxId) maxId = arcId;
-      const start = this.arcCoordsBase + arcOffsets[arcId];
-      const end = this.arcCoordsBase + arcOffsets[arcId + 1];
-      out.set(arcId, EMPTY_BYTES);
-      promises.push(
-        this.enqueueSectionFetch("arcs", start, end).then((bytes) => {
-          out.set(arcId, bytes);
-        }),
-      );
-    }
-    if (uniqueCount > 0) {
-      const totalArcs = arcOffsets.length - 1;
-      const span = maxId - minId + 1;
-      perfLog(
-        `[ctopo] fetchArcs: ${uniqueCount} arcs, id span [${minId}, ${maxId}] ` +
-          `(${span}/${totalArcs} = ${((span / totalArcs) * 100).toFixed(1)}%, density ` +
-          `${((uniqueCount / span) * 100).toFixed(1)}%)`,
-      );
-    }
-    await Promise.all(promises);
-    return out;
-  }
-
   // Block-compressed arc_coords path. Each arc lives entirely
   // within one block (encoder-side guarantee), so per-arc work is:
   // (1) find the block, (2) ensure it's decompressed (cached
@@ -966,11 +918,6 @@ export class CtopoClient {
   private getArcCoordDict(): Promise<Uint8Array | undefined> {
     if (this.arcCoordDictPromise === undefined) {
       const meta = this.meta.arcCoordsBlocks;
-      if (meta === undefined) {
-        throw new Error(
-          "ctopo: arcCoordsBlocks META missing — getArcCoordDict called incorrectly",
-        );
-      }
       if (meta.dictSection === undefined) {
         // No shared dict (too few blocks to train one).
         this.arcCoordDictPromise = Promise.resolve(undefined);
@@ -990,11 +937,6 @@ export class CtopoClient {
   private getArcCoordBlocks(): Promise<Uint32Array> {
     if (this.arcCoordBlocksPromise === undefined) {
       const meta = this.meta.arcCoordsBlocks;
-      if (meta === undefined) {
-        throw new Error(
-          "ctopo: arcCoordsBlocks META missing — getArcCoordBlocks called incorrectly",
-        );
-      }
       const entry = this.sectionByName.get(meta.blockTableSection);
       if (entry === undefined) {
         throw new Error(
@@ -1032,7 +974,7 @@ export class CtopoClient {
       dtype: "blob",
       offset: physicalStart,
       length: compLength,
-      compression: "zst",
+      compression: "zstd",
     };
     const promise = (async () => {
       // Fetch compressed bytes + dict + decoder in parallel.
@@ -1047,11 +989,7 @@ export class CtopoClient {
       // dict-aware path. The shared dict was passed once to
       // CtopoDecompressor at construction and digested into a DDict
       // (see src/zstd-wasm/), so per-block decode skips both the
-      // dict-bytes copy and dict-table rebuild. Dict-aware
-      // compression also makes blocks ~30× smaller than no-dict, so
-      // the decoder has far less data to scan. A micro-bench at
-      // 16 KiB blocks measured ~10 µs/block on this path — using
-      // the dict is unequivocally a win on both wire bytes AND CPU.
+      // dict-bytes copy and dict-table rebuild.
       const t0 = performance.now();
       const out = decode(compressed, uncSize, dict);
       this.statDecompressMs += performance.now() - t0;
@@ -1092,13 +1030,17 @@ export class CtopoClient {
   // byte-range cache automatically. Used by the open path to
   // prefetch front-loaded sections without serializing on a single
   // big GET (which throttles on a single HTTP/2 stream).
+  // Fire-and-forget — exceptions are swallowed (a failed prefetch
+  // surfaces on the first dependent section fetch instead).
   prefetchRange(
     family: string,
     start: number,
     end: number,
     priority: FetchPriority = "auto",
-  ): Promise<Uint8Array> {
-    return this.enqueueSectionFetch(family, start, end, priority);
+  ): void {
+    this.enqueueSectionFetch(family, start, end, priority).catch(() => {
+      // Silent — prefetch failures don't fail open or surface.
+    });
   }
 
   // --- Private: batched fetch pipeline ---
@@ -1124,7 +1066,10 @@ export class CtopoClient {
     signal?: AbortSignal,
   ): Promise<Uint8Array> {
     if (signal?.aborted) {
-      return Promise.reject(signal.reason ?? new Error("aborted"));
+      const reason: unknown = signal.reason;
+      return Promise.reject(
+        reason instanceof Error ? reason : new Error("aborted"),
+      );
     }
     const cached = this.lookupByteRange(start, end);
     if (cached !== undefined) {
@@ -1265,7 +1210,7 @@ export class CtopoClient {
         1,
         Math.ceil((logical.end - logical.start) / this.maxChunkBytes),
       );
-      logical.chunkBytes = new Array(numChunks);
+      logical.chunkBytes = new Array<Uint8Array>(numChunks);
       for (let i = 0; i < numChunks; i++) {
         const cs = logical.start + i * this.maxChunkBytes;
         const ce = Math.min(cs + this.maxChunkBytes, logical.end);
@@ -1284,7 +1229,7 @@ export class CtopoClient {
     const tasks: DispatchTask[] = [];
     const canMultiRange =
       this.multiRangeEnabled &&
-      !this.multiRangeDisabled &&
+      this.maxRangesPerRequest >= 2 &&
       this.fetcher.multiRange !== undefined;
 
     if (canMultiRange && chunks.length > 1) {
@@ -1520,7 +1465,7 @@ export class CtopoClient {
       if (result.kind === "unsupported") {
         // Server doesn't support multi-range — disable for this client
         // and re-dispatch each chunk as an individual range request.
-        this.multiRangeDisabled = true;
+        this.multiRangeEnabled = false;
         perfLog(
           `[ctopo] multi-range unsupported, falling back to single-range`,
         );

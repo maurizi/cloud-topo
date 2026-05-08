@@ -32,9 +32,6 @@ export default tseslint.config(
     plugins: { prettier: prettierPlugin },
     rules: {
       "no-console": "error",
-      "@typescript-eslint/no-explicit-any": "off",
-      "@typescript-eslint/no-unsafe-assignment": "off",
-      "@typescript-eslint/prefer-promise-reject-errors": "off",
       "@typescript-eslint/no-unused-vars": [
         "error",
         { argsIgnorePattern: "^_" },

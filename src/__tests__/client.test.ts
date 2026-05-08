@@ -5,7 +5,8 @@ import { describe, expect, it } from "vitest";
 
 import { type Topology } from "topojson-specification";
 
-import { CtopoClient, makeBufferFetcher, type RangeFetcher } from "../client";
+import { CtopoClient } from "../client";
+import { makeBufferFetcher, type RangeFetcher } from "../fetcher";
 import { encodeContainer } from "../encode";
 
 function fixtureTopology(): Topology {
@@ -177,7 +178,7 @@ describe("CtopoClient", () => {
     const client = await CtopoClient.openWith(fetcher, {
       frontPrefetchBytes: 0,
       arcCoordsPrefetchBytes: 0,
-      arcOffsetsPrefetchBytes: 0,
+      arcOffsetsPrefetch: false,
     });
 
     const controller = new AbortController();
@@ -196,7 +197,7 @@ describe("CtopoClient", () => {
     const client = await CtopoClient.openWith(fetcher, {
       frontPrefetchBytes: 0,
       arcCoordsPrefetchBytes: 0,
-      arcOffsetsPrefetchBytes: 0,
+      arcOffsetsPrefetch: false,
     });
 
     requests.length = 0;
@@ -221,7 +222,7 @@ describe("CtopoClient", () => {
     const client = await CtopoClient.openWith(fetcher, {
       frontPrefetchBytes: 0,
       arcCoordsPrefetchBytes: 0,
-      arcOffsetsPrefetchBytes: 0,
+      arcOffsetsPrefetch: false,
     });
 
     requests.length = 0;
@@ -246,7 +247,7 @@ describe("CtopoClient", () => {
     const client = await CtopoClient.openWith(fetcher, {
       frontPrefetchBytes: 0,
       arcCoordsPrefetchBytes: 0,
-      arcOffsetsPrefetchBytes: 0,
+      arcOffsetsPrefetch: false,
     });
 
     requests.length = 0;
@@ -265,13 +266,40 @@ describe("CtopoClient", () => {
     expect(requests.length).toBe(2);
   });
 
+  it("open-time prefetches don't double-request overlapping bytes", async () => {
+    // With every prefetch flag at its default, the open path issues
+    // multiple concurrent GETs (header, arc_offsets, arc_coord_blocks,
+    // arc_coords_dict if present, and an arc_coords prefix). They
+    // target distinct sections, so no two GETs should land on
+    // overlapping byte ranges. This locks in the invariant that the
+    // skeleton prefetch isn't re-fetching bytes the header/footer
+    // prefetch already covered (and vice versa for non-zero
+    // frontPrefetchBytes).
+    const buf = await encodeContainer(fixtureTopology());
+    const { fetcher, requests } = recordingFetcher(buf);
+    await CtopoClient.openWith(fetcher);
+    // Drain microtasks so every speculative prefetch resolves.
+    await new Promise((r) => setTimeout(r, 0));
+
+    // Pairwise disjoint: for any two distinct requests [a1, b1) and
+    // [a2, b2), they overlap iff a1 < b2 && a2 < b1.
+    for (let i = 0; i < requests.length; i++) {
+      for (let j = i + 1; j < requests.length; j++) {
+        const [a1, b1] = requests[i];
+        const [a2, b2] = requests[j];
+        const overlaps = a1 < b2 && a2 < b1;
+        expect(overlaps, `requests ${i} and ${j} overlap`).toBe(false);
+      }
+    }
+  });
+
   it("block table + dict are prefetched at open; fetchArcs only needs the block data", async () => {
     const buf = await encodeContainer(fixtureTopology());
     const { fetcher, requests } = recordingFetcher(buf);
     const client = await CtopoClient.openWith(fetcher, {
       frontPrefetchBytes: 0,
       arcCoordsPrefetchBytes: 0,
-      arcOffsetsPrefetchBytes: 0,
+      arcOffsetsPrefetch: false,
     });
     // Drain microtasks so speculative block-table prefetch resolves.
     await new Promise((r) => setTimeout(r, 0));
@@ -293,7 +321,7 @@ describe("CtopoClient", () => {
     const client = await CtopoClient.openWith(fetcher, {
       frontPrefetchBytes: 0,
       arcCoordsPrefetchBytes: 0,
-      arcOffsetsPrefetchBytes: 0,
+      arcOffsetsPrefetch: false,
       coalesceGapByFamily: { offsets: -1 },
     });
     requests.length = 0;
@@ -311,7 +339,7 @@ describe("CtopoClient", () => {
     const client = await CtopoClient.openWith(fetcher, {
       frontPrefetchBytes: 0,
       arcCoordsPrefetchBytes: 0,
-      arcOffsetsPrefetchBytes: 0,
+      arcOffsetsPrefetch: false,
     });
 
     requests.length = 0;
@@ -328,7 +356,7 @@ describe("CtopoClient", () => {
     const client = await CtopoClient.openWith(fetcher, {
       frontPrefetchBytes: 0,
       arcCoordsPrefetchBytes: 0,
-      arcOffsetsPrefetchBytes: 0,
+      arcOffsetsPrefetch: false,
     });
 
     // First drain: fetch all four arcs — two GETs (offsets + coords).
@@ -353,7 +381,7 @@ describe("CtopoClient", () => {
     const { fetcher, requests } = recordingFetcher(buf);
     const client = await CtopoClient.openWith(fetcher, {
       arcCoordsPrefetchBytes: 0,
-      arcOffsetsPrefetchBytes: 0,
+      arcOffsetsPrefetch: false,
     });
 
     // First call fetches offsets + the one compressed block.
@@ -384,12 +412,12 @@ describe("CtopoClient", () => {
       fetcherFor(defaultBuf).fetcher,
       {
         arcCoordsPrefetchBytes: 0,
-        arcOffsetsPrefetchBytes: 0,
+        arcOffsetsPrefetch: false,
       },
     );
     const tinyClient = await CtopoClient.openWith(fetcherFor(tinyBuf).fetcher, {
       arcCoordsPrefetchBytes: 0,
-      arcOffsetsPrefetchBytes: 0,
+      arcOffsetsPrefetch: false,
     });
 
     expect(defaultClient.meta.arcCoordsBlocks).toBeDefined();
@@ -417,7 +445,7 @@ describe("CtopoClient", () => {
     const { fetcher } = fetcherFor(buf);
     const client = await CtopoClient.openWith(fetcher, {
       arcCoordsPrefetchBytes: 0,
-      arcOffsetsPrefetchBytes: 0,
+      arcOffsetsPrefetch: false,
     });
 
     // First call decompresses the (one) block. Second call should

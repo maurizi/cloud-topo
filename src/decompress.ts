@@ -11,7 +11,7 @@
  * for dict-aware sections, since DecompressionStream has no dict
  * parameter. Brotli is supported as an alternative codec for
  * producers that prefer faster encode at the cost of slightly worse
- * ratio; reading "br" relies on native DecompressionStream("brotli")
+ * ratio; reading "brotli" relies on native DecompressionStream("brotli")
  * — no JS fallback.
  */
 
@@ -65,7 +65,7 @@ const CAPACITY_SLACK = 64;
 // browsers, falling back to the bundled zstd-rs wasm decoder
 // (~103 KiB) elsewhere. Brotli is supported as an alternative codec
 // for producers that prefer faster encode at the cost of slightly
-// worse ratio; reading "br" relies on native
+// worse ratio; reading "brotli" relies on native
 // DecompressionStream("brotli") (Firefox today, Chrome rolling) — no
 // JS fallback. Unknown codecs throw a clear error so adding a new
 // one is a one-place change.
@@ -79,13 +79,13 @@ export async function decompressSection(
   // decode wall-clock for weighing wire savings vs CPU cost.
   const t0 = performance.now();
   let out: Uint8Array;
-  if (codec === "zst") {
+  if (codec === "zstd") {
     out = await decompressZstd(bytes, entry);
-  } else if (codec === "br") {
+  } else if (codec === "brotli") {
     out = await decompressNativeOrThrow(bytes, entry, "brotli");
   } else {
     throw new Error(
-      `ctopo: section "${entry.name}" has unknown codec "${codec as string}" — this build understands "zst" and "br"`,
+      `ctopo: section "${entry.name}" has unknown codec "${codec as string}" — this build understands "zstd" and "brotli"`,
     );
   }
   const elapsed = performance.now() - t0;

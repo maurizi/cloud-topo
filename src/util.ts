@@ -30,7 +30,7 @@ export async function runWithConcurrency<T>(
     }
   };
   const n = Math.min(limit, items.length);
-  const workers: Promise<void>[] = new Array(n);
+  const workers = new Array<Promise<void>>(n);
   for (let i = 0; i < n; i++) workers[i] = worker();
   await Promise.all(workers);
 }

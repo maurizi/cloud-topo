@@ -53,6 +53,7 @@ import {
   type ContainerMeta,
   type DType,
   type PropertyOverride,
+  compressionToWire,
 } from "./types";
 import {
   buildArcSections,
@@ -62,7 +63,12 @@ import {
   typedArrayBytes,
   type SpatialSort,
 } from "./encode-arcs";
-export type { SpatialSort } from "./encode-arcs";
+export {
+  buildArcSections,
+  computeArcOrder,
+  invertPermutation,
+} from "./encode-arcs";
+export type { LayerCsrForOrder, SpatialSort } from "./encode-arcs";
 import {
   buildLayerCSR,
   buildPropertySection,
@@ -96,6 +102,12 @@ export interface BuiltSection {
   // the caller via EncodeOptions.frontLoadedSectionNames for app-
   // specific sections (e.g., index strings).
   readonly frontLoad?: boolean;
+  // When true, force a new compression group to start before this
+  // section. Used by rewriteContainer (with AssembleInput's
+  // preserveSourceOrder flag) to preserve the source file's
+  // compression-group structure verbatim — every (offset, length)
+  // transition in the source becomes a groupBreak in the rebuild.
+  readonly groupBreak?: boolean;
 }
 
 // Progress event emitted while encoding. Writers wire this up to
@@ -153,9 +165,9 @@ export interface PhaseTimingEvent {
 }
 
 export interface EncodeOptions {
-  // Codec for compressible sections. Defaults to "zst" — best ratio
+  // Codec for compressible sections. Defaults to "zstd" — best ratio
   // and works on every browser (native or via fzstd fallback). Pick
-  // "br" to skip the fzstd polyfill entirely (relies on native
+  // "brotli" to skip the fzstd polyfill entirely (relies on native
   // DecompressionStream("brotli") — Firefox today, Chrome rolling).
   readonly compression?: Compression;
   // Optional progress callback. Called synchronously between stages;
@@ -176,9 +188,8 @@ export interface EncodeOptions {
   // "cities/name"). Typical use: index/lookup strings or properties
   // that the app needs immediately after open.
   readonly frontLoadedSectionNames?: ReadonlyArray<string>;
-  // Within-tier visit-order algorithm for arc_coords packing.
-  // Default 'hilbert'. See SpatialSort docs for the alternatives;
-  // hierarchical-hilbert is the production winner.
+  // Sort order algorithm for arc_coords packing.
+  // Default 'hierarchical-hilbert'. See SpatialSort docs for the alternatives
   readonly spatialSort?: SpatialSort;
   // Bench instrumentation hooks. Both fire synchronously and should
   // stay cheap. No-op when omitted; no behavior change.
@@ -265,19 +276,19 @@ export async function encodeContainer(
     elapsedMs: performance.now() - tBuildCsr,
   });
 
-  // Internal layout optimization: arcs in arc_coords are reordered so
-  // arcs that bound geometries at the same layer land in a contiguous
-  // file region, smallest layer first. Callers that union geometries
-  // at a coarser layer then read a short prefix of arc_coords instead
-  // of scattering Range GETs across the whole section. Arc semantics
-  // and the public client API are unchanged — only the byte order in
+  // Internal layout optimization: arcs that bound geometries within
+  // a single layer are placed contiguously in arc_coords, smaller
+  // (coarser) layer first. Callers that union geometries at a coarse
+  // layer read a short prefix of arc_coords instead of scattering
+  // Range GETs across the whole section. Arc semantics and the
+  // public client API are unchanged — only the byte order in
   // arc_coords + arc id assignment moves.
   const tArcOrder = performance.now();
   const arcOrder = computeArcOrder(
     numArcs,
     layerCsrs,
     input.arcs,
-    opts.spatialSort ?? "hilbert",
+    opts.spatialSort ?? "hierarchical-hilbert",
     input.transform !== undefined && input.transform !== null,
   );
   const newIdOf = invertPermutation(arcOrder);
@@ -312,52 +323,42 @@ export async function encodeContainer(
     frontLoad: true,
   });
 
-  // Block-compressed arc_coords — when enabled, arc_coords ships as
-  // a sequence of independently-decodable zstd frames sharing a
-  // raw-content dict. The dict + block table are tiny and required
-  // before any per-block decompress; mark both front-loaded.
-  // META.arcCoordsBlocks tells the reader how to map logical arc
-  // byte ranges (arc_offsets) to physical block ranges.
-  let arcCoordsBlocksMeta: ContainerMeta["arcCoordsBlocks"] = undefined;
-  let arcCoordsSectionBytes = arcCoordsBytes;
-  {
-    const tBlockCompress = performance.now();
-    const block = await blockCompressArcCoords(
-      arcCoordsBytes,
-      arcOffsetsBytes,
-      {
-        targetBlockSize:
-          opts.arcCoordBlockBytes ?? DEFAULT_ARC_COORD_BLOCK_BYTES,
-        dictBytes: autoArcCoordDictBytes(arcCoordsBytes.byteLength),
-      },
-    );
-    opts.onPhaseTiming?.({
-      stage: "block-compress",
-      elapsedMs: performance.now() - tBlockCompress,
-    });
-    if (block.dictBytes !== undefined) {
-      sections.push({
-        name: "arc_coords_dict",
-        dtype: "blob",
-        bytes: block.dictBytes,
-        frontLoad: true,
-      });
-    }
+  // Block-compressed arc_coords: arc_coords ships as a sequence of
+  // independently-decodable zstd frames sharing a raw-content dict.
+  // The dict + block table are tiny and required before any per-block
+  // decompress; mark both front-loaded. META.arcCoordsBlocks tells
+  // the reader how to map logical arc byte ranges (arc_offsets) to
+  // physical block ranges.
+  const tBlockCompress = performance.now();
+  const block = await blockCompressArcCoords(arcCoordsBytes, arcOffsetsBytes, {
+    targetBlockSize: opts.arcCoordBlockBytes ?? DEFAULT_ARC_COORD_BLOCK_BYTES,
+    dictBytes: autoArcCoordDictBytes(arcCoordsBytes.byteLength),
+  });
+  opts.onPhaseTiming?.({
+    stage: "block-compress",
+    elapsedMs: performance.now() - tBlockCompress,
+  });
+  if (block.dictBytes !== undefined) {
     sections.push({
-      name: "arc_coord_blocks",
-      dtype: "u32",
-      bytes: block.blockTableBytes,
+      name: "arc_coords_dict",
+      dtype: "blob",
+      bytes: block.dictBytes,
       frontLoad: true,
     });
-    arcCoordsSectionBytes = block.compressedBytes;
-    arcCoordsBlocksMeta = {
-      dictSection:
-        block.dictBytes !== undefined ? "arc_coords_dict" : undefined,
-      blockTableSection: "arc_coord_blocks",
-      blockCount: block.blockCount,
-      targetBlockSize: block.targetBlockSize,
-    };
   }
+  sections.push({
+    name: "arc_coord_blocks",
+    dtype: "u32",
+    bytes: block.blockTableBytes,
+    frontLoad: true,
+  });
+  const arcCoordsSectionBytes = block.compressedBytes;
+  const arcCoordsBlocksMeta: ContainerMeta["arcCoordsBlocks"] = {
+    dictSection: block.dictBytes !== undefined ? "arc_coords_dict" : undefined,
+    blockTableSection: "arc_coord_blocks",
+    blockCount: block.blockCount,
+    targetBlockSize: block.targetBlockSize,
+  };
 
   // arc_coords lives in the front-loaded region too. Tier ordering
   // (top-layer perimeter → top-layer interior → lower layers) puts
@@ -464,7 +465,7 @@ export async function encodeContainer(
     layers: layerSummaries,
     metadata: undefined,
     arcCoordsBlocks: arcCoordsBlocksMeta,
-    compression: opts.compression ?? "zst",
+    compression: opts.compression ?? "zstd",
     onProgress: opts.onProgress,
     onSectionEncoded: opts.onSectionEncoded,
     onPhaseTiming: opts.onPhaseTiming,
@@ -492,12 +493,10 @@ export async function rewriteContainer(
   inPath: string,
   outPath: string,
   overrides: ReadonlyArray<PropertyOverride>,
-  opts: { frontLoadedSectionNames?: ReadonlyArray<string> } = {},
 ): Promise<void> {
   const original = readFileSync(inPath);
   const { meta, sections } = parseContainer(original);
   const overridesByName = new Map(overrides.map((o) => [o.name, o]));
-  const extraFrontLoad = new Set(opts.frontLoadedSectionNames ?? []);
 
   // Decompress each compression group once so group members get their
   // own uncompressed slice. Keyed by `${offset}:${length}` — the same
@@ -516,7 +515,7 @@ export async function rewriteContainer(
       entry.offset + entry.length,
     );
     const decompressed =
-      entry.compression === "br"
+      entry.compression === "brotli"
         ? brotliDecompressSync(compressed)
         : zstdDecompressSync(compressed);
     const bytes = new Uint8Array(
@@ -528,9 +527,16 @@ export async function rewriteContainer(
     return bytes;
   }
 
-  const builtSections: BuiltSection[] = sections.map((entry) => {
-    const frontLoad =
-      isStructurallyFrontLoaded(entry.name) || extraFrontLoad.has(entry.name);
+  // Source group structure: every (offset, length) transition between
+  // consecutive sections marks a group boundary in the source file.
+  // We thread these through as `groupBreak` flags so assembleContainer
+  // rebuilds with the same group layout — no name-based front/lazy
+  // reclassification needed.
+  const builtSections: BuiltSection[] = sections.map((entry, i) => {
+    const groupBreak =
+      i > 0 &&
+      (entry.offset !== sections[i - 1].offset ||
+        entry.length !== sections[i - 1].length);
     const override = overridesByName.get(entry.name);
     if (override === undefined) {
       // Group member: decompress the group, extract this member's slice,
@@ -552,7 +558,7 @@ export async function rewriteContainer(
           dtype: entry.dtype,
           bytes,
           delta: entry.delta,
-          frontLoad,
+          groupBreak,
         };
       }
       // Non-group section: pass through the on-disk bytes verbatim,
@@ -568,12 +574,12 @@ export async function rewriteContainer(
         bytes,
         compression: entry.compression,
         delta: entry.delta,
-        frontLoad,
+        groupBreak,
       };
     }
     // Replaced sections rebuild from raw values; assembleContainer
     // re-compresses if `shouldCompressSection` says so.
-    return { ...buildPropertySection(entry.name, override.data), frontLoad };
+    return { ...buildPropertySection(entry.name, override.data), groupBreak };
   });
 
   const layers = meta.layers.map((l) => ({
@@ -603,7 +609,12 @@ export async function rewriteContainer(
     // Replaced sections re-compress with this default. Pass-through
     // sections preserve their existing codec (their bytes are already
     // compressed; assembleContainer just forwards them).
-    compression: "zst",
+    compression: "zstd",
+    // Honor the source file's section order and group structure
+    // verbatim. Each section's groupBreak flag (set above from source
+    // (offset, length) transitions) drives compression-group flushes;
+    // no name-based front/lazy reclassification.
+    preserveSourceOrder: true,
   });
   writeFileSync(outPath, buf);
 }
@@ -617,7 +628,7 @@ export async function rewriteContainer(
 // eagerly), and arc_coords_dict (a trained zstd dict, won't
 // compress further). arc_offsets is read whole at open, so it
 // compresses freely.
-function shouldCompressSection(name: string, dtype: DType): boolean {
+function shouldCompressSection(name: string, _dtype: DType): boolean {
   if (name === "arc_coords") return false;
   // Block-compressed arc_coords block table: small (~12 bytes per
   // block, ~20 KiB for large topologies) and fetched eagerly at open. Skip
@@ -629,37 +640,9 @@ function shouldCompressSection(name: string, dtype: DType): boolean {
   // block can decompress (chicken-and-egg if it were compressed
   // against another dict).
   if (name === "arc_coords_dict") return false;
-  // CSR triples (poly_offsets, ring_offsets, arc_refs per layer) are
-  // small (~few MB for large topologies) and read whole, so compressing them is a
-  // free win even though they're not the bottleneck.
-  if (
-    name.endsWith("/poly_offsets") ||
-    name.endsWith("/ring_offsets") ||
-    name.endsWith("/arc_refs") ||
-    name.endsWith("/multi_poly_breaks")
-  ) {
-    return true;
-  }
-  // Property + strings: yes.
-  if (dtype === "strings") return true;
-  // Treat any remaining named section (arc_offsets and properties)
-  // as compressible.
+  // Everything else (CSR triples, arc_offsets, properties, strings)
+  // compresses freely.
   return true;
-}
-
-// Section names the encoder always front-loads — these are needed at
-// open time for any consumer of the format. Used by rewriteContainer
-// to preserve the front-load ordering across rewrites.
-function isStructurallyFrontLoaded(name: string): boolean {
-  if (name === "arc_coords_dict") return true;
-  if (name === "arc_coord_blocks") return true;
-  if (name === "arc_offsets") return true;
-  if (name === "arc_coords") return true;
-  if (name.endsWith("/poly_offsets")) return true;
-  if (name.endsWith("/ring_offsets")) return true;
-  if (name.endsWith("/arc_refs")) return true;
-  if (name.endsWith("/multi_poly_breaks")) return true;
-  return false;
 }
 
 // --- Internal: delta encoding ---
@@ -713,7 +696,7 @@ async function compressBytesAsync(
   bytes: Uint8Array,
   codec: Compression,
 ): Promise<Uint8Array> {
-  if (codec === "zst") {
+  if (codec === "zstd") {
     const compressed = await zstdCompressAsync(bytes, {
       params: { [zlibConstants.ZSTD_c_compressionLevel]: 19 },
     });
@@ -749,8 +732,15 @@ interface AssembleInput {
   readonly bbox: readonly [number, number, number, number];
   readonly layers: ReadonlyArray<{ name: string; numGeometries: number }>;
   readonly metadata: string | undefined;
-  readonly arcCoordsBlocks?: ContainerMeta["arcCoordsBlocks"];
+  readonly arcCoordsBlocks: ContainerMeta["arcCoordsBlocks"];
   readonly compression: Compression;
+  // When true, use `sections` in the order given (no front-load
+  // re-sort) and use each section's groupBreak flag for compression-
+  // group boundaries (no synthesized front→lazy boundary). Set by
+  // rewriteContainer to honor the source file's section order and
+  // group structure. Default false → encoder uses front-load-based
+  // ordering and a single front→lazy group boundary.
+  readonly preserveSourceOrder?: boolean;
   readonly onProgress?: (event: EncodeProgress) => void;
   readonly onSectionEncoded?: (event: SectionEncodedEvent) => void;
   readonly onPhaseTiming?: (event: PhaseTimingEvent) => void;
@@ -786,6 +776,7 @@ async function assembleContainer(input: AssembleInput): Promise<Buffer> {
     metadata,
     arcCoordsBlocks,
     compression: codec,
+    preserveSourceOrder,
     onProgress,
     onSectionEncoded,
     onPhaseTiming,
@@ -806,15 +797,31 @@ async function assembleContainer(input: AssembleInput): Promise<Buffer> {
   // order), then everything else. Section table META keeps pointers
   // by name + physical offset, so the on-disk reorder is invisible
   // to consumers — only matters for the open-path prefetch.
-  const rawSections: ReadonlyArray<BuiltSection> = [
-    ...declaredSections.filter((s) => s.frontLoad === true),
-    ...declaredSections.filter((s) => s.frontLoad !== true),
-  ];
+  //
+  // preserveSourceOrder=true (rewriteContainer's path) skips this
+  // reorder so the rebuild emits sections in their source-file order.
+  // Compression-group boundaries come from per-section groupBreak
+  // flags rather than the front→lazy classification.
+  const rawSections: ReadonlyArray<BuiltSection> =
+    preserveSourceOrder === true
+      ? declaredSections.slice()
+      : [
+          ...declaredSections.filter((s) => s.frontLoad === true),
+          ...declaredSections.filter((s) => s.frontLoad !== true),
+        ];
   // Index of the first non-front-load section (or rawSections.length
   // if everything is front-loaded). We force a group flush at this
   // boundary so a compression group never spans front-load + lazy —
   // that would force the front prefetch to drag lazy bytes along.
-  const lazyStartIdx = rawSections.findIndex((s) => s.frontLoad !== true);
+  //
+  // preserveSourceOrder=true bypasses this single-boundary flush;
+  // group breaks come from each section's groupBreak flag instead,
+  // letting the rebuild reproduce the source's compression-group
+  // structure verbatim.
+  const lazyStartIdx =
+    preserveSourceOrder === true
+      ? -1
+      : rawSections.findIndex((s) => s.frontLoad !== true);
 
   // Walk sections in order and pack consecutive compressible ones
   // into groups. Anything that doesn't compress (arc_offsets,
@@ -907,6 +914,10 @@ async function assembleContainer(input: AssembleInput): Promise<Buffer> {
     // lazy one, otherwise the front prefetch would drag the lazy
     // members into its window.
     if (i === lazyStartIdx) flushPending();
+    // Per-section group break (rewriteContainer signals these so the
+    // rebuild's compression groups mirror the source's group
+    // structure).
+    if (section.groupBreak === true) flushPending();
     // Pre-compressed sections (rewriteContainer pass-through) and
     // intentionally-uncompressed sections each go in their own
     // single-member region with no group metadata.
@@ -1063,19 +1074,20 @@ async function assembleContainer(input: AssembleInput): Promise<Buffer> {
   // Build the section-table-compatible "logical entries" array,
   // one per rawSection, sharing offsets within their region.
   // Build section placements.
-  const sectionPlacement: Array<{
+  const sectionPlacement = new Array<{
     physicalOffset: number;
     physicalLength: number;
     groupOffset: number | undefined;
     groupLength: number | undefined;
     compression: Compression | undefined;
     uncompressedRegionLength: number | undefined;
-  }> = new Array(rawSections.length);
+  }>(rawSections.length);
 
-  // New layout: HEADER (16 B) → data sections → FOOTER (section
-  // table + META) → 8 B trailing footer length. dataStart is fixed
-  // at HEADER_SIZE; META + section table get written into the
-  // footer at the very end of the file.
+  // Layout:
+  //  HEADER (16 B) → data sections →
+  //  FOOTER (section table + META) → 8 B trailing footer length.
+  // dataStart is fixed at HEADER_SIZE; META + section table get written
+  // into the footer at the very end of the file.
   const dataStart = HEADER_SIZE;
   const regionLayout: Array<{ offset: number; length: number }> = [];
   let regionCursor = 0;
@@ -1149,7 +1161,18 @@ async function assembleContainer(input: AssembleInput): Promise<Buffer> {
       return entry;
     }),
   };
-  const metaJson = JSON.stringify(meta);
+  // Translate compression strings from public ("zstd"/"brotli") to
+  // wire ("zst"/"br") at the JSON boundary — wire format unchanged
+  // across this rename; only the public type uses long names.
+  const metaForWire = {
+    ...meta,
+    sections: meta.sections.map((s) =>
+      s.compression !== undefined
+        ? { ...s, compression: compressionToWire(s.compression) }
+        : s,
+    ),
+  };
+  const metaJson = JSON.stringify(metaForWire);
   const metaBytes = Buffer.from(metaJson, "utf-8");
 
   // Footer layout: section_count u32 + meta_length u32 + section_table

@@ -24,22 +24,39 @@ export type DType =
 // arc_coords_dict (already a trained zstd dict, won't compress
 // further and must be decodable before any block decompresses).
 //
-// "zst" is the default — best ratio on our data and ships with a
+// "zstd" is the default — best ratio on our data and ships with a
 // tiny (~7 KB) pure-JS fallback decoder (fzstd), preloaded in
 // parallel with the header fetch at open time, so it works on every
 // browser regardless of native support.
 //
-// "br" is supported as an alternative. Native via
+// "brotli" is supported as an alternative. Native via
 // DecompressionStream("brotli") on Firefox today and rolling out in
 // Chrome; producers can pick it for slightly faster encode at the
 // cost of slightly worse ratio. No polyfill — relies on native
-// support; readers throw a clear error if a "br" section is
+// support; readers throw a clear error if a "brotli" section is
 // encountered on a runtime without it.
 //
 // The format keeps `compression` open as a union so future codecs
 // (zstd-with-shared-dict for arc_coords, etc.) can be added without
 // a format-version bump.
-export type Compression = "zst" | "br";
+//
+// Public-API names are "zstd" / "brotli" (descriptive). The on-disk
+// META JSON keeps the abbreviated forms "zst" / "br" — the encoder
+// translates one direction at META emit, the reader translates the
+// other at META parse via the helpers below. Wire format unchanged.
+export type Compression = "zstd" | "brotli";
+
+// Internal wire-format codec strings written into META on disk.
+// Not exported through index.ts — encode/decode boundary only.
+export type WireCompression = "zst" | "br";
+
+export function compressionToWire(c: Compression): WireCompression {
+  return c === "zstd" ? "zst" : "br";
+}
+
+export function compressionFromWire(w: WireCompression): Compression {
+  return w === "zst" ? "zstd" : "brotli";
+}
 
 // One row of the binary section table. JS numbers safely cover the u64 wire
 // values up to 2^53 — well beyond any plausible .ctopo file size.
@@ -98,9 +115,9 @@ export interface ContainerMeta {
   // FlatGeobuf-style escape hatch — JSON-string blob for caller-defined
   // metadata.
   readonly metadata?: string;
-  // When set, arc_coords is block-compressed with zstd: the section's
-  // bytes are a concatenation of independently-decodable zstd frames
-  // (one per block), each compressed against a shared raw-content
+  // arc_coords is block-compressed with zstd: the section's bytes
+  // are a concatenation of independently-decodable zstd frames (one
+  // per block), each compressed against a shared raw-content
   // dictionary. The dict is a sample of arc-coord bytes (first
   // `targetDictSize` of arc_coords on encode); reader fetches it
   // once at open time and passes it to every per-block decompress.
@@ -110,9 +127,8 @@ export interface ContainerMeta {
   //
   // arc_offsets references *logical* (uncompressed) arc-coord byte
   // positions; the client maps those through arcCoordsBlocks to find
-  // which physical blocks to fetch and decompress. Absent when
-  // arc_coords is stored raw (no block layout).
-  readonly arcCoordsBlocks?: {
+  // which physical blocks to fetch and decompress.
+  readonly arcCoordsBlocks: {
     // Section name carrying the shared trained zstd dictionary
     // (output of `zstd --train` over a sample of arc-coord blocks).
     // Reader fetches it eagerly at open and reuses for every block
@@ -145,8 +161,8 @@ export interface ContainerMeta {
   }>;
 }
 
-// One LayerSelection per layer in a merge/mesh/feature call. Multi-layer
-// inputs share global arcs, so cancellation works uniformly across them.
+// One LayerSelection per layer in a merge. Multi-layer inputs share global arcs,
+// so cancellation works uniformly across them.
 export interface LayerSelection {
   readonly layer: string;
   readonly indices: Iterable<number>;
@@ -160,9 +176,7 @@ export interface LayerSelection {
 //
 // Decoding is lazy — `get(i)` slices and decodes a single entry on
 // demand. Opening a container with millions of string entries doesn't
-// pay any decode cost up front, and individual entries can exceed
-// V8's max-string limit because no concatenated form is ever
-// materialized.
+// pay any decode cost up front or encounter max string length issues
 export class StringArray {
   private readonly view: DataView;
   private readonly utf8: Uint8Array;

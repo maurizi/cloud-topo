@@ -6,7 +6,8 @@ import { describe, expect, it } from "vitest";
 import { type Topology } from "topojson-specification";
 
 import { encodeContainer, rewriteContainer } from "../encode";
-import { CtopoClient, makeBufferFetcher } from "../client";
+import { CtopoClient } from "../client";
+import { makeBufferFetcher } from "../fetcher";
 import {
   MAGIC,
   VERSION_MAJOR,
@@ -42,7 +43,7 @@ function viewSectionAuto(
     return viewSection(buf, entry, baseOffset);
   }
   const decompressed =
-    entry.compression === "br"
+    entry.compression === "brotli"
       ? brotliDecompressSync(sectionBytes)
       : zstdDecompressSync(sectionBytes);
   const all = new Uint8Array(
@@ -196,6 +197,64 @@ function makeSpatialSortFixture(): Topology {
   };
 }
 
+// Same arcs and same geometries as makeSpatialSortFixture, but with
+// every block + county polygon concatenated into a single layer.
+// Lets layer-invariance tests confirm the hierarchical sort produces
+// byte-identical output regardless of layer separation.
+function makeFlatSpatialSortFixture(): Topology {
+  return {
+    type: "Topology",
+    arcs: [
+      [
+        [10, 0],
+        [10, 1],
+      ],
+      [
+        [20, 0],
+        [20, 1],
+      ],
+      [
+        [30, 0],
+        [30, 1],
+      ],
+      [
+        [40, 0],
+        [40, 1],
+      ],
+      [
+        [50, 0],
+        [50, 1],
+      ],
+      [
+        [60, 0],
+        [60, 1],
+      ],
+      [
+        [70, 0],
+        [70, 1],
+      ],
+      [
+        [80, 0],
+        [80, 1],
+      ],
+    ],
+    bbox: [0, 0, 100, 1],
+    objects: {
+      all: {
+        type: "GeometryCollection",
+        geometries: [
+          { type: "Polygon", arcs: [[6, 0]], properties: { id: "A" } },
+          { type: "Polygon", arcs: [[~6, 4, 1]], properties: { id: "B" } },
+          { type: "Polygon", arcs: [[7, ~4, 2]], properties: { id: "C" } },
+          { type: "Polygon", arcs: [[~7, 5, 3]], properties: { id: "D" } },
+          { type: "Polygon", arcs: [[0, 4, 2, ~5]], properties: { id: "L" } },
+          { type: "Polygon", arcs: [[~5, 1, 4, ~3]], properties: { id: "R" } },
+        ],
+      },
+    },
+  };
+}
+
 describe("ctopo format", () => {
   it("writes magic + version in the front header and section_count in the footer", async () => {
     const buf = await encodeContainer(fixtureTopology());
@@ -212,7 +271,9 @@ describe("ctopo format", () => {
   });
 
   it("round-trips every section type (numeric, strings, blob, CSR)", async () => {
-    const buf = await encodeContainer(fixtureTopology());
+    const buf = await encodeContainer(fixtureTopology(), {
+      spatialSort: "hilbert",
+    });
     const { meta, sections } = parseContainer(buf);
 
     expect(meta.numArcs).toBe(7);
@@ -305,6 +366,24 @@ describe("ctopo format", () => {
     }
   });
 
+  it("META on disk uses wire-format codec strings; ContainerMeta exposes long names", async () => {
+    // Public API uses "zstd" / "brotli"; on-disk META keeps the
+    // abbreviated wire forms "zst" / "br" so existing files remain
+    // readable. Translation is at the encode/decode boundary.
+    const buf = await encodeContainer(fixtureTopology());
+    const text = new TextDecoder().decode(buf);
+    // Raw META JSON should contain wire codec strings only.
+    expect(text).toMatch(/"compression":"zst"/);
+    expect(text).not.toMatch(/"compression":"zstd"/);
+    // Public ContainerMeta exposes the long form via parseContainer.
+    const { sections } = parseContainer(buf);
+    const compressed = sections.filter((s) => s.compression !== undefined);
+    expect(compressed.length).toBeGreaterThan(0);
+    for (const s of compressed) {
+      expect(s.compression === "zstd" || s.compression === "brotli").toBe(true);
+    }
+  });
+
   it("rejects bad magic with a clear error", async () => {
     const buf = await encodeContainer(fixtureTopology());
     const corrupted = Buffer.from(buf);
@@ -322,18 +401,21 @@ describe("ctopo format", () => {
     );
   });
 
-  it("reorders arcs in visit order (top layer first, then base-only)", async () => {
+  it("reorders arcs in visit order (global Hilbert across all layers)", async () => {
     // Two-layer fixture: 4 base units arranged in a 2×2 grid grouped
     // into 2 top-layer parents (left half + right half). Arcs:
     //   0..3: top-layer outside edges
     //   4..5: top-layer inner boundary
     //   6..7: base-only boundaries
     //
-    // Topology gives them out-of-order; encoder walks layers top
-    // (county) → base (block), assigning visit numbers in walk
-    // order, so county arcs land before base-only arcs.
+    // Default sort = "hilbert" runs one global Hilbert pass over every
+    // geom across every layer. With y constant (all geoms have rep
+    // y=0), the Hilbert key collapses to a function of x; geoms walk
+    // in x-ascending order: county L (x=10), county R (x=60), block A
+    // (x=70), block B (x=70, tie-broken after A), block C (x=80),
+    // block D (x=80, tie-broken after C).
     const topology = makeSpatialSortFixture();
-    const buf = await encodeContainer(topology);
+    const buf = await encodeContainer(topology, { spatialSort: "hilbert" });
     // Use CtopoClient to read through the block-decompression path
     // (the refactored encoder always block-compresses arc_coords).
     const client = await CtopoClient.openWith(makeBufferFetcher(buf));
@@ -353,51 +435,53 @@ describe("ctopo format", () => {
     // layer don't cancel — same identity topojson's mergeArcs
     // uses to compute a union outline). Within each group, ties
     // break by visit order.
-    // Visit order from the layer walk (county→block):
+    // Visit order from the global Hilbert walk:
     //   county L (arcs [0, 4, 2, ~5]) → visits 0=0, 4=1, 2=2, 5=3
     //   county R (arcs [~5, 1, 4, ~3]) → 1=4, 3=5
-    //   block layer (Hilbert): A → 6=6, C → 7=7
+    //   block A (arcs [6, 0]) → 6=6
+    //   block C (arcs [7, ~4, 2]) → 7=7
     // Outline (fwd≠rev) arcs by visit: 0, 4, 2, 5, 1 →
     // Non-outline arcs by visit: 3, 6, 7
     expect(recoveredOrder).toEqual([0, 4, 2, 5, 1, 3, 6, 7]);
   });
 
-  it("spatialSort='hilbert' (explicit) produces byte-identical output to default", async () => {
-    // Default has no spatialSort; the explicit value must take the
-    // same code path. Bit-equality across the whole container guards
-    // against any silent regression in the dispatch refactor.
+  it("spatialSort='hilbert' produces byte-identical output across two encodes", async () => {
+    // Two explicit encodes with the same spatialSort must produce
+    // byte-equal containers. Bit-equality across the whole container
+    // guards against any silent regression in the dispatch refactor.
     const topology = makeSpatialSortFixture();
-    const defBuf = await encodeContainer(topology);
-    const explicitBuf = await encodeContainer(topology, {
-      spatialSort: "hilbert",
-    });
-    expect(Array.from(explicitBuf)).toEqual(Array.from(defBuf));
+    const aBuf = await encodeContainer(topology, { spatialSort: "hilbert" });
+    const bBuf = await encodeContainer(topology, { spatialSort: "hilbert" });
+    expect(Array.from(bBuf)).toEqual(Array.from(aBuf));
   });
 
-  // Two invariants every spatialSort variant must hold:
-  //   (1) The output is a valid permutation of the input arcs
-  //       (no duplicates, none missing).
-  //   (2) Top-layer arcs come before base-only arcs in arc_coords.
-  //       The encoder assigns visit numbers top-down across layers
-  //       so deeper-only arcs end up at the file tail. Variants
-  //       differ in WITHIN-layer ordering only.
-  // Exact within-layer order isn't asserted: the fixture is too
-  // small (4 geoms per layer) for the hierarchical variants'
-  // precinct-grouping or within-component walks to differ
-  // meaningfully from Hilbert. The bench is the right tool for
-  // that.
+  // Invariants every hierarchical-* variant must hold:
+  //   (1) Output is a valid permutation of the input arcs (no
+  //       duplicates, none missing).
+  //   (2) Tier ordering by refCount: arcs with higher refCount come
+  //       before arcs with lower refCount. (Within-tier walk differs
+  //       between -hilbert / -str / -greedy-path; not asserted on
+  //       this fixture — too few arcs per tier to distinguish.)
+  //   (3) Layer-invariance: encoding the same arcs+geometries as
+  //       multiple layers vs one concatenated layer produces an
+  //       identical arc order. This is the load-bearing property
+  //       of the hierarchical-* family.
+  //
+  // refCount across all layers for makeSpatialSortFixture:
+  //   arc 4: 2 blocks + 2 counties = 4   (highest tier)
+  //   arc 5: 1 block  + 2 counties = 3
+  //   arcs 0,1,2,3,6,7: 2 each          (lowest tier)
   for (const sort of [
     "hierarchical-hilbert",
-    "hierarchical-greedy-path",
     "hierarchical-str",
+    "hierarchical-greedy-path",
   ] as const) {
-    it(`spatialSort='${sort}' produces a valid permutation; deeper-only arcs come last`, async () => {
-      const topology = makeSpatialSortFixture();
+    async function recover(topology: Topology): Promise<number[]> {
       const buf = await encodeContainer(topology, { spatialSort: sort });
       const client = await CtopoClient.openWith(makeBufferFetcher(buf));
       const arcIds = Array.from({ length: 8 }, (_, i) => i);
       const arcBytes = await client.fetchArcs(arcIds);
-      const recoveredOrder: number[] = [];
+      const order: number[] = [];
       for (const newId of arcIds) {
         const bytes = arcBytes.get(newId)!;
         const dv = new DataView(
@@ -405,20 +489,30 @@ describe("ctopo format", () => {
           bytes.byteOffset,
           bytes.byteLength,
         );
-        const x = dv.getFloat64(0, true);
-        recoveredOrder.push(x / 10 - 1);
+        order.push(dv.getFloat64(0, true) / 10 - 1);
       }
-      // Exactly the 8 input arcs, no duplicates, no missing.
-      expect(recoveredOrder).toHaveLength(8);
-      expect(new Set(recoveredOrder).size).toBe(8);
-      expect([...recoveredOrder].sort((a, b) => a - b)).toEqual([
-        0, 1, 2, 3, 4, 5, 6, 7,
-      ]);
-      // County-layer arcs (= 0..5) all come before base-only arcs (= 6,7).
-      expect(new Set(recoveredOrder.slice(0, 6))).toEqual(
-        new Set([0, 1, 2, 3, 4, 5]),
+      return order;
+    }
+
+    it(`spatialSort='${sort}' tiers arcs by refCount`, async () => {
+      const recoveredOrder = await recover(makeSpatialSortFixture());
+      // Valid permutation.
+      expect(new Set(recoveredOrder)).toEqual(
+        new Set([0, 1, 2, 3, 4, 5, 6, 7]),
       );
-      expect(new Set(recoveredOrder.slice(6, 8))).toEqual(new Set([6, 7]));
+      // Highest refCount first, next tier next, then refCount=2
+      // tier in any (within-tier-strategy-specific) order.
+      expect(recoveredOrder[0]).toBe(4);
+      expect(recoveredOrder[1]).toBe(5);
+      expect(new Set(recoveredOrder.slice(2, 8))).toEqual(
+        new Set([0, 1, 2, 3, 6, 7]),
+      );
+    });
+
+    it(`spatialSort='${sort}' is layer-invariant`, async () => {
+      const multiLayerOrder = await recover(makeSpatialSortFixture());
+      const flatOrder = await recover(makeFlatSpatialSortFixture());
+      expect(multiLayerOrder).toEqual(flatOrder);
     });
   }
 
@@ -471,10 +565,10 @@ describe("ctopo format", () => {
     const { meta, sections } = parseContainer(buf);
 
     expect(meta.arcCoordsBlocks).toBeDefined();
-    expect(meta.arcCoordsBlocks?.dictSection).toBeUndefined();
-    expect(meta.arcCoordsBlocks?.blockTableSection).toBe("arc_coord_blocks");
-    expect(meta.arcCoordsBlocks?.targetBlockSize).toBe(32);
-    expect(meta.arcCoordsBlocks!.blockCount).toBeGreaterThan(1);
+    expect(meta.arcCoordsBlocks.dictSection).toBeUndefined();
+    expect(meta.arcCoordsBlocks.blockTableSection).toBe("arc_coord_blocks");
+    expect(meta.arcCoordsBlocks.targetBlockSize).toBe(32);
+    expect(meta.arcCoordsBlocks.blockCount).toBeGreaterThan(1);
 
     const blocksEntry = sections.find((s) => s.name === "arc_coord_blocks")!;
     expect(blocksEntry.compression).toBeUndefined();
@@ -493,7 +587,7 @@ describe("ctopo format", () => {
     // Decompress each standalone-frame block (no dict) and confirm
     // the recorded uncompressedEnd matches the actual decoded length.
     let cumUncEnd = 0;
-    for (let i = 0; i < meta.arcCoordsBlocks!.blockCount; i++) {
+    for (let i = 0; i < meta.arcCoordsBlocks.blockCount; i++) {
       const uncEnd = blockTable[i * 3 + 0];
       const compOff = blockTable[i * 3 + 1];
       const compLen = blockTable[i * 3 + 2];

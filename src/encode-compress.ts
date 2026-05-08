@@ -12,13 +12,7 @@
  * spans two blocks.
  */
 
-import {
-  readFileSync,
-  writeFileSync,
-  writeSync,
-  mkdtempSync,
-  rmSync,
-} from "fs";
+import { readFileSync, writeFileSync, mkdtempSync, rmSync } from "fs";
 import { createZstdCompress, constants as zlibConstants } from "zlib";
 import type { ZstdCompress } from "zlib";
 import { spawnSync } from "child_process";
@@ -72,6 +66,24 @@ const ARC_COORD_DICT_DEFAULT = 112640; // zstd's --maxdict default
 const ARC_COORD_DICT_MIN = 16 * 1024;
 const ARC_COORD_DICT_MAX = 256 * 1024;
 
+// Auto-pick policy constants for selecting among trained-dict
+// candidates and the no-dict baseline. Tuned to "stick with
+// established defaults when measured differences are noise floor."
+//
+// MIN_DICT_GAIN: among trained-dict candidates, a non-standard size
+// must beat the standard 110 KiB by at least this fraction of the
+// projected file bytes to win. Sub-threshold differences across
+// fixtures are mostly run-to-run noise from the sample-block subset.
+const MIN_DICT_GAIN = 0.005; // 0.5%
+
+// NO_DICT_PENALTY: when picking between the best dict and the no-dict
+// baseline, dicts get a bonus equal to this fraction. Dict-trained
+// blocks decode meaningfully faster (a separate optimization goal
+// from raw byte size), so a dict that ties on bytes still wins.
+// Effectively: dict wins iff dict.projected < noDict.projected
+// * (1 + NO_DICT_PENALTY).
+const NO_DICT_PENALTY = 0.01; // 1%
+
 // Max in-flight block-compress tasks.
 const BLOCK_COMPRESS_CONCURRENCY = 8;
 
@@ -81,8 +93,7 @@ const BLOCK_COMPRESS_CONCURRENCY = 8;
 // frame, harvest the frame bytes, clear the chunks, and repeat. Calling
 // `zstdCompress(buf, { dictionary })` 1882 times instead leaks ~600 KB
 // per call (the binding rebuilds the CDict each time and never frees
-// the prior copies), eating gigabytes on large encodes. One stream =
-// one dict registration = no leak.
+// the prior copies), eating gigabytes on large encodes.
 interface ZstdFrameStream {
   readonly stream: ZstdCompress;
   readonly chunks: Buffer[];
@@ -214,10 +225,7 @@ export async function blockCompressArcCoords(
   // picked dict, then run a worker loop per stream pulling blocks off
   // a shared cursor. Each stream registers its dict once and emits one
   // independent zstd frame per block via flush(ZSTD_e_end) — no
-  // per-block CDict rebuild, no per-block leak. Replaces the previous
-  // `runWithConcurrency` + `promisify(zstdCompress)` pattern, which
-  // leaked ~600 KB per call on large dicts and was OOM-killing
-  // encode-sweep at the 384 KiB-dict presets.
+  // per-block CDict rebuild, no per-block leak.
   const compressedBlocks = new Array<Buffer>(blockSpecs.length);
   const PROGRESS_EVERY = 100;
   const t0 = Date.now();
@@ -231,7 +239,7 @@ export async function blockCompressArcCoords(
   stderrLog(`[blockCompress] before-loop ${memSnapshot()}`);
 
   const poolSize = Math.min(BLOCK_COMPRESS_CONCURRENCY, blockSpecs.length);
-  const streams: ZstdFrameStream[] = new Array(poolSize);
+  const streams = new Array<ZstdFrameStream>(poolSize);
   for (let s = 0; s < poolSize; s++)
     streams[s] = makeZstdFrameStream(dictBytes);
 
@@ -343,10 +351,9 @@ function trainArcCoordsDict(
       writeFileSync(join(sampleDir, name), slice);
       totalSampleBytes += slice.byteLength;
     }
-    writeSync(
-      2,
+    stderrLog(
       `[trainDict] training on ${sampleIndices.length} samples ` +
-        `(${(totalSampleBytes / 1024 / 1024).toFixed(1)} MiB), maxdict=${(targetDictBytes / 1024).toFixed(0)} KiB\n`,
+        `(${(totalSampleBytes / 1024 / 1024).toFixed(1)} MiB), maxdict=${(targetDictBytes / 1024).toFixed(0)} KiB`,
     );
     const t0 = Date.now();
     const result = spawnSync(
@@ -372,9 +379,8 @@ function trainArcCoordsDict(
       );
     }
     const dictBuf = readFileSync(dictPath);
-    writeSync(
-      2,
-      `[trainDict] trained ${dictBuf.byteLength} byte dict in ${((Date.now() - t0) / 1000).toFixed(1)}s\n`,
+    stderrLog(
+      `[trainDict] trained ${dictBuf.byteLength} byte dict in ${((Date.now() - t0) / 1000).toFixed(1)}s`,
     );
     return new Uint8Array(
       dictBuf.buffer,
@@ -423,10 +429,9 @@ async function autoPickArcCoordDict(
     if (sampleSlices.length >= SAMPLE_BLOCKS) break;
   }
   const projectionFactor = blockSpecs.length / sampleSlices.length;
-  writeSync(
-    2,
+  stderrLog(
     `[autoDict] tuning on ${sampleSlices.length} sample blocks (${blockSpecs.length} total, ` +
-      `projection×${projectionFactor.toFixed(1)}, max dict=${(maxDictBytes / 1024).toFixed(0)} KiB)\n`,
+      `projection×${projectionFactor.toFixed(1)}, max dict=${(maxDictBytes / 1024).toFixed(0)} KiB)`,
   );
 
   // Helper: compress all sample slices with optional dict, return total
@@ -475,10 +480,9 @@ async function autoPickArcCoordDict(
     dict: undefined,
     projectedFileBytes: noDictProjected,
   });
-  writeSync(
-    2,
+  stderrLog(
     `[autoDict]   no-dict: sample=${(noDictSampleTotal / 1024).toFixed(0)} KiB, ` +
-      `projected=${(noDictProjected / 1024 / 1024).toFixed(2)} MiB\n`,
+      `projected=${(noDictProjected / 1024 / 1024).toFixed(2)} MiB`,
   );
 
   // Trained-dict candidates.
@@ -492,20 +496,66 @@ async function autoPickArcCoordDict(
       dict,
       projectedFileBytes: projected,
     });
-    writeSync(
-      2,
+    stderrLog(
       `[autoDict]   ${(dict.byteLength / 1024).toFixed(0)} KiB dict: ` +
         `sample=${(sampleTotal / 1024).toFixed(0)} KiB, ` +
         `projected=${(projected / 1024 / 1024).toFixed(2)} MiB ` +
-        `(incl ${(dict.byteLength / 1024).toFixed(0)} KiB dict)\n`,
+        `(incl ${(dict.byteLength / 1024).toFixed(0)} KiB dict)`,
     );
   }
 
-  // Pick the smallest projected file size.
-  let best = candidates[0];
-  for (const c of candidates) {
-    if (c.projectedFileBytes < best.projectedFileBytes) best = c;
+  // Two-stage pick:
+  //
+  // 1. Among trained-dict candidates, prefer the standard 110 KiB
+  //    default unless another size beats it by more than
+  //    MIN_DICT_GAIN. Sub-threshold differences are noise from the
+  //    sample-block subset and not worth picking a non-standard size.
+  //
+  // 2. Compare the best dict against the no-dict baseline with a
+  //    NO_DICT_PENALTY bias against no-dict. Dicts win ties (and
+  //    tolerate small byte regressions) because dict-trained blocks
+  //    decode faster — a benefit the byte projection ignores.
+  const dicts = candidates.filter(
+    (c): c is Candidate & { dict: Uint8Array } => c.dict !== undefined,
+  );
+  const noDict = candidates.find((c) => c.dict === undefined);
+
+  // Stage 1: best dict, default-preferring.
+  let bestDict: (Candidate & { dict: Uint8Array }) | undefined = undefined;
+  if (dicts.length > 0) {
+    const standard = dicts.find(
+      (c) => c.dict.byteLength === ARC_COORD_DICT_DEFAULT,
+    );
+    bestDict = standard ?? dicts[0];
+    for (const c of dicts) {
+      if (
+        c.projectedFileBytes <
+        bestDict.projectedFileBytes * (1 - MIN_DICT_GAIN)
+      ) {
+        bestDict = c;
+      }
+    }
   }
-  writeSync(2, `[autoDict] picked: ${best.label}\n`);
-  return best.dict;
+
+  // Stage 2: best dict vs no-dict.
+  let chosen: Candidate;
+  let rationale: string;
+  if (bestDict === undefined) {
+    chosen = noDict ?? candidates[0];
+    rationale = "only candidate";
+  } else if (noDict === undefined) {
+    chosen = bestDict;
+    rationale = "no no-dict baseline";
+  } else if (
+    bestDict.projectedFileBytes <
+    noDict.projectedFileBytes * (1 + NO_DICT_PENALTY)
+  ) {
+    chosen = bestDict;
+    rationale = `dict beats no-dict (${(bestDict.projectedFileBytes / noDict.projectedFileBytes).toFixed(3)}× projected, decode-speed bonus applied)`;
+  } else {
+    chosen = noDict;
+    rationale = `no-dict wins by >${(NO_DICT_PENALTY * 100).toFixed(1)}%`;
+  }
+  stderrLog(`[autoDict] picked: ${chosen.label} — ${rationale}`);
+  return chosen.dict;
 }

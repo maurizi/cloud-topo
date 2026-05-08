@@ -5,7 +5,8 @@ import { describe, expect, it } from "vitest";
 
 import { type Topology } from "topojson-specification";
 
-import { CtopoClient, makeBufferFetcher } from "../client";
+import { CtopoClient } from "../client";
+import { makeBufferFetcher } from "../fetcher";
 import { encodeContainer } from "../encode";
 import { merge, mergeArcs, neighbors } from "../merge";
 
@@ -78,7 +79,9 @@ describe("ctopo merge primitives", () => {
   });
 
   it("mergeArcs cancels the shared arc when both blocks are merged", async () => {
-    const buf = await encodeContainer(twoBlockTopology());
+    const buf = await encodeContainer(twoBlockTopology(), {
+      spatialSort: "hilbert",
+    });
     const client = await CtopoClient.openWith(makeBufferFetcher(buf));
 
     // Single-block — should keep all four of its arcs.

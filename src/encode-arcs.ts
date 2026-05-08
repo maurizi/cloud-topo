@@ -35,44 +35,30 @@ export interface LayerCsrForOrder {
 type TopoArcs = ReadonlyArray<ReadonlyArray<ReadonlyArray<number>>>;
 
 export type SpatialSort =
-  // Plain Hilbert: each geom is mapped to a 16-bit Hilbert key from
-  // its representative point; geoms (and their arcs by walk order)
-  // are emitted in key order. Default. Cheap and consistent.
+  // Plain Hilbert: one global Hilbert pass over every geom across
+  // every layer. Geoms are mapped to a 16-bit Hilbert key from a
+  // representative point; arcs inherit the order via the geom walk.
+  // Cheap and consistent. Hilbert keys ignore layer order; tie-
+  // breaks are deterministic on (layerIdx, geomIdx).
   | "hilbert"
-  // Hierarchical: arc-ref-count-driven partition. An arc with refs
-  // ≤ 2 is "base-only" (just bounds 2 base-layer geoms); refs > 2
-  // means it also bounds a parent-layer geom and is a boundary
-  // arc. Boundary arcs are emitted at the file front (in Hilbert
-  // order); base-only arcs are bucketed by parent component
-  // (computed via union-find on base-only arcs) and emitted by
-  // component, ordered Hilbert within component.
-  //
-  // Layer-agnostic — partition detected purely from arc-sharing
-  // patterns, works for any nesting depth. The current production
-  // winner: -1 to -6% wall-clock on small/medium topologies vs
-  // plain Hilbert + the default coalesce gap, neutral on the
-  // largest fixtures.
+  // Hierarchical family: layer-agnostic refCount-based tiering with a
+  // configurable within-tier walk. Operates on arcs directly — no
+  // geom walk, no "base layer" concept.
+  //   1. refCount[arc] = total appearances across every ring of every
+  //      geom in every layer.
+  //   2. Group arcs by descending refCount tier.
+  //   3. Within each tier, walk arcs in the order picked by the suffix:
+  //      - "-hilbert"      : sort by 16-bit Hilbert key of arc rep point.
+  //      - "-str"          : sort by x; split into ⌈√N⌉ strips; sort
+  //                          each by y. Tightest packing on most
+  //                          fixtures by pure bytes-fetched.
+  //      - "-greedy-path"  : nearest-unvisited walk by rep-point
+  //                          distance. Snake-path through the tier.
+  // Arcs shared by many rings (boundaries common to multiple tiers of nesting)
+  // land at the front; base-only arcs (refCount = 2) land at the tail.
   | "hierarchical-hilbert"
-  // Same hierarchical partition as hierarchical-hilbert, but the
-  // within-component walk is greedy-path (least-deflection) over
-  // the component's geoms. Bytes-fetched is lower than Hilbert-
-  // within on most fixtures (per the bench's packing index), but
-  // the walk produces more "splits" inside the perimeter — under
-  // the current single-range HTTP fetcher the extra request count
-  // costs more than the byte savings buy. Promoted to a future
-  // candidate: with multi-range HTTP requests (one GET, multiple
-  // disjoint byte ranges), the per-request RTT amortizes and this
-  // becomes the right default. Same code, gate on client.
-  | "hierarchical-greedy-path"
-  // Same hierarchical partition, within-component walk is STR
-  // (Sort-Tile-Recursive: sort geoms by x-rep, split into ⌈√N⌉
-  // strips, sort each strip by y-rep). Best by pure bytes-fetched
-  // (beat both Hilbert-within and greedy-path-within on most
-  // fixtures in the packing-index bench). Same caveat as
-  // hierarchical-greedy-path: produces more requests, so wall-
-  // clock loses under the current single-range fetcher. Future
-  // candidate for the multi-range world.
-  | "hierarchical-str";
+  | "hierarchical-str"
+  | "hierarchical-greedy-path";
 
 // --- Public API ---
 
@@ -145,86 +131,49 @@ export function computeArcOrder(
   spatialSort: SpatialSort,
   isQuantized: boolean,
 ): Uint32Array {
-  if (layerCsrs.length <= 1) {
+  // Plain "hilbert" sorts geometries; with only one layer the geom
+  // walk degenerates to "geoms in input order," so identity is fine.
+  // The hierarchical-* family sorts arcs directly and its load-bearing
+  // property is byte-identical output regardless of layer separation
+  // — must run even with one layer.
+  const isHierarchical =
+    spatialSort === "hierarchical-hilbert" ||
+    spatialSort === "hierarchical-str" ||
+    spatialSort === "hierarchical-greedy-path";
+  if (layerCsrs.length <= 1 && !isHierarchical) {
+    return identityOrder(numArcs);
+  }
+  if (layerCsrs.length === 0) {
     return identityOrder(numArcs);
   }
 
-  // Visit indices: each layer top → base contributes a sort pass.
-  // The chosen `spatialSort` decides geometry visit order within
-  // each pass; arcs inherit that order via the geometry walk.
-  // Top-layer boundary arcs (outer perimeter + parent-layer
-  // interior boundaries) naturally land at the front of arc_coords
-  // because they're assigned visit numbers first. Base-only arcs
-  // come last.
-  const numLayers = layerCsrs.length;
-  const visit = new Int32Array(numArcs).fill(-1);
-  let cursor = 0;
-  if (
-    spatialSort === "hierarchical-hilbert" ||
-    spatialSort === "hierarchical-greedy-path" ||
-    spatialSort === "hierarchical-str"
-  ) {
-    const within: "hilbert" | "greedy-path" | "str" =
-      spatialSort === "hierarchical-greedy-path"
-        ? "greedy-path"
-        : spatialSort === "hierarchical-str"
-          ? "str"
-          : "hilbert";
-    // Use the same `within` strategy at non-base layers (no parent
-    // grouping needed — top-tier arcs are between top-level
-    // features whose parent is the whole topology). Then hand the
-    // base layer to the hierarchical visit which subgroups
-    // base-only arcs by parent component computed from arc-ref
-    // counts across all layers.
-    const flatVisitFn =
-      within === "greedy-path"
-        ? greedyPathAssignVisit
-        : within === "str"
-          ? strAssignVisit
-          : hilbertAssignVisit;
-    for (let level = numLayers - 1; level >= 1; level--) {
-      cursor = flatVisitFn(
-        layerCsrs[level].csr,
-        arcs,
-        visit,
-        cursor,
-        isQuantized,
-      );
-    }
-    cursor = hierarchicalAssignVisit(
-      layerCsrs.map((l) => l.csr),
-      arcs,
-      visit,
-      cursor,
-      isQuantized,
-      within,
-    );
-  } else {
-    const visitFn = pickVisitFn(spatialSort);
-    for (let level = numLayers - 1; level >= 0; level--) {
-      cursor = visitFn(layerCsrs[level].csr, arcs, visit, cursor, isQuantized);
-    }
-  }
-
-  // Front-load the topology's outer-boundary arcs. Computed via
-  // the same signed-reference cancellation that topojson's
-  // `mergeArcs` uses: an arc is on the boundary of the union of
-  // all geoms iff its forward references don't equal its reverse
-  // references when summed across every geom in every layer.
-  // Interior arcs (shared by two adjacent polygons running in
-  // opposite directions) cancel; outer-boundary arcs don't.
+  // Walk every signed arc reference in every layer ONCE: the hierarchical
+  // path needs total refCount per arc, and the outline-front-loading pass
+  // needs forward/reverse counts. refCount = fwd + rev, so we derive it
+  // from the same scan instead of re-walking arcRefs inside the visit
+  // pass. For million-arc topologies with many cross-layer references,
+  // this is the second-largest pass after the comparator-driven sort.
   //
-  // This is layer-organization-agnostic — collapsing nested layers
-  // into one or splitting one layer into many doesn't change the
-  // outline as long as the geoms themselves cover the same area.
-  // Pulled by the relatively rare merges that touch the outer
-  // boundary; grouping them up front keeps those merges contiguous
-  // and out of the way of common interior fetches.
+  // Front-load the topology's outer-boundary arcs. Computed via the same
+  // signed-reference cancellation that topojson's `mergeArcs` uses: an arc
+  // is on the boundary of the union of all geoms iff its forward
+  // references don't equal its reverse references when summed across
+  // every geom in every layer. Interior arcs (shared by two adjacent
+  // polygons running in opposite directions) cancel; outer-boundary arcs
+  // don't.
+  //
+  // This is layer-organization-agnostic — collapsing nested layers into
+  // one or splitting one layer into many doesn't change the outline as
+  // long as the geoms themselves cover the same area. Pulled by the
+  // relatively rare merges that touch the outer boundary; grouping them
+  // up front keeps those merges contiguous and out of the way of common
+  // interior fetches.
   const outlineFwd = new Int32Array(numArcs);
   const outlineRev = new Int32Array(numArcs);
   for (const { csr } of layerCsrs) {
-    for (let i = 0; i < csr.arcRefs.length; i++) {
-      const r = csr.arcRefs[i];
+    const arcRefs = csr.arcRefs;
+    for (let i = 0; i < arcRefs.length; i++) {
+      const r = arcRefs[i];
       if (r >= 0) outlineFwd[r]++;
       else outlineRev[~r]++;
     }
@@ -234,12 +183,67 @@ export function computeArcOrder(
     if (outlineFwd[id] !== outlineRev[id]) isOutline[id] = 1;
   }
 
-  // Array.sort with a comparator is fine for ~millions of arcs
-  // (~hundreds of ms one-time at producer side at the high end).
-  const sorted = Array.from(identityOrder(numArcs)).sort(
-    (a, b) => isOutline[b] - isOutline[a] || visit[a] - visit[b],
-  );
-  return new Uint32Array(sorted);
+  // Each spatial sort produces a single layer-agnostic arc visit
+  // pass: it walks all arcs across all layers and assigns each one
+  // a monotonically-increasing visit index. Plain "hilbert" sorts
+  // geometries by Hilbert key; the hierarchical-* family sorts arcs
+  // directly by refCount tier with a configurable within-tier walk.
+  const visit = new Int32Array(numArcs).fill(-1);
+  if (
+    spatialSort === "hierarchical-hilbert" ||
+    spatialSort === "hierarchical-str" ||
+    spatialSort === "hierarchical-greedy-path"
+  ) {
+    const within: "hilbert" | "str" | "greedy-path" =
+      spatialSort === "hierarchical-str"
+        ? "str"
+        : spatialSort === "hierarchical-greedy-path"
+          ? "greedy-path"
+          : "hilbert";
+    // Derive refCount from outlineFwd + outlineRev — every signed
+    // reference contributed to one or the other, so their sum is the
+    // total refCount per arc. Saves a second walk over all arcRefs.
+    const refCount = new Int32Array(numArcs);
+    for (let id = 0; id < numArcs; id++) {
+      refCount[id] = outlineFwd[id] + outlineRev[id];
+    }
+    hierarchicalAssignVisit(arcs, visit, 0, within, refCount);
+  } else {
+    globalHilbertAssignVisit(
+      layerCsrs.map((l) => l.csr),
+      arcs,
+      visit,
+      0,
+      isQuantized,
+    );
+  }
+
+  // Final order: outline arcs first (in visit order), then non-outline
+  // (in visit order). Counting-sort it in O(n) instead of an O(n log n)
+  // comparator-driven sort. Orphaned arcs (visit === -1, only possible
+  // on the global hilbert path) sort to the front of their group, matching
+  // the previous comparator's `visit[a] - visit[b]` behavior on -1.
+  let outlineCount = 0;
+  for (let id = 0; id < numArcs; id++) if (isOutline[id]) outlineCount++;
+  const result = new Uint32Array(numArcs);
+  let outCur = 0;
+  let nonOutCur = outlineCount;
+  for (let id = 0; id < numArcs; id++) {
+    if (visit[id] !== -1) continue;
+    if (isOutline[id]) result[outCur++] = id;
+    else result[nonOutCur++] = id;
+  }
+  const invVisit = new Int32Array(numArcs).fill(-1);
+  for (let id = 0; id < numArcs; id++) {
+    if (visit[id] !== -1) invVisit[visit[id]] = id;
+  }
+  for (let v = 0; v < numArcs; v++) {
+    const id = invVisit[v];
+    if (id === -1) continue;
+    if (isOutline[id]) result[outCur++] = id;
+    else result[nonOutCur++] = id;
+  }
+  return result;
 }
 
 export function invertPermutation(perm: Uint32Array): Int32Array {
@@ -259,743 +263,443 @@ export function remapArcRefs(arcRefs: Int32Array, newIdOf: Int32Array): void {
 
 // --- Internal helpers ---
 
-// Visit-order pass: takes a layer's CSR + the global arcs array and
-// the running per-arc visit index Int32Array (filled with -1 before
-// the first pass). Walks geometries (or arcs directly, for arc-graph
-// variants) in some algorithm-specific order, assigning each
-// unclaimed arc a monotonically-increasing visit index. Returns the
-// cursor so subsequent layer passes continue numbering from where
-// this one left off.
+// Per-arc visit-order passes (hierarchicalAssignVisit + globalHilbertAssignVisit
+// below) take all layers' CSRs together so refCount and rep-point
+// computations are layer-agnostic. The running visit Int32Array is
+// filled with -1 before the first pass; each pass assigns
+// monotonically-increasing visit indices to unclaimed arcs and
+// returns the updated cursor.
+
+// Global Hilbert pass over every geometry across every layer.
+// One bbox, one sort, one walk — the layer the geometry came from
+// is not load-bearing. Geometries with smaller Hilbert keys land
+// first in arc_coords; ties break deterministically by (layerIdx,
+// geomIdx) so output is stable across runs.
 //
-// `isQuantized` is threaded through for variants that may need to
-// walk delta-encoded arcs to recover absolute endpoint coordinates;
-// the current set of variants only need the "first point"
-// representative (absolute in both quantized and unquantized
-// topologies) and ignore it.
-type VisitFn = (
-  csr: LayerCsrForOrder,
-  arcs: TopoArcs,
-  visit: Int32Array,
-  startCursor: number,
-  isQuantized: boolean,
-) => number;
-
-function pickVisitFn(sort: SpatialSort): VisitFn {
-  switch (sort) {
-    case "hilbert":
-      return hilbertAssignVisit;
-    case "hierarchical-hilbert":
-    case "hierarchical-greedy-path":
-    case "hierarchical-str":
-      // Special-cased in computeArcOrder — these multi-strategy
-      // sorts go through hierarchicalAssignVisit, which pickVisitFn
-      // never sees. Return Hilbert as a defensive fallback if
-      // something ever calls in.
-      return hilbertAssignVisit;
-  }
-}
-
-// Hilbert-curve visit-order pass for one layer. For each geometry
-// take its first arc's first absolute point as a representative
-// position, normalize against the layer's bbox onto a 16-bit grid,
-// compute the Hilbert key, sort geometries by key, and walk in
-// order emitting any not-yet-claimed arcs. Returns the updated
-// cursor so subsequent layer passes continue numbering from where
-// this one left off.
-function hilbertAssignVisit(
-  csr: LayerCsrForOrder,
-  arcs: TopoArcs,
-  visit: Int32Array,
-  startCursor: number,
-  _isQuantized: boolean,
-): number {
-  const numGeoms = csr.polyOffsets.length - 1;
-  if (numGeoms === 0) return startCursor;
-
-  // Representative point per geometry (absolute coords). For
-  // quantized topologies the topology's first arc point is the
-  // delta from the origin = the absolute coordinate, so this works
-  // uniformly without checking for `transform`.
-  const repX = new Float64Array(numGeoms);
-  const repY = new Float64Array(numGeoms);
-  let minX = Infinity;
-  let maxX = -Infinity;
-  let minY = Infinity;
-  let maxY = -Infinity;
-  for (let g = 0; g < numGeoms; g++) {
-    const ringStart = csr.polyOffsets[g];
-    if (csr.polyOffsets[g + 1] === ringStart) {
-      // No rings — geometry has no arcs. Place at origin so the
-      // sort is stable; rare in practice.
-      repX[g] = 0;
-      repY[g] = 0;
-      continue;
-    }
-    const arcStart = csr.ringOffsets[ringStart];
-    const signed = csr.arcRefs[arcStart];
-    const arcId = signed >= 0 ? signed : ~signed;
-    const arc = arcs[arcId];
-    if (arc.length === 0) {
-      repX[g] = 0;
-      repY[g] = 0;
-      continue;
-    }
-    const x = arc[0][0];
-    const y = arc[0][1];
-    repX[g] = x;
-    repY[g] = y;
-    if (x < minX) minX = x;
-    if (x > maxX) maxX = x;
-    if (y < minY) minY = y;
-    if (y > maxY) maxY = y;
-  }
-
-  // 16-bit Hilbert grid → keys fit in u32 (2^32 = 16-bit × 16-bit).
-  const HSIZE = 1 << 16;
-  const xRange = maxX - minX || 1;
-  const yRange = maxY - minY || 1;
-  const keys = new Uint32Array(numGeoms);
-  for (let g = 0; g < numGeoms; g++) {
-    let nx = Math.floor(((repX[g] - minX) / xRange) * (HSIZE - 1));
-    let ny = Math.floor(((repY[g] - minY) / yRange) * (HSIZE - 1));
-    if (nx < 0) nx = 0;
-    if (ny < 0) ny = 0;
-    if (nx >= HSIZE) nx = HSIZE - 1;
-    if (ny >= HSIZE) ny = HSIZE - 1;
-    keys[g] = hilbertXYToKey(nx, ny, HSIZE);
-  }
-
-  // Sort geometry indices by key. Stable sort isn't required for
-  // correctness — ties just get an arbitrary but deterministic
-  // order — but we use a tiebreaker on geometry index so the
-  // result is identical across runs for fixtures with collisions.
-  const sorted = new Array<number>(numGeoms);
-  for (let g = 0; g < numGeoms; g++) sorted[g] = g;
-  sorted.sort((a, b) => keys[a] - keys[b] || a - b);
-
-  let cursor = startCursor;
-  for (const g of sorted) {
-    const ringEnd = csr.polyOffsets[g + 1];
-    for (let r = csr.polyOffsets[g]; r < ringEnd; r++) {
-      const arcEnd = csr.ringOffsets[r + 1];
-      for (let a = csr.ringOffsets[r]; a < arcEnd; a++) {
-        const id = csr.arcRefs[a] >= 0 ? csr.arcRefs[a] : ~csr.arcRefs[a];
-        if (visit[id] === -1) visit[id] = cursor++;
-      }
-    }
-  }
-  return cursor;
-}
-
-// Hierarchical visit pass for the BASE layer. Base-only arcs
-// (= arcs whose total reference count across all layers' CSRs is
-// ≤ 2 — i.e., they bound only the 2 base-layer geoms and don't
-// also bound any parent-layer geom) are grouped by their parent
-// component, computed via union-find: any base-only arc connects
-// two base geoms in the same parent component by definition.
-// Within each parent component, arcs follow the base layer's
-// Hilbert visit order; across components, by component head's
-// Hilbert.
-//
-// Layer-agnostic — the partition is detected purely from
-// arc-sharing patterns (ref counts), no parent-layer CSR
-// consulted directly. Generalizes to any nesting depth.
-//
-// Different signature from the standard VisitFn — needs all
-// layer CSRs to count arc references. Called from computeArcOrder
-// via a special path.
-function hierarchicalAssignVisit(
+// For inputs where the caller separated nested geometries into
+// multiple layers (e.g. county / precinct / block), the result is
+// byte-identical to encoding the same geometries flattened into a
+// single layer.
+function globalHilbertAssignVisit(
   layerCsrs: ReadonlyArray<LayerCsrForOrder>,
   arcs: TopoArcs,
   visit: Int32Array,
   startCursor: number,
-  isQuantized: boolean,
-  withinStrategy: "hilbert" | "greedy-path" | "str" = "hilbert",
+  _isQuantized: boolean,
 ): number {
-  if (layerCsrs.length === 0) return startCursor;
-  const baseCsr = layerCsrs[0];
-  const numArcs = visit.length;
+  // Total geom count across all layers.
+  let totalGeoms = 0;
+  for (const csr of layerCsrs) totalGeoms += csr.polyOffsets.length - 1;
+  if (totalGeoms === 0) return startCursor;
 
-  // Count each arc's references across all layers' CSRs. An arc
-  // referenced exactly twice (= once per side at the base layer)
-  // is "base-only"; higher counts mean it also bounds a parent-
-  // layer geom and is a boundary arc handled by an earlier pass.
-  const refCount = new Int32Array(numArcs);
-  for (const csr of layerCsrs) {
-    for (let i = 0; i < csr.arcRefs.length; i++) {
-      const id = csr.arcRefs[i] >= 0 ? csr.arcRefs[i] : ~csr.arcRefs[i];
-      refCount[id]++;
-    }
-  }
-  // parentArcs = arcs that ALSO appear in some non-base layer
-  // (refCount > 2). Equivalent to "boundary between parent geoms"
-  // without naming the parent layer.
-  const parentArcs = new Set<number>();
-  for (let i = 0; i < numArcs; i++) {
-    if (refCount[i] > 2) parentArcs.add(i);
-  }
-
-  const numBaseGeoms = baseCsr.polyOffsets.length - 1;
-  if (numBaseGeoms === 0) return startCursor;
-
-  // Build arc → base-geom map. arcToBaseGeom{0,1}[id] hold up to 2
-  // base-layer geom indices that bound this arc. Use sentinel -1
-  // for "no second geom" so we don't allocate per-arc arrays.
-  // Visit array length is the global arc count.
-  const arcToBaseGeom0 = new Int32Array(numArcs);
-  const arcToBaseGeom1 = new Int32Array(numArcs);
-  arcToBaseGeom0.fill(-1);
-  arcToBaseGeom1.fill(-1);
-  for (let g = 0; g < numBaseGeoms; g++) {
-    const ringEnd = baseCsr.polyOffsets[g + 1];
-    for (let r = baseCsr.polyOffsets[g]; r < ringEnd; r++) {
-      const arcEnd = baseCsr.ringOffsets[r + 1];
-      for (let a = baseCsr.ringOffsets[r]; a < arcEnd; a++) {
-        const id =
-          baseCsr.arcRefs[a] >= 0 ? baseCsr.arcRefs[a] : ~baseCsr.arcRefs[a];
-        if (arcToBaseGeom0[id] === -1) arcToBaseGeom0[id] = g;
-        else if (arcToBaseGeom0[id] !== g && arcToBaseGeom1[id] === -1)
-          arcToBaseGeom1[id] = g;
-      }
-    }
-  }
-
-  // Union-find on base geoms via base-only arcs (arcs not in the parent set).
-  const parent = new Int32Array(numBaseGeoms);
-  for (let i = 0; i < numBaseGeoms; i++) parent[i] = i;
-  const find = (x: number): number => {
-    while (parent[x] !== x) {
-      parent[x] = parent[parent[x]];
-      x = parent[x];
-    }
-    return x;
-  };
-  for (let arcId = 0; arcId < numArcs; arcId++) {
-    if (parentArcs.has(arcId)) continue;
-    const b0 = arcToBaseGeom0[arcId];
-    const b1 = arcToBaseGeom1[arcId];
-    if (b0 < 0 || b1 < 0) continue;
-    const ra = find(b0);
-    const rb = find(b1);
-    if (ra !== rb) parent[ra] = rb;
-  }
-  // baseGeomToComponent[geom] = root component id (used as bucket key).
-  const baseGeomToComponent = new Int32Array(numBaseGeoms);
-  for (let i = 0; i < numBaseGeoms; i++) baseGeomToComponent[i] = find(i);
-
-  // Run a Hilbert pass over the base layer to get a within-component
-  // visit order (and a deterministic geom ordering across
-  // components). We don't use the visit numbers from this pass
-  // directly — we use the geom VISIT ORDER produced.
-  //
-  // Easier: compute Hilbert keys per geom (same as hilbertAssignVisit
-  // first phase), then for each component collect its base-only arcs
-  // in geom-Hilbert order; emit components in the Hilbert order of
-  // their head geom.
-  const repX = new Float64Array(numBaseGeoms);
-  const repY = new Float64Array(numBaseGeoms);
+  // Representative point per (layer, geom). For quantized topologies
+  // the topology's first arc point is the delta from the origin =
+  // the absolute coordinate, so the same code works uniformly for
+  // both quantized and unquantized inputs.
+  const repX = new Float64Array(totalGeoms);
+  const repY = new Float64Array(totalGeoms);
+  // Parallel arrays mapping flat index → (layer, geom).
+  const flatLayer = new Int32Array(totalGeoms);
+  const flatGeom = new Int32Array(totalGeoms);
   let minX = Infinity;
   let maxX = -Infinity;
   let minY = Infinity;
   let maxY = -Infinity;
-  for (let g = 0; g < numBaseGeoms; g++) {
-    const ringStart = baseCsr.polyOffsets[g];
-    if (baseCsr.polyOffsets[g + 1] === ringStart) continue;
-    const arcStart = baseCsr.ringOffsets[ringStart];
-    const signed = baseCsr.arcRefs[arcStart];
-    const arcId = signed >= 0 ? signed : ~signed;
-    const arc = arcs[arcId];
+  let flat = 0;
+  for (let l = 0; l < layerCsrs.length; l++) {
+    const csr = layerCsrs[l];
+    const numGeoms = csr.polyOffsets.length - 1;
+    for (let g = 0; g < numGeoms; g++) {
+      flatLayer[flat] = l;
+      flatGeom[flat] = g;
+      const ringStart = csr.polyOffsets[g];
+      if (csr.polyOffsets[g + 1] === ringStart) {
+        // No rings — geometry has no arcs. Place at origin so the
+        // sort is stable; rare in practice.
+        repX[flat] = 0;
+        repY[flat] = 0;
+        flat++;
+        continue;
+      }
+      const arcStart = csr.ringOffsets[ringStart];
+      const signed = csr.arcRefs[arcStart];
+      const arcId = signed >= 0 ? signed : ~signed;
+      const arc = arcs[arcId];
+      if (arc.length === 0) {
+        repX[flat] = 0;
+        repY[flat] = 0;
+        flat++;
+        continue;
+      }
+      const x = arc[0][0];
+      const y = arc[0][1];
+      repX[flat] = x;
+      repY[flat] = y;
+      if (x < minX) minX = x;
+      if (x > maxX) maxX = x;
+      if (y < minY) minY = y;
+      if (y > maxY) maxY = y;
+      flat++;
+    }
+  }
+
+  // 16-bit Hilbert grid → keys fit in u32.
+  const HSIZE = 1 << 16;
+  const HSIZE_M1 = HSIZE - 1;
+  const xScale = HSIZE_M1 / (maxX - minX || 1);
+  const yScale = HSIZE_M1 / (maxY - minY || 1);
+  const keys = new Uint32Array(totalGeoms);
+  for (let i = 0; i < totalGeoms; i++) {
+    let nx = (repX[i] - minX) * xScale;
+    let ny = (repY[i] - minY) * yScale;
+    if (nx < 0) nx = 0;
+    else if (nx > HSIZE_M1) nx = HSIZE_M1;
+    if (ny < 0) ny = 0;
+    else if (ny > HSIZE_M1) ny = HSIZE_M1;
+    keys[i] = hilbertXYToKey(nx | 0, ny | 0, HSIZE);
+  }
+
+  // Sort flat indices by key, tiebreaking on (layer, geom) for
+  // deterministic output across collisions. Uint32Array.sort with a
+  // comparator avoids the boxing/unboxing overhead of Array<number>.
+  const sorted = new Uint32Array(totalGeoms);
+  for (let i = 0; i < totalGeoms; i++) sorted[i] = i;
+  sorted.sort(
+    (a, b) =>
+      keys[a] - keys[b] ||
+      flatLayer[a] - flatLayer[b] ||
+      flatGeom[a] - flatGeom[b],
+  );
+
+  let cursor = startCursor;
+  for (let s = 0; s < totalGeoms; s++) {
+    const i = sorted[s];
+    const csr = layerCsrs[flatLayer[i]];
+    const g = flatGeom[i];
+    const ringEnd = csr.polyOffsets[g + 1];
+    for (let r = csr.polyOffsets[g]; r < ringEnd; r++) {
+      const arcEnd = csr.ringOffsets[r + 1];
+      const arcRefs = csr.arcRefs;
+      for (let a = csr.ringOffsets[r]; a < arcEnd; a++) {
+        const ref = arcRefs[a];
+        const id = ref >= 0 ? ref : ~ref;
+        if (visit[id] === -1) visit[id] = cursor++;
+      }
+    }
+  }
+  return cursor;
+}
+
+// Layer-agnostic arc-level sort: refCount-based tiering with a
+// pluggable within-tier walk. Operates directly on arcs, not on
+// geometries — there's no geom walk, no "base layer", no per-layer
+// iteration. Same arc order whether the caller passed three layers
+// (county / precinct / block) or one concatenated layer holding the
+// same geometries.
+//
+// Algorithm:
+//   refCount[arc] = total appearances across every ring of every
+//                   geom across every layer.
+//   tier(arc)     = refCount[arc]; arcs are bucketed by tier and
+//                   tiers are walked in DESCENDING order so arcs
+//                   shared by many rings (boundaries common to
+//                   several layers of nesting) land at the front.
+//   within-tier   = "hilbert" / "str" / "greedy-path" — picks the
+//                   walk order among arcs that share a tier.
+//
+// Rep point per arc is the arc's first point — absolute for non-
+// quantized topologies; for quantized topologies the first point
+// is the delta-from-origin which equals the absolute first
+// coordinate, so the same code works uniformly.
+function hierarchicalAssignVisit(
+  arcs: TopoArcs,
+  visit: Int32Array,
+  startCursor: number,
+  withinStrategy: "hilbert" | "str" | "greedy-path",
+  refCount: Int32Array,
+): number {
+  const numArcs = visit.length;
+  if (numArcs === 0) return startCursor;
+
+  // Rep point per arc (= arc's first point) and global bbox.
+  const repX = new Float64Array(numArcs);
+  const repY = new Float64Array(numArcs);
+  let minX = Infinity;
+  let maxX = -Infinity;
+  let minY = Infinity;
+  let maxY = -Infinity;
+  for (let id = 0; id < numArcs; id++) {
+    const arc = arcs[id];
     if (arc.length === 0) continue;
     const x = arc[0][0];
     const y = arc[0][1];
-    repX[g] = x;
-    repY[g] = y;
+    repX[id] = x;
+    repY[id] = y;
     if (x < minX) minX = x;
     if (x > maxX) maxX = x;
     if (y < minY) minY = y;
     if (y > maxY) maxY = y;
   }
-  const HSIZE = 1 << 16;
-  const xRange = maxX - minX || 1;
-  const yRange = maxY - minY || 1;
-  const baseGeomHilbert = new Uint32Array(numBaseGeoms);
-  for (let g = 0; g < numBaseGeoms; g++) {
-    let nx = Math.floor(((repX[g] - minX) / xRange) * (HSIZE - 1));
-    let ny = Math.floor(((repY[g] - minY) / yRange) * (HSIZE - 1));
-    if (nx < 0) nx = 0;
-    if (ny < 0) ny = 0;
-    if (nx >= HSIZE) nx = HSIZE - 1;
-    if (ny >= HSIZE) ny = HSIZE - 1;
-    baseGeomHilbert[g] = hilbertXYToKey(nx, ny, HSIZE);
+
+  // Hilbert is a pure ordering — sorting by (refCount desc, hilbertKey
+  // asc, arcId asc) is byte-equivalent to bucketing by refCount and
+  // sorting within each bucket. Skip the tier-bucket scaffolding, the
+  // per-tier allocations, and the per-tier walkTier dispatch with a
+  // single sort.
+  if (withinStrategy === "hilbert") {
+    const HSIZE = 1 << 16;
+    const HSIZE_M1 = HSIZE - 1;
+    const xScale = HSIZE_M1 / (maxX - minX || 1);
+    const yScale = HSIZE_M1 / (maxY - minY || 1);
+    const keys = new Uint32Array(numArcs);
+    for (let id = 0; id < numArcs; id++) {
+      let nx = (repX[id] - minX) * xScale;
+      let ny = (repY[id] - minY) * yScale;
+      if (nx < 0) nx = 0;
+      else if (nx > HSIZE_M1) nx = HSIZE_M1;
+      if (ny < 0) ny = 0;
+      else if (ny > HSIZE_M1) ny = HSIZE_M1;
+      keys[id] = hilbertXYToKey(nx | 0, ny | 0, HSIZE);
+    }
+    const order = new Uint32Array(numArcs);
+    for (let i = 0; i < numArcs; i++) order[i] = i;
+    order.sort(
+      (a, b) => refCount[b] - refCount[a] || keys[a] - keys[b] || a - b,
+    );
+    let cursor = startCursor;
+    for (let i = 0; i < numArcs; i++) visit[order[i]] = cursor++;
+    return cursor;
   }
 
-  // Group base geoms by parent component.
-  const baseGeomsByComponent = new Map<number, number[]>();
-  for (let g = 0; g < numBaseGeoms; g++) {
-    const p = baseGeomToComponent[g];
-    const list = baseGeomsByComponent.get(p);
-    if (list === undefined) baseGeomsByComponent.set(p, [g]);
-    else list.push(g);
+  // STR and greedy have a within-tier walk that isn't expressible as a
+  // single comparator, so they keep the bucket-by-refCount scaffolding.
+  // Counting sort is O(n) — refCount is small-bounded so the histogram
+  // fits comfortably.
+  let maxRC = 0;
+  for (let id = 0; id < numArcs; id++) {
+    if (refCount[id] > maxRC) maxRC = refCount[id];
+  }
+  const tierCount = new Uint32Array(maxRC + 1);
+  for (let id = 0; id < numArcs; id++) tierCount[refCount[id]]++;
+  // tierStart[rc] = beginning offset in `bucketed` for arcs with that
+  // refCount, with tiers laid out in DESCENDING refCount order.
+  const tierStart = new Uint32Array(maxRC + 1);
+  let acc = 0;
+  for (let rc = maxRC; rc >= 0; rc--) {
+    tierStart[rc] = acc;
+    acc += tierCount[rc];
+  }
+  const tierFill = new Uint32Array(maxRC + 1);
+  const bucketed = new Uint32Array(numArcs);
+  // Walk arcs in ascending id order so each tier's bucket ends up in
+  // ascending id order — matches the prior `|| a - b` tiebreak.
+  for (let id = 0; id < numArcs; id++) {
+    const rc = refCount[id];
+    bucketed[tierStart[rc] + tierFill[rc]++] = id;
   }
 
-  // Per-component geom walk:
-  //   - "hilbert": sort the component's geoms by Hilbert key.
-  //   - "greedy-path": start at corner-most geom, walk to the
-  //     unvisited intra-component neighbor with smallest deflection
-  //     from the previous step.
-  // Both produce a 1D ordering of the component's geoms; arcs of
-  // each geom are emitted in walk order (deduped).
+  // Reusable scratch sized for the largest possible tier (= numArcs).
+  const scratch = new Uint32Array(numArcs);
+
   let cursor = startCursor;
-
-  // Build intra-component geom adjacency for greedy-path.
-  // (Hilbert path doesn't need it.)
-  type NbrEdge = { nbr: number; arcId: number };
-  const baseGeomNeighbors = new Map<number, NbrEdge[]>();
-  if (withinStrategy === "greedy-path") {
-    for (let arcId = 0; arcId < numArcs; arcId++) {
-      if (parentArcs.has(arcId)) continue;
-      const a = arcToBaseGeom0[arcId];
-      const b = arcToBaseGeom1[arcId];
-      if (a < 0 || b < 0) continue;
-      if (baseGeomToComponent[a] !== baseGeomToComponent[b]) continue;
-      const la = baseGeomNeighbors.get(a) ?? [];
-      la.push({ nbr: b, arcId });
-      baseGeomNeighbors.set(a, la);
-      const lb = baseGeomNeighbors.get(b) ?? [];
-      lb.push({ nbr: a, arcId });
-      baseGeomNeighbors.set(b, lb);
-    }
-  }
-
-  // Order components by their lowest-Hilbert geom (deterministic +
-  // approximate Hilbert order for the inter-component sequence).
-  const componentOrder = Array.from(baseGeomsByComponent.entries())
-    .map(([cid, baseGeoms]) => {
-      let head = baseGeomHilbert[baseGeoms[0]];
-      let headGeom = baseGeoms[0];
-      for (const g of baseGeoms) {
-        if (baseGeomHilbert[g] < head) {
-          head = baseGeomHilbert[g];
-          headGeom = g;
-        }
-      }
-      return { cid, baseGeoms, head, headGeom };
-    })
-    .sort((a, b) => a.head - b.head);
-
-  for (const { baseGeoms, headGeom } of componentOrder) {
-    let walk: readonly number[];
-    if (withinStrategy === "hilbert") {
-      walk = [...baseGeoms].sort(
-        (a, b) => baseGeomHilbert[a] - baseGeomHilbert[b] || a - b,
-      );
-    } else if (withinStrategy === "str") {
-      // STR sort within the component's geoms: sort by x-rep, split
-      // into ⌈√N⌉ vertical strips, sort each strip by y-rep.
-      const numGeoms = baseGeoms.length;
-      const numStrips = Math.max(1, Math.ceil(Math.sqrt(numGeoms)));
-      const stripSize = Math.ceil(numGeoms / numStrips);
-      const byX = [...baseGeoms].sort((a, b) => repX[a] - repX[b] || a - b);
-      const order: number[] = [];
-      for (let s = 0; s < numStrips; s++) {
-        const lo = s * stripSize;
-        const hi = Math.min(lo + stripSize, numGeoms);
-        if (lo >= hi) continue;
-        const strip = byX.slice(lo, hi);
-        strip.sort((a, b) => repY[a] - repY[b] || a - b);
-        for (const g of strip) order.push(g);
-      }
-      walk = order;
-    } else {
-      // Greedy-path walk through the component's geoms.
-      const visited = new Uint8Array(numBaseGeoms);
-      const order: number[] = [];
-      // Start at corner-most by repX+repY (matches the existing
-      // greedy-path-only sort in this file).
-      let start = baseGeoms[0];
-      let bestStartScore = repX[start] + repY[start];
-      for (const g of baseGeoms) {
-        const s = repX[g] + repY[g];
-        if (s < bestStartScore) {
-          bestStartScore = s;
-          start = g;
-        }
-      }
-      visited[start] = 1;
-      order.push(start);
-      let current = start;
-      let prevDx = 0;
-      let prevDy = 0;
-      let havePrev = false;
-      while (order.length < baseGeoms.length) {
-        const nbrs = (baseGeomNeighbors.get(current) ?? []).filter(
-          ({ nbr }) =>
-            !visited[nbr] &&
-            baseGeomToComponent[nbr] === baseGeomToComponent[current],
-        );
-        let next = -1;
-        if (nbrs.length > 0) {
-          if (havePrev) {
-            let bestScore = -Infinity;
-            for (const { nbr } of nbrs) {
-              const dx = repX[nbr] - repX[current];
-              const dy = repY[nbr] - repY[current];
-              const norm = Math.hypot(dx, dy) || 1;
-              const cosAngle = (dx * prevDx + dy * prevDy) / norm;
-              if (cosAngle > bestScore) {
-                bestScore = cosAngle;
-                next = nbr;
-              }
-            }
-          } else {
-            next = nbrs[0].nbr;
-          }
-        } else {
-          // Disconnected within component (shouldn't happen — every
-          // base-only arc connects two geoms of the same parent
-          // component, so a component's geoms are connected by
-          // definition). Fall back to closest-by-Euclidean.
-          let bestD = Infinity;
-          for (const g of baseGeoms) {
-            if (visited[g]) continue;
-            const d = Math.hypot(
-              repX[g] - repX[current],
-              repY[g] - repY[current],
-            );
-            if (d < bestD) {
-              bestD = d;
-              next = g;
-            }
-          }
-        }
-        if (next < 0) break;
-        prevDx = repX[next] - repX[current];
-        prevDy = repY[next] - repY[current];
-        const norm = Math.hypot(prevDx, prevDy) || 1;
-        prevDx /= norm;
-        prevDy /= norm;
-        havePrev = true;
-        visited[next] = 1;
-        order.push(next);
-        current = next;
-      }
-      void headGeom; // (unused; kept for tabular structure)
-      walk = order;
-    }
-    // Emit: each geom's unclaimed arcs in walk order, deduped.
-    const seen = new Set<number>();
-    for (const g of walk) {
-      const ringEnd = baseCsr.polyOffsets[g + 1];
-      for (let r = baseCsr.polyOffsets[g]; r < ringEnd; r++) {
-        const arcEnd = baseCsr.ringOffsets[r + 1];
-        for (let a = baseCsr.ringOffsets[r]; a < arcEnd; a++) {
-          const id =
-            baseCsr.arcRefs[a] >= 0 ? baseCsr.arcRefs[a] : ~baseCsr.arcRefs[a];
-          if (visit[id] !== -1 || parentArcs.has(id) || seen.has(id)) continue;
-          seen.add(id);
-          visit[id] = cursor++;
-        }
-      }
-    }
+  let tierBegin = 0;
+  for (let rc = maxRC; rc >= 0; rc--) {
+    const size = tierCount[rc];
+    if (size === 0) continue;
+    const tier = bucketed.subarray(tierBegin, tierBegin + size);
+    cursor = walkTier(
+      tier,
+      withinStrategy,
+      repX,
+      repY,
+      scratch.subarray(0, size),
+      visit,
+      cursor,
+    );
+    tierBegin += size;
   }
   return cursor;
 }
 
-// Sort-Tile-Recursive packing on per-geometry bboxes. Sort by bbox
-// x-center, split into ⌈√N⌉ vertical strips of ⌈N/⌈√N⌉⌉ items each;
-// within each strip sort by bbox y-center. Walk in that order
-// emitting unclaimed arcs. Better than Hilbert for elongated
-// geometries that don't curl with the curve.
-//
-// Bboxes are approximated from each arc's first point (arc[0]) —
-// same "representative point" trick that hilbertAssignVisit uses,
-// just aggregated across all arcs per geometry. For quantized
-// topologies arc[0] is the absolute origin coordinate (per the
-// topojson convention used elsewhere in this file), so this works
-// without threading a quantization flag through. For polygons with
-// many small arcs (the common case for fine-grained polygon meshes)
-// the bbox of arc start points tightly approximates the true geom
-// bbox.
-function strAssignVisit(
-  csr: LayerCsrForOrder,
-  arcs: TopoArcs,
+// Walk a single refCount tier in the chosen within-tier order, emitting
+// visit indices directly into `visit`. Each arc is in exactly one tier,
+// so we don't need a `visit[id] === -1` guard. `scratch` is a writable
+// Uint32Array the caller has sized to tier.length (reused across tiers
+// to keep allocation traffic out of the inner loop). `tier` is a
+// subarray view and is never mutated.
+function walkTier(
+  tier: Uint32Array,
+  strategy: "str" | "greedy-path",
+  repX: Float64Array,
+  repY: Float64Array,
+  scratch: Uint32Array,
   visit: Int32Array,
   startCursor: number,
-  _isQuantized: boolean,
 ): number {
-  const numGeoms = csr.polyOffsets.length - 1;
-  if (numGeoms === 0) return startCursor;
-
-  // Per-geom bbox center. Float64Array pair so we can sort indices
-  // by the values without re-walking the CSR.
-  const cx = new Float64Array(numGeoms);
-  const cy = new Float64Array(numGeoms);
-  for (let g = 0; g < numGeoms; g++) {
-    let minX = Infinity;
-    let minY = Infinity;
-    let maxX = -Infinity;
-    let maxY = -Infinity;
-    let any = false;
-    const ringEnd = csr.polyOffsets[g + 1];
-    for (let r = csr.polyOffsets[g]; r < ringEnd; r++) {
-      const arcEnd = csr.ringOffsets[r + 1];
-      for (let a = csr.ringOffsets[r]; a < arcEnd; a++) {
-        const signed = csr.arcRefs[a];
-        const arcId = signed >= 0 ? signed : ~signed;
-        const arc = arcs[arcId];
-        if (arc.length === 0) continue;
-        const x = arc[0][0];
-        const y = arc[0][1];
-        if (x < minX) minX = x;
-        if (x > maxX) maxX = x;
-        if (y < minY) minY = y;
-        if (y > maxY) maxY = y;
-        any = true;
-      }
-    }
-    if (any) {
-      cx[g] = (minX + maxX) / 2;
-      cy[g] = (minY + maxY) / 2;
-    } // else cx=cy=0; sort puts these together in some arbitrary corner
-  }
-
-  // Pass 1: sort all geometries by x-center.
-  const byX = new Array<number>(numGeoms);
-  for (let g = 0; g < numGeoms; g++) byX[g] = g;
-  byX.sort((a, b) => cx[a] - cx[b] || a - b);
-
-  // Pass 2: split into ⌈√N⌉ vertical strips of ⌈N/⌈√N⌉⌉ items each.
-  // Within each strip sort by y-center. Tied centers fall back to
-  // index order so the result is deterministic.
-  const numStrips = Math.max(1, Math.ceil(Math.sqrt(numGeoms)));
-  const stripSize = Math.ceil(numGeoms / numStrips);
-  const sorted = new Array<number>(numGeoms);
-  let outIdx = 0;
-  for (let s = 0; s < numStrips; s++) {
-    const lo = s * stripSize;
-    const hi = Math.min(lo + stripSize, numGeoms);
-    if (lo >= hi) continue;
-    const strip = byX.slice(lo, hi);
-    strip.sort((a, b) => cy[a] - cy[b] || a - b);
-    for (const g of strip) sorted[outIdx++] = g;
-  }
-
+  const n = tier.length;
   let cursor = startCursor;
-  for (const g of sorted) {
-    const ringEnd = csr.polyOffsets[g + 1];
-    for (let r = csr.polyOffsets[g]; r < ringEnd; r++) {
-      const arcEnd = csr.ringOffsets[r + 1];
-      for (let a = csr.ringOffsets[r]; a < arcEnd; a++) {
-        const id = csr.arcRefs[a] >= 0 ? csr.arcRefs[a] : ~csr.arcRefs[a];
-        if (visit[id] === -1) visit[id] = cursor++;
-      }
+  if (n === 1) {
+    visit[tier[0]] = cursor++;
+    return cursor;
+  }
+
+  if (strategy === "str") {
+    // Sort-Tile-Recursive: sort by x, split into ⌈√N⌉ vertical strips,
+    // sort each strip by y. Tighter packing than Hilbert for elongated
+    // tiers; pure bytes-fetched winner on most fixtures.
+    scratch.set(tier);
+    scratch.sort((a, b) => repX[a] - repX[b] || a - b);
+    const numStrips = Math.max(1, Math.ceil(Math.sqrt(n)));
+    const stripSize = Math.ceil(n / numStrips);
+    for (let s = 0; s < numStrips; s++) {
+      const lo = s * stripSize;
+      const hi = Math.min(lo + stripSize, n);
+      if (lo >= hi) continue;
+      // subarray shares the underlying buffer; sorting it sorts in place.
+      scratch.subarray(lo, hi).sort((a, b) => repY[a] - repY[b] || a - b);
     }
+    for (let k = 0; k < n; k++) visit[scratch[k]] = cursor++;
+    return cursor;
+  }
+
+  // "greedy-path": nearest-unvisited walk by rep-point distance.
+  // Starts at the corner-most arc (smallest x+y) and at each step
+  // picks the nearest unvisited tier member. Uses a uniform spatial
+  // grid (~√n × √n cells, ≈1 point per cell at startup) so each NN
+  // query expands outward from the current cell until it can prove
+  // any unchecked cell is strictly farther than the best found so
+  // far. Brings worst-case work from O(n²) to roughly O(n log n) for
+  // typical (non-pathological) point distributions.
+  const tx = new Float64Array(n);
+  const ty = new Float64Array(n);
+  let txMin = Infinity;
+  let txMax = -Infinity;
+  let tyMin = Infinity;
+  let tyMax = -Infinity;
+  for (let k = 0; k < n; k++) {
+    const x = repX[tier[k]];
+    const y = repY[tier[k]];
+    tx[k] = x;
+    ty[k] = y;
+    if (x < txMin) txMin = x;
+    if (x > txMax) txMax = x;
+    if (y < tyMin) tyMin = y;
+    if (y > tyMax) tyMax = y;
+  }
+
+  const gridSide = Math.max(1, Math.ceil(Math.sqrt(n)));
+  const cellSizeX = (txMax - txMin || 1) / gridSide;
+  const cellSizeY = (tyMax - tyMin || 1) / gridSide;
+  const xInvScale = 1 / cellSizeX;
+  const yInvScale = 1 / cellSizeY;
+  const minCellSize = cellSizeX < cellSizeY ? cellSizeX : cellSizeY;
+  const minCellSizeSq = minCellSize * minCellSize;
+  const numCells = gridSide * gridSide;
+
+  // Bucket points into cells (CSR layout). cellPoints lists tier
+  // indices in cell-major order; within each cell they stay in
+  // ascending tier-index order — that ordering is what preserves the
+  // original tiebreak (lowest tier-index wins on equal distance).
+  const cellOf = new Uint32Array(n);
+  const cellCounts = new Uint32Array(numCells);
+  for (let k = 0; k < n; k++) {
+    let cxi = ((tx[k] - txMin) * xInvScale) | 0;
+    let cyi = ((ty[k] - tyMin) * yInvScale) | 0;
+    if (cxi >= gridSide) cxi = gridSide - 1;
+    if (cyi >= gridSide) cyi = gridSide - 1;
+    if (cxi < 0) cxi = 0;
+    if (cyi < 0) cyi = 0;
+    const c = cyi * gridSide + cxi;
+    cellOf[k] = c;
+    cellCounts[c]++;
+  }
+  const cellStart = new Uint32Array(numCells + 1);
+  for (let c = 0; c < numCells; c++) {
+    cellStart[c + 1] = cellStart[c] + cellCounts[c];
+  }
+  // Reuse the caller's scratch buffer for the cell-points list.
+  const cellPoints = scratch;
+  const cellFill = new Uint32Array(numCells);
+  for (let k = 0; k < n; k++) {
+    const c = cellOf[k];
+    cellPoints[cellStart[c] + cellFill[c]++] = k;
+  }
+
+  const visited = new Uint8Array(n);
+  let startIdx = 0;
+  let bestStart = tx[0] + ty[0];
+  for (let k = 1; k < n; k++) {
+    const s = tx[k] + ty[k];
+    if (s < bestStart) {
+      bestStart = s;
+      startIdx = k;
+    }
+  }
+  visited[startIdx] = 1;
+  visit[tier[startIdx]] = cursor++;
+  let currentIdx = startIdx;
+  let placed = 1;
+
+  while (placed < n) {
+    const cx = tx[currentIdx];
+    const cy = ty[currentIdx];
+    let qcx = ((cx - txMin) * xInvScale) | 0;
+    let qcy = ((cy - tyMin) * yInvScale) | 0;
+    if (qcx >= gridSide) qcx = gridSide - 1;
+    if (qcy >= gridSide) qcy = gridSide - 1;
+    if (qcx < 0) qcx = 0;
+    if (qcy < 0) qcy = 0;
+    const maxR =
+      Math.max(qcx, qcy, gridSide - 1 - qcx, gridSide - 1 - qcy) || 0;
+
+    let nextIdx = -1;
+    let bestDistSq = Infinity;
+    let r = 0;
+    while (true) {
+      const xLo = qcx - r < 0 ? 0 : qcx - r;
+      const xHi = qcx + r > gridSide - 1 ? gridSide - 1 : qcx + r;
+      const yLo = qcy - r < 0 ? 0 : qcy - r;
+      const yHi = qcy + r > gridSide - 1 ? gridSide - 1 : qcy + r;
+      for (let yy = yLo; yy <= yHi; yy++) {
+        const dyCells = yy - qcy;
+        const adyCells = dyCells < 0 ? -dyCells : dyCells;
+        for (let xx = xLo; xx <= xHi; xx++) {
+          const dxCells = xx - qcx;
+          const adxCells = dxCells < 0 ? -dxCells : dxCells;
+          // Skip cells covered by earlier (smaller-r) rings.
+          if ((adxCells > adyCells ? adxCells : adyCells) !== r) continue;
+          const c = yy * gridSide + xx;
+          const start = cellStart[c];
+          const end = cellStart[c + 1];
+          for (let p = start; p < end; p++) {
+            const k = cellPoints[p];
+            if (visited[k]) continue;
+            const dx = tx[k] - cx;
+            const dy = ty[k] - cy;
+            const d = dx * dx + dy * dy;
+            if (d < bestDistSq || (d === bestDistSq && k < nextIdx)) {
+              bestDistSq = d;
+              nextIdx = k;
+            }
+          }
+        }
+      }
+      // Unchecked cells (Chebyshev ≥ r+1) have min euclidean distance
+      // > r * minCellSize — strict, derived from the half-open cell
+      // boundary. So once bestDist² ≤ r² * minCellSize² any unchecked
+      // point is strictly farther and can't tie-break either.
+      if (bestDistSq <= r * r * minCellSizeSq) break;
+      if (r >= maxR) break;
+      r++;
+    }
+
+    if (nextIdx === -1) break;
+    visited[nextIdx] = 1;
+    visit[tier[nextIdx]] = cursor++;
+    currentIdx = nextIdx;
+    placed++;
   }
   return cursor;
-}
-
-// Greedy least-deflection path. Walks the geom-geom adjacency graph
-// (edges = shared arcs), at each step picking the unvisited neighbor
-// most aligned with the previous direction-of-travel vector. Falls
-// back to the spatially-nearest unvisited geom when no unvisited
-// neighbor is available (rare on real connected geographies; happens
-// at dead-end vertices and across disconnected components).
-//
-// Produces a snake-path through the geom set; arcs of consecutive
-// geoms tend to land in neighboring file positions which is the
-// goal — selections that form connected components in the geom
-// graph get tighter file ranges.
-function greedyPathAssignVisit(
-  csr: LayerCsrForOrder,
-  arcs: TopoArcs,
-  visit: Int32Array,
-  startCursor: number,
-  _isQuantized: boolean,
-): number {
-  const numGeoms = csr.polyOffsets.length - 1;
-  if (numGeoms === 0) return startCursor;
-
-  // Representative point per geom (arc[0] of the first arc — same
-  // as hilbertAssignVisit). Used for direction vectors and the
-  // nearest-unvisited fallback.
-  const repX = new Float64Array(numGeoms);
-  const repY = new Float64Array(numGeoms);
-  for (let g = 0; g < numGeoms; g++) {
-    const ringStart = csr.polyOffsets[g];
-    if (csr.polyOffsets[g + 1] === ringStart) continue;
-    const arcStart = csr.ringOffsets[ringStart];
-    const signed = csr.arcRefs[arcStart];
-    const arcId = signed >= 0 ? signed : ~signed;
-    const arc = arcs[arcId];
-    if (arc.length === 0) continue;
-    repX[g] = arc[0][0];
-    repY[g] = arc[0][1];
-  }
-
-  // Build geom-geom adjacency by walking CSR once.
-  // Pass 1: arc → first geom that references it (or -1 if not yet seen).
-  // Pass 2: when an arc is referenced a second time, the two geoms are
-  // mutual neighbors. Topojson arcs are shared by at most 2 polygons,
-  // so the second-reference assumption holds.
-  const adj = buildGeomAdjacency(csr);
-
-  // Start at the corner-most geom (minimum repX + repY) for
-  // determinism.
-  let start = 0;
-  let bestStartScore = repX[0] + repY[0];
-  for (let g = 1; g < numGeoms; g++) {
-    const s = repX[g] + repY[g];
-    if (s < bestStartScore) {
-      bestStartScore = s;
-      start = g;
-    }
-  }
-
-  const visited = new Uint8Array(numGeoms);
-  const order = new Array<number>(numGeoms);
-  let orderLen = 0;
-  let current = start;
-  let prevDx = 0;
-  let prevDy = 0;
-  let havePrev = false;
-  visited[current] = 1;
-  order[orderLen++] = current;
-
-  while (orderLen < numGeoms) {
-    const neighbors = adj[current];
-    let next = -1;
-    let bestScore = -Infinity;
-    for (const n of neighbors) {
-      if (visited[n]) continue;
-      const dx = repX[n] - repX[current];
-      const dy = repY[n] - repY[current];
-      const score = scoreCandidate(prevDx, prevDy, dx, dy, havePrev);
-      if (score > bestScore) {
-        bestScore = score;
-        next = n;
-      }
-    }
-    if (next === -1) {
-      // No unvisited neighbor: jump to spatially-nearest unvisited.
-      // Linear scan is O(N) per jump but we rarely jump on a
-      // connected geography (most base-layer graphs are single
-      // connected components).
-      let bestDist = Infinity;
-      for (let g = 0; g < numGeoms; g++) {
-        if (visited[g]) continue;
-        const dx = repX[g] - repX[current];
-        const dy = repY[g] - repY[current];
-        const d = dx * dx + dy * dy;
-        if (d < bestDist) {
-          bestDist = d;
-          next = g;
-        }
-      }
-      // After a jump there's no continuous direction.
-      havePrev = false;
-    } else {
-      prevDx = repX[next] - repX[current];
-      prevDy = repY[next] - repY[current];
-      havePrev = true;
-    }
-    if (next === -1) break; // all visited
-    visited[next] = 1;
-    order[orderLen++] = next;
-    current = next;
-  }
-
-  let cursor = startCursor;
-  for (let i = 0; i < orderLen; i++) {
-    const g = order[i];
-    const ringEnd = csr.polyOffsets[g + 1];
-    for (let r = csr.polyOffsets[g]; r < ringEnd; r++) {
-      const arcEnd = csr.ringOffsets[r + 1];
-      for (let a = csr.ringOffsets[r]; a < arcEnd; a++) {
-        const id = csr.arcRefs[a] >= 0 ? csr.arcRefs[a] : ~csr.arcRefs[a];
-        if (visit[id] === -1) visit[id] = cursor++;
-      }
-    }
-  }
-  return cursor;
-}
-// Walk CSR once, return adjacency lists per geometry. Two geoms are
-// adjacent iff they share at least one arc (regardless of orientation).
-// Used by greedy-path.
-function buildGeomAdjacency(
-  csr: LayerCsrForOrder,
-): ReadonlyArray<ReadonlyArray<number>> {
-  const numGeoms = csr.polyOffsets.length - 1;
-  // Pass 1: arc → first geom that referenced it (or -1).
-  let maxArcId = -1;
-  for (let i = 0; i < csr.arcRefs.length; i++) {
-    const id = csr.arcRefs[i] >= 0 ? csr.arcRefs[i] : ~csr.arcRefs[i];
-    if (id > maxArcId) maxArcId = id;
-  }
-  const arcOwner = new Int32Array(maxArcId + 1).fill(-1);
-  const adj: number[][] = new Array(numGeoms);
-  for (let g = 0; g < numGeoms; g++) adj[g] = [];
-  for (let g = 0; g < numGeoms; g++) {
-    const ringEnd = csr.polyOffsets[g + 1];
-    for (let r = csr.polyOffsets[g]; r < ringEnd; r++) {
-      const arcEnd = csr.ringOffsets[r + 1];
-      for (let a = csr.ringOffsets[r]; a < arcEnd; a++) {
-        const id = csr.arcRefs[a] >= 0 ? csr.arcRefs[a] : ~csr.arcRefs[a];
-        const owner = arcOwner[id];
-        if (owner === -1) {
-          arcOwner[id] = g;
-        } else if (owner !== g) {
-          adj[g].push(owner);
-          adj[owner].push(g);
-          // No third polygon will reference a topojson arc, so we
-          // could break out — but cheap to leave the loop running.
-        }
-      }
-    }
-  }
-  // Dedupe in case the same arc was referenced multiple times by the
-  // same polygon (happens with rings that revisit an arc — rare but
-  // observed on real-world inputs).
-  for (let g = 0; g < numGeoms; g++) {
-    if (adj[g].length > 1) {
-      const seen = new Set<number>();
-      const out: number[] = [];
-      for (const n of adj[g]) {
-        if (!seen.has(n)) {
-          seen.add(n);
-          out.push(n);
-        }
-      }
-      adj[g] = out;
-    }
-  }
-  return adj;
-}
-
-// Greedy-path candidate scoring. Returns a higher value for a more
-// "preferred" neighbor. With no prior direction, prefer the nearest
-// neighbor (ties broken arbitrarily). With a prior direction, prefer
-// the neighbor whose direction most closely matches it (cosine
-// similarity), tiebreak on nearness so straight-but-far loses to
-// straight-and-close.
-function scoreCandidate(
-  prevDx: number,
-  prevDy: number,
-  dx: number,
-  dy: number,
-  havePrev: boolean,
-): number {
-  const len2 = dx * dx + dy * dy;
-  if (!havePrev) {
-    // Negate so smaller distance = higher score.
-    return -len2;
-  }
-  const prevLen = Math.sqrt(prevDx * prevDx + prevDy * prevDy);
-  const len = Math.sqrt(len2);
-  if (prevLen === 0 || len === 0) return -len2;
-  const cosine = (prevDx * dx + prevDy * dy) / (prevLen * len);
-  // Cosine in [-1, 1]; near +1 = aligned (preferred). Add a small
-  // penalty for distance to break ties in favor of near neighbors.
-  return cosine - 1e-9 * len;
 }
 
 // Map (x, y) on an n × n integer grid (n a power of 2) to its

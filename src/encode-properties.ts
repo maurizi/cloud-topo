@@ -264,7 +264,7 @@ function packStrings(
 ): BuiltSection {
   // Encode: count u32 + 4 pad + offsets u32[count+1] + utf8 bytes.
   const encoder = new TextEncoder();
-  const encoded: Uint8Array[] = new Array(length);
+  const encoded = new Array<Uint8Array>(length);
   let totalUtf8 = 0;
   for (let i = 0; i < length; i++) {
     const v = values[i];

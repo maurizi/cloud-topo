@@ -30,6 +30,57 @@ export interface MultiPolygonArcs {
   readonly arcs: number[][][];
 }
 
+// Shared preamble for merge / mergeArcs: build polygons, group by
+// connectivity, collect each group's exterior arcs, fetch the arc
+// bytes in one batched call, build an endpoint lookup. Both callers
+// need everything except `arcBytes` (mergeArcs uses only endpoints
+// for stitching; merge also needs the bytes to decode coordinates),
+// so we return all of it and let the caller pick.
+async function prepareMergeGroups(
+  client: CtopoClient,
+  inputs: ReadonlyArray<LayerSelection>,
+  signal: AbortSignal | undefined,
+): Promise<{
+  groupExteriorArcs: number[][];
+  arcBytes: Map<number, Uint8Array>;
+  endpoints: EndpointLookup;
+}> {
+  const polygons = await buildInputPolygons(client, inputs, signal);
+  if (polygons.length === 0) {
+    const arcBytes = new Map<number, Uint8Array>();
+    return {
+      groupExteriorArcs: [],
+      arcBytes,
+      endpoints: makeEndpointLookup(arcBytes, client),
+    };
+  }
+
+  const polygonsByArc = buildPolygonsByArc(polygons);
+  const groups = groupPolygonsByConnectivity(polygons, polygonsByArc);
+
+  // Collect every group's exterior arcs in one go so we can fetch
+  // arc bytes in a single batched call rather than one fetch per
+  // group.
+  const allExteriorArcs: number[] = [];
+  const groupExteriorArcs: number[][] = groups.map((group) => {
+    const ext = exteriorArcsForGroup(group, polygonsByArc);
+    for (const a of ext) allExteriorArcs.push(a);
+    return ext;
+  });
+  if (allExteriorArcs.length === 0) {
+    const arcBytes = new Map<number, Uint8Array>();
+    return {
+      groupExteriorArcs: [],
+      arcBytes,
+      endpoints: makeEndpointLookup(arcBytes, client),
+    };
+  }
+
+  const arcBytes = await client.fetchArcs(absArcIds(allExteriorArcs), signal);
+  const endpoints = makeEndpointLookup(arcBytes, client);
+  return { groupExteriorArcs, arcBytes, endpoints };
+}
+
 // `mergeArcs` — union of inputs as topology-style geometry. Cheap: only
 // arc endpoints are fetched (for stitching), not full coords.
 export async function mergeArcs(
@@ -37,26 +88,11 @@ export async function mergeArcs(
   inputs: ReadonlyArray<LayerSelection>,
   signal?: AbortSignal,
 ): Promise<MultiPolygonArcs> {
-  const polygons = await buildInputPolygons(client, inputs, signal);
-  if (polygons.length === 0) return { type: "MultiPolygon", arcs: [] };
-
-  const polygonsByArc = buildPolygonsByArc(polygons);
-  const groups = groupPolygonsByConnectivity(polygons, polygonsByArc);
-
-  // Collect every group's exterior arcs in one go so we can fetch
-  // arc-endpoint bytes in a single batched call rather than one
-  // fetch per group.
-  const allExteriorArcs: number[] = [];
-  const groupExteriorArcs: number[][] = groups.map((group) => {
-    const ext = exteriorArcsForGroup(group, polygonsByArc);
-    for (const a of ext) allExteriorArcs.push(a);
-    return ext;
-  });
-  if (allExteriorArcs.length === 0) return { type: "MultiPolygon", arcs: [] };
-
-  const arcBytes = await client.fetchArcs(absArcIds(allExteriorArcs), signal);
-  const endpoints = makeEndpointLookup(arcBytes, client);
-
+  const { groupExteriorArcs, endpoints } = await prepareMergeGroups(
+    client,
+    inputs,
+    signal,
+  );
   const out: number[][][] = [];
   for (const ext of groupExteriorArcs) {
     if (ext.length === 0) continue;
@@ -85,24 +121,11 @@ export async function merge(
   inputs: ReadonlyArray<LayerSelection>,
   signal?: AbortSignal,
 ): Promise<MultiPolygon> {
-  const polygons = await buildInputPolygons(client, inputs, signal);
-  if (polygons.length === 0) return { type: "MultiPolygon", coordinates: [] };
-
-  const polygonsByArc = buildPolygonsByArc(polygons);
-  const groups = groupPolygonsByConnectivity(polygons, polygonsByArc);
-
-  const allExteriorArcs: number[] = [];
-  const groupExteriorArcs: number[][] = groups.map((group) => {
-    const ext = exteriorArcsForGroup(group, polygonsByArc);
-    for (const a of ext) allExteriorArcs.push(a);
-    return ext;
-  });
-  if (allExteriorArcs.length === 0)
-    return { type: "MultiPolygon", coordinates: [] };
-
-  const arcBytes = await client.fetchArcs(absArcIds(allExteriorArcs), signal);
-  const endpoints = makeEndpointLookup(arcBytes, client);
-
+  const { groupExteriorArcs, arcBytes, endpoints } = await prepareMergeGroups(
+    client,
+    inputs,
+    signal,
+  );
   const coordinates: number[][][][] = [];
   for (const ext of groupExteriorArcs) {
     if (ext.length === 0) continue;
@@ -385,7 +408,7 @@ function exteriorArcsForGroup(
 }
 
 function absArcIds(signed: ReadonlyArray<number>): number[] {
-  const out: number[] = new Array(signed.length);
+  const out = new Array<number>(signed.length);
   for (let i = 0; i < signed.length; i++) {
     const s = signed[i];
     out[i] = s >= 0 ? s : ~s;
@@ -615,7 +638,7 @@ function decodeArcPoints(
     return points;
   }
   const numPoints = view.byteLength / 16;
-  const points: number[][] = new Array(numPoints);
+  const points = new Array<number[]>(numPoints);
   for (let i = 0; i < numPoints; i++) {
     const off = i * 16;
     points[i] = [view.getFloat64(off, true), view.getFloat64(off + 8, true)];

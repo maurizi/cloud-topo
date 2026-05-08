@@ -9,7 +9,7 @@ cloud-topo (`.ctopo`) is a binary file format that packs a quantized topology â€
 ## Why not just use TopoJSON?
 
 |                       | TopoJSON (JSON)                                    | cloud-topo (binary)                                                                           |
-| --------------------- | -------------------------------------------------- | --------------------------------------------------------------------------------------------- |
+|-----------------------|----------------------------------------------------|-----------------------------------------------------------------------------------------------|
 | **Wire size**         | JSON text; gzip helps but can't beat binary + zstd | Varint-encoded arcs + zstd-compressed sections; typically 30â€“60% smaller                      |
 | **Load strategy**     | Download entire file, parse all JSON               | Two small Range GETs open the container; subsequent sections fetched on demand                |
 | **Merge performance** | Parse full topology, walk every arc                | Binary arc stitching over pre-indexed CSR geometry; only fetches boundary arcs                |
@@ -17,6 +17,8 @@ cloud-topo (`.ctopo`) is a binary file format that packs a quantized topology â€
 | **Compression**       | gzip on the wire (server-side)                     | Per-section zstd (with shared dictionary for arc blocks) or Brotli; client-side decompression |
 
 cloud-topo is best suited for applications that serve large topologies (thousands to millions of features) from static hosting or object storage (S3, GCS, R2) and need to perform selective operations like merging subsets or reading individual properties without downloading everything.
+
+For best performance, host `.ctopo` files behind a CDN that supports **multi-range requests** (multiple byte ranges in one `Range` header, returned as `multipart/byteranges`). The client coalesces the disjoint arc and offset reads a single merge needs into one request when the server supports it, which can collapse a dozen sequential round trips into one. CloudFront supports this; bare S3/GCS/R2 do not (each disjoint chunk becomes its own request). The client falls back transparently â€” multi-range is a performance optimization, not a requirement.
 
 ## File format
 
@@ -36,7 +38,7 @@ cloud-topo is best suited for applications that serve large topologies (thousand
  end-8..end      footer_length      8 B
 ```
 
-All values are little-endian. The footer lives at the end of the file so a single suffix Range GET (`bytes=-N`) discovers every section's offset and the full metadata JSON. A parallel front Range GET covers front-loaded sections (CSR geometry triples, arc offsets) so the first merge can start without additional round trips.
+All values are little-endian. The footer lives at the end of the file so a single suffix Range GET (`bytes=-N`) discovers every section's offset and the full metadata JSON. A parallel front Range GET covers front-loaded sections (CSR geometry triples, arc offsets) so the first merge can start without additional round trips. Subsequent on-demand reads (arc coordinate slices, property columns) are batched into multi-range requests when the server supports `multipart/byteranges`, falling back to one request per chunk otherwise.
 
 ## Installation
 
@@ -100,11 +102,11 @@ const buf = await encodeContainer(topology);
 The input is a standard [TopoJSON Topology](https://github.com/topojson/topojson-specification) object. The encoder:
 
 - Extracts global arcs and per-layer geometry into CSR (compressed sparse row) triples
-- Auto-detects the narrowest dtype for each numeric property (u8, u16, u32, i8, i16, i32, f64)
+- Auto-detects the narrowest data type for each numeric property (u8, u16, u32, i8, i16, i32, f64)
 - Packs string properties into a length-prefixed UTF-8 layout with lazy decoding
 - Delta-encodes cumulative offset arrays for better compression
 - Optionally block-compresses arc coordinates with a shared zstd dictionary
-- Reorders arcs by tier (coarser layers first) so a small skeleton prefetch covers the most-used boundaries
+- Reorders arcs based spatial locality and number of arc references
 
 ### Rewriting properties in an existing container
 
@@ -123,7 +125,7 @@ Non-overridden sections pass through byte-for-byte; only the named properties ar
 ### Main entrypoint (`cloud-topo`)
 
 | Export                                   | Kind     | Description                                                                                                                |
-| ---------------------------------------- | -------- | -------------------------------------------------------------------------------------------------------------------------- |
+|------------------------------------------|----------|----------------------------------------------------------------------------------------------------------------------------|
 | `CtopoClient`                            | class    | Opens and reads `.ctopo` containers over HTTP Range                                                                        |
 | `CtopoClient.open(url, opts?)`           | static   | Open a remote container                                                                                                    |
 | `CtopoClient.openWith(fetcher, opts?)`   | static   | Open with a custom `RangeFetcher`                                                                                          |
@@ -147,7 +149,7 @@ Non-overridden sections pass through byte-for-byte; only the named properties ar
 ### Types
 
 | Export                 | Description                                    |
-| ---------------------- | ---------------------------------------------- |
+|------------------------|------------------------------------------------|
 | `ContainerMeta`        | Parsed metadata JSON from the footer           |
 | `SectionEntry`         | One row of the binary section table            |
 | `LayerGeometry`        | CSR triple (polyOffsets, ringOffsets, arcRefs) |
@@ -161,7 +163,7 @@ Non-overridden sections pass through byte-for-byte; only the named properties ar
 ### Encoder entrypoint (`cloud-topo/encode`)
 
 | Export                                                | Description                                                                                                               |
-| ----------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------- |
+|-------------------------------------------------------|---------------------------------------------------------------------------------------------------------------------------|
 | `encodeContainer(topology, opts?)`                    | TopoJSON â†’ `.ctopo` Buffer                                                                                                |
 | `writeContainer(path, topology, opts?)`               | Encode and write to file                                                                                                  |
 | `rewriteContainer(inPath, outPath, overrides, opts?)` | Mutate named property sections in an existing container; `opts.frontLoadedSectionNames` adds extras to the front-load set |

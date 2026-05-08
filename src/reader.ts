@@ -25,7 +25,12 @@ import {
   VERSION_MAJOR,
   unpackVersion,
 } from "./format";
-import { type ContainerMeta, type SectionEntry } from "./types";
+import {
+  type ContainerMeta,
+  type SectionEntry,
+  type WireCompression,
+  compressionFromWire,
+} from "./types";
 
 export interface ParsedHeader {
   readonly meta: ContainerMeta;
@@ -81,8 +86,7 @@ export function parseFrontHeader(bytes: Uint8Array): void {
 
 // Parse a footer buffer (section_count + meta_length + section_table
 // + meta_json) into a ParsedHeader. The buffer must start at the
-// footer's first byte and be
-// at least footer_length bytes long.
+// footer's first byte and be at least footer_length bytes long.
 export function parseFooter(footerBytes: Uint8Array): ParsedHeader {
   if (footerBytes.byteLength < FOOTER_PREFIX_SIZE) {
     throw new Error(
@@ -112,11 +116,40 @@ export function parseFooter(footerBytes: Uint8Array): ParsedHeader {
   const metaJson = new TextDecoder("utf-8").decode(
     footerBytes.subarray(metaStart, metaEnd),
   );
-  const meta = JSON.parse(metaJson) as ContainerMeta;
+  // META on disk uses wire codec strings ("zst" / "br"); translate
+  // to public ("zstd" / "brotli") so the rest of the codebase only
+  // sees the long names. Wire format unchanged.
+  type WireSectionMeta = Omit<
+    ContainerMeta["sections"][number],
+    "compression"
+  > & {
+    compression?: WireCompression;
+  };
+  type WireMeta = Omit<ContainerMeta, "sections"> & {
+    sections: ReadonlyArray<WireSectionMeta>;
+  };
+  const rawMeta = JSON.parse(metaJson) as WireMeta;
+  const meta: ContainerMeta = {
+    ...rawMeta,
+    sections: rawMeta.sections.map((s) => ({
+      ...s,
+      compression:
+        s.compression !== undefined
+          ? compressionFromWire(s.compression)
+          : undefined,
+    })),
+  };
 
   if (meta.sections.length !== sectionCount) {
     throw new Error(
       `ctopo: META section count (${meta.sections.length}) disagrees with footer (${sectionCount})`,
+    );
+  }
+  if (
+    typeof (meta as { arcCoordsBlocks?: unknown }).arcCoordsBlocks !== "object"
+  ) {
+    throw new Error(
+      "ctopo: META is missing arcCoordsBlocks — file was produced by an unsupported encoder",
     );
   }
 
@@ -124,7 +157,7 @@ export function parseFooter(footerBytes: Uint8Array): ParsedHeader {
   // with the META descriptor at the same index. The 16-byte name in
   // the binary table is a diagnostic short identifier — META is
   // authoritative.
-  const sections: SectionEntry[] = new Array(sectionCount);
+  const sections = new Array<SectionEntry>(sectionCount);
   let dataStart = Number.POSITIVE_INFINITY;
   for (let i = 0; i < sectionCount; i++) {
     const entryStart = tableStart + i * SECTION_ENTRY_SIZE;
