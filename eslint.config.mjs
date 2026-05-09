@@ -5,15 +5,19 @@ import prettierPlugin from "eslint-plugin-prettier";
 
 export default tseslint.config(
   {
-    ignores: ["dist/**", "node_modules/**", "*.config.*"]
+    ignores: ["dist/**", "node_modules/**", "*.config.*"],
   },
   {
     files: ["src/**/*.ts"],
-    extends: [eslint.configs.recommended, ...tseslint.configs.recommendedTypeChecked, prettier],
+    extends: [
+      eslint.configs.recommended,
+      ...tseslint.configs.recommendedTypeChecked,
+      prettier,
+    ],
     languageOptions: {
       parserOptions: {
-        project: "./tsconfig.lint.json"
-      }
+        project: "./tsconfig.lint.json",
+      },
     },
     plugins: { prettier: prettierPlugin },
     rules: {
@@ -21,12 +25,15 @@ export default tseslint.config(
       "@typescript-eslint/no-explicit-any": "off",
       "@typescript-eslint/no-unsafe-assignment": "off",
       "@typescript-eslint/prefer-promise-reject-errors": "off",
-      "@typescript-eslint/no-unused-vars": ["error", { argsIgnorePattern: "^_" }],
+      "@typescript-eslint/no-unused-vars": [
+        "error",
+        { argsIgnorePattern: "^_" },
+      ],
       "@typescript-eslint/consistent-type-imports": [
         "error",
-        { prefer: "type-imports", fixStyle: "inline-type-imports" }
+        { prefer: "type-imports", fixStyle: "inline-type-imports" },
       ],
-      "prettier/prettier": "error"
-    }
-  }
+      "prettier/prettier": "error",
+    },
+  },
 );

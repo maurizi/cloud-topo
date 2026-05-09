@@ -437,9 +437,7 @@ describe("ctopo merge primitives", () => {
       },
     };
     const buf = await encodeContainer(topology);
-    const client = await CtopoClient.openWith(
-      makeBufferFetcher(buf),
-    );
+    const client = await CtopoClient.openWith(makeBufferFetcher(buf));
     const result = await merge(client, [
       { layer: "block", indices: [0, 1, 2, 3] },
     ]);

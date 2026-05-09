@@ -3,7 +3,7 @@ import { defineConfig } from "tsup";
 export default defineConfig({
   entry: {
     index: "src/index.ts",
-    encode: "src/encode.ts"
+    encode: "src/encode.ts",
   },
   format: ["esm"],
   dts: true,
@@ -11,5 +11,5 @@ export default defineConfig({
   clean: true,
   target: "es2022",
   splitting: true,
-  treeshake: true
+  treeshake: true,
 });

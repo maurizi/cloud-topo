@@ -19,17 +19,13 @@ import {
   mkdtempSync,
   rmSync,
 } from "fs";
-import {
-  zstdCompress,
-  zstdCompressSync,
-  constants as zlibConstants,
-} from "zlib";
-import { promisify } from "util";
+import { createZstdCompress, constants as zlibConstants } from "zlib";
+import type { ZstdCompress } from "zlib";
 import { spawnSync } from "child_process";
 import { tmpdir } from "os";
 import { join } from "path";
 
-import { runWithConcurrency, stderrLog, memSnapshot } from "./util";
+import { stderrLog, memSnapshot } from "./util";
 
 // --- Types ---
 
@@ -79,7 +75,60 @@ const ARC_COORD_DICT_MAX = 256 * 1024;
 // Max in-flight block-compress tasks.
 const BLOCK_COMPRESS_CONCURRENCY = 8;
 
-const zstdCompressAsync = promisify(zstdCompress);
+// One persistent ZstdCompress stream + the chunks array its 'data'
+// handler pushes into. Each stream registers its dict exactly once at
+// construction; we then write one block, flush(ZSTD_e_end) to seal a
+// frame, harvest the frame bytes, clear the chunks, and repeat. Calling
+// `zstdCompress(buf, { dictionary })` 1882 times instead leaks ~600 KB
+// per call (the binding rebuilds the CDict each time and never frees
+// the prior copies), eating gigabytes on large encodes. One stream =
+// one dict registration = no leak.
+interface ZstdFrameStream {
+  readonly stream: ZstdCompress;
+  readonly chunks: Buffer[];
+}
+
+function makeZstdFrameStream(
+  dictBytes: Uint8Array | undefined,
+): ZstdFrameStream {
+  const opts = (dictBytes !== undefined
+    ? {
+        dictionary: dictBytes,
+        params: { [zlibConstants.ZSTD_c_compressionLevel]: 19 },
+      }
+    : {
+        params: { [zlibConstants.ZSTD_c_compressionLevel]: 19 },
+      }) as unknown as Parameters<typeof createZstdCompress>[0];
+  const stream = createZstdCompress(opts);
+  const chunks: Buffer[] = [];
+  stream.on("data", (c: Buffer) => chunks.push(c));
+  // The bench encodes never write enough to need backpressure; throw
+  // on stream errors so we don't silently swallow a binding crash.
+  stream.on("error", (err) => {
+    throw err;
+  });
+  return { stream, chunks };
+}
+
+// Compress one block as an independent zstd frame through `s.stream`.
+// Resets the chunks buffer first so this frame's bytes are exactly
+// what's collected during this call.
+async function compressFrame(
+  s: ZstdFrameStream,
+  block: Uint8Array,
+): Promise<Buffer> {
+  s.chunks.length = 0;
+  s.stream.write(block);
+  await new Promise<void>((resolve) =>
+    s.stream.flush(zlibConstants.ZSTD_e_end, resolve),
+  );
+  return Buffer.concat(s.chunks);
+}
+
+function closeZstdFrameStream(s: ZstdFrameStream): void {
+  s.stream.end();
+  s.stream.close();
+}
 
 // --- Public API ---
 
@@ -155,7 +204,7 @@ export async function blockCompressArcCoords(
   // not dictionary-compress meaningfully; grid-shaped ones might).
   // The user-supplied options.dictBytes is treated as the upper
   // bound — we'll consider sizes up to that.
-  const dictBytes = autoPickArcCoordDict(
+  const dictBytes = await autoPickArcCoordDict(
     arcCoordsBytes,
     blockSpecs,
     options.dictBytes,
@@ -181,27 +230,21 @@ export async function blockCompressArcCoords(
   );
   stderrLog(`[blockCompress] before-loop ${memSnapshot()}`);
 
-  await runWithConcurrency(
-    blockSpecs,
-    BLOCK_COMPRESS_CONCURRENCY,
-    async (spec, i) => {
+  const poolSize = Math.min(BLOCK_COMPRESS_CONCURRENCY, blockSpecs.length);
+  const streams: ZstdFrameStream[] = new Array(poolSize);
+  for (let s = 0; s < poolSize; s++)
+    streams[s] = makeZstdFrameStream(dictBytes);
+
+  let cursor = 0;
+  const worker = async (s: ZstdFrameStream): Promise<void> => {
+    while (cursor < blockSpecs.length) {
+      const i = cursor++;
+      const spec = blockSpecs[i];
       const blockBytes = arcCoordsBytes.subarray(
         spec.startUncompressed,
         spec.endUncompressed,
       );
-      // Node's zstd accepts `dictionary` at runtime even though
-      // ZstdOptions doesn't expose it — same cast pattern as before.
-      // dictBytes can be undefined for small regions; in that case
-      // we just compress without a dict.
-      const opts = (dictBytes !== undefined
-        ? {
-            dictionary: dictBytes,
-            params: { [zlibConstants.ZSTD_c_compressionLevel]: 19 },
-          }
-        : {
-            params: { [zlibConstants.ZSTD_c_compressionLevel]: 19 },
-          }) as unknown as Parameters<typeof zstdCompressAsync>[1];
-      compressedBlocks[i] = await zstdCompressAsync(blockBytes, opts);
+      compressedBlocks[i] = await compressFrame(s, blockBytes);
       completed++;
       if (completed % PROGRESS_EVERY === 0 || completed === blockSpecs.length) {
         stderrLog(
@@ -209,8 +252,13 @@ export async function blockCompressArcCoords(
             `t=${((Date.now() - t0) / 1000).toFixed(1)}s ${memSnapshot()}`,
         );
       }
-    },
-  );
+    }
+  };
+  try {
+    await Promise.all(streams.map((s) => worker(s)));
+  } finally {
+    for (const s of streams) closeZstdFrameStream(s);
+  }
   stderrLog(
     `[blockCompress] done in ${((Date.now() - t0) / 1000).toFixed(1)}s`,
   );
@@ -346,14 +394,14 @@ function trainArcCoordsDict(
 // The cost is one `zstd --train` per candidate (~10s each) and
 // one sample compress per candidate (~1s). For ~3-4 candidates
 // that's ~40s of overhead at encode time.
-function autoPickArcCoordDict(
+async function autoPickArcCoordDict(
   arcCoordsBytes: Uint8Array,
   blockSpecs: ReadonlyArray<{
     readonly startUncompressed: number;
     readonly endUncompressed: number;
   }>,
   maxDictBytes: number,
-): Uint8Array | undefined {
+): Promise<Uint8Array | undefined> {
   // Need a meaningful number of blocks for both training and the
   // sample test. Skip auto-tuning (and dict entirely) for tiny
   // regions — the savings are too small to justify the overhead.
@@ -381,22 +429,24 @@ function autoPickArcCoordDict(
       `projection×${projectionFactor.toFixed(1)}, max dict=${(maxDictBytes / 1024).toFixed(0)} KiB)\n`,
   );
 
-  // Helper: compress all sample slices with optional dict, return total bytes.
-  const compressSampleTotal = (dict: Uint8Array | undefined): number => {
-    let total = 0;
-    for (const slice of sampleSlices) {
-      const opts =
-        dict !== undefined
-          ? ({
-              dictionary: dict,
-              params: { [zlibConstants.ZSTD_c_compressionLevel]: 19 },
-            } as unknown as Parameters<typeof zstdCompressSync>[1])
-          : ({
-              params: { [zlibConstants.ZSTD_c_compressionLevel]: 19 },
-            } as unknown as Parameters<typeof zstdCompressSync>[1]);
-      total += zstdCompressSync(slice, opts).byteLength;
+  // Helper: compress all sample slices with optional dict, return total
+  // bytes. One persistent stream per candidate dict — registering the
+  // dict ~700 times across the seven candidates would otherwise leak
+  // hundreds of MB before blockCompress even starts.
+  const compressSampleTotal = async (
+    dict: Uint8Array | undefined,
+  ): Promise<number> => {
+    const s = makeZstdFrameStream(dict);
+    try {
+      let total = 0;
+      for (const slice of sampleSlices) {
+        const frame = await compressFrame(s, slice);
+        total += frame.byteLength;
+      }
+      return total;
+    } finally {
+      closeZstdFrameStream(s);
     }
-    return total;
   };
 
   // Candidate dict sizes — geometric range. Don't clamp to
@@ -418,7 +468,7 @@ function autoPickArcCoordDict(
   const candidates: Candidate[] = [];
 
   // Baseline: no dict.
-  const noDictSampleTotal = compressSampleTotal(undefined);
+  const noDictSampleTotal = await compressSampleTotal(undefined);
   const noDictProjected = noDictSampleTotal * projectionFactor;
   candidates.push({
     label: "no-dict",
@@ -435,7 +485,7 @@ function autoPickArcCoordDict(
   for (const size of candidateSizes) {
     const dict = trainArcCoordsDict(arcCoordsBytes, blockSpecs, size);
     if (dict === undefined) continue;
-    const sampleTotal = compressSampleTotal(dict);
+    const sampleTotal = await compressSampleTotal(dict);
     const projected = sampleTotal * projectionFactor + dict.byteLength;
     candidates.push({
       label: `${(dict.byteLength / 1024).toFixed(0)} KiB dict`,
