@@ -3,39 +3,52 @@
 
 // Typed wrapper around the wasm-bindgen-generated zstd decoder.
 // Source crate at crates/zstd-decoder/. Generated outputs (the
-// adjacent .js + .d.ts + wasm-bytes.ts) are committed to keep
-// `npm install` toolchain-free; rebuild via `npm run build:wasm`.
+// adjacent .js + .d.ts + .wasm) are committed to keep `npm install`
+// toolchain-free; rebuild via `npm run build:wasm`.
 
 // Types come via the @ts-self-types directive in
 // ./ctopo_zstd_decoder.js pointing at the sibling .d.ts.
+import type * as NodeFsPromises from "node:fs/promises";
 import init, {
   CtopoDecompressor,
   decompress_no_dict,
 } from "./ctopo_zstd_decoder.js";
-import { wasmBase64 } from "./wasm-bytes";
 
 let ready: Promise<void> | undefined;
 
-function base64ToBytes(b64: string): Uint8Array {
-  // atob exists in browsers and Node ≥16. Buffer.from would be
-  // faster on Node-only paths, but atob keeps this isomorphic.
-  const bin = atob(b64);
-  const out = new Uint8Array(bin.length);
-  for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
-  return out;
+// Resolves to the wasm asset URL. With tsup/esbuild's `file` loader
+// this gets rewritten to point at the bundled dist/<hash>.wasm; in
+// source / vitest it's a file:// URL alongside this module.
+const wasmUrl = new URL("./ctopo_zstd_decoder_bg.wasm", import.meta.url);
+
+// Lazy `node:fs/promises` import for the Node code path. The module
+// name goes through a variable so browser bundlers can't statically
+// resolve it, and the magic comments tell Vite/webpack to skip the
+// dynamic import entirely. The import only ever runs when wasmUrl is
+// a file:// URL (i.e. real Node, not a browser).
+async function readNodeFile(url: URL): Promise<Uint8Array> {
+  const moduleName = "node:fs/promises";
+  const fs = (await import(
+    /* @vite-ignore */ /* webpackIgnore: true */ moduleName
+  )) as typeof NodeFsPromises;
+  return await fs.readFile(url);
 }
 
-// Initialize the wasm module once. Async-only — browsers reject
-// synchronous `new WebAssembly.Module()` of buffers >4 KiB on the
-// main thread, and our wasm is ~103 KiB.
 export function initZstdWasm(): Promise<void> {
   if (ready === undefined) {
     ready = (async () => {
-      // wasm-bindgen's __wbg_init accepts either a fetch URL/Request
-      // or raw bytes; passing bytes goes through
-      // WebAssembly.instantiate(bytes, imports) which compiles
-      // off-main-thread. No fetch, no separate .wasm asset.
-      await init(base64ToBytes(wasmBase64));
+      if (wasmUrl.protocol === "file:") {
+        // Node / file URL — built-in fetch can't load file:// so we
+        // hand wasm-bindgen raw bytes; it falls back to
+        // WebAssembly.instantiate(bytes, imports).
+        const bytes = await readNodeFile(wasmUrl);
+        await init({ module_or_path: bytes });
+        return;
+      }
+      // Browser / worker — pass the URL through; wasm-bindgen calls
+      // fetch() + WebAssembly.instantiateStreaming for an
+      // off-main-thread streaming compile that overlaps with download.
+      await init({ module_or_path: wasmUrl });
     })();
   }
   return ready;
