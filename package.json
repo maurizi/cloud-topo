@@ -4,6 +4,14 @@
   "description": "Cloud-optimized binary topology container with HTTP Range support and topojson-compatible primitives",
   "license": "Apache-2.0",
   "author": "Michael Maurizi Jr.",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/maurizi/cloud-topo.git"
+  },
+  "bugs": {
+    "url": "https://github.com/maurizi/cloud-topo/issues"
+  },
+  "homepage": "https://github.com/maurizi/cloud-topo#readme",
   "type": "module",
   "exports": {
     ".": {
