@@ -166,8 +166,8 @@ export interface PhaseTimingEvent {
 
 export interface EncodeOptions {
   // Codec for compressible sections. Defaults to "zstd" — best ratio
-  // and works on every browser (native or via fzstd fallback). Pick
-  // "brotli" to skip the fzstd polyfill entirely (relies on native
+  // and works on every browser (native or via zstd-rs fallback). Pick
+  // "brotli" to skip the zstd-rs polyfill entirely (relies on native
   // DecompressionStream("brotli") — Firefox today, Chrome rolling).
   readonly compression?: Compression;
   // Optional progress callback. Called synchronously between stages;

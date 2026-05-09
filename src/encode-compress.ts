@@ -42,15 +42,9 @@ export interface BlockCompressedArcCoords {
 
 // --- Constants ---
 
-// Default block size for block-compressed arc_coords. Aligned to
-// whole arcs at emit time. The merge-sweep bench (median-of-3
-// across a matrix of fixtures and latency profiles) showed 16 KiB
-// blocks paired with an 8 KiB client coalesce-gap save 13-34% of
-// merge wall-clock vs. 64 KiB blocks + 1 MiB gap, with a sub-1%
-// file-size penalty. Smaller still (8 KiB blocks) saves marginally
-// more time but adds per-block-header overhead; 16 KiB is the
-// inflection.
-export const DEFAULT_ARC_COORD_BLOCK_BYTES = 16 * 1024;
+// Default block size for block-compressed arc_coords.
+// Aligned to whole arcs at emit time.
+export const DEFAULT_ARC_COORD_BLOCK_BYTES = 8 * 1024;
 
 // Auto-pick dict size from arc_coords uncompressed length.
 // We use a *trained* dict via `zstd --train`.

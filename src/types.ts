@@ -25,9 +25,8 @@ export type DType =
 // further and must be decodable before any block decompresses).
 //
 // "zstd" is the default — best ratio on our data and ships with a
-// tiny (~7 KB) pure-JS fallback decoder (fzstd), preloaded in
-// parallel with the header fetch at open time, so it works on every
-// browser regardless of native support.
+// WASM-based fallback decoder (zstd-rs), preloaded in parallel
+// with the header fetch at open time, so it works on every browser
 //
 // "brotli" is supported as an alternative. Native via
 // DecompressionStream("brotli") on Firefox today and rolling out in

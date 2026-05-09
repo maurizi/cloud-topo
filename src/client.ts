@@ -169,7 +169,7 @@ export interface OpenContainerOptions {
   // multi-range HTTP request. CloudFront supports multiple ranges in
   // one request (ascending, non-overlapping); grouping reduces total
   // request count at the cost of multipart response parsing overhead.
-  // Only takes effect when the fetcher implements `multiRange`. 20 by
+  // Only takes effect when the fetcher implements `multiRange`. 64 by
   // default.
   readonly maxRangesPerRequest?: number;
   // Hard off-switch for multi-range packing. Default true. When false,
@@ -269,7 +269,7 @@ const DEFAULT_MAX_PARALLEL_RANGES = 8;
 // re-read by stitching.
 const DEFAULT_BYTE_RANGE_CACHE = 128 * 1024 * 1024;
 // Multi-range request defaults.
-const DEFAULT_MAX_RANGES_PER_REQUEST = 20;
+const DEFAULT_MAX_RANGES_PER_REQUEST = 64;
 // Open-time prefetch size for arc_coords. Block-compressed arc_coords
 // is read through the byte-range cache; warming the section's prefix
 // lets the first N blocks' compressed bytes serve from memory. The
