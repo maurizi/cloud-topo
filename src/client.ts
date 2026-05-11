@@ -85,6 +85,25 @@ export interface CtopoClientStats {
   readonly perFamily: Readonly<
     Record<string, { requests: number; requestBytes: number }>
   >;
+  // Uncompressed section bytes the client actually surfaced to its
+  // public accessors, keyed by section name. Tallied at the consume
+  // site so benches can compare "what we downloaded" (perFamily /
+  // requestBytes) against "what we actually consumed":
+  //   - property/strings/layerGeometry: the section's full
+  //     uncompressed slice byteLength on first access (and 0 on
+  //     subsequent accesses — the cached view bypasses fetch).
+  //   - fetchArcs: arc_coords is bumped by the sum of returned arc
+  //     slice byteLengths (only the requested arcs' coord bytes —
+  //     much less than the whole block's decompressed bytes when
+  //     the requested set is sparse within a block); arc_offsets
+  //     is bumped by 8 per unique arc id (the two u32 entries each
+  //     lookup actually consults); arc_coord_blocks is bumped by
+  //     12 per distinct block touched (one block-table entry per
+  //     block); arc_coords_dict is bumped once at its first fetch
+  //     (the entire dict is needed by every block decompress).
+  //   - Sections that never get accessed don't appear here at all.
+  // Reported uncompressed; downloads in perFamily are compressed.
+  readonly usefulBytesBySection: Readonly<Record<string, number>>;
 }
 
 export interface OpenContainerOptions {
@@ -369,6 +388,18 @@ export class CtopoClient {
   // covering it is still in flight attaches to that GET's Promise
   // instead of firing a duplicate.
   private inFlightRanges: InFlightRange[] = [];
+  // In-flight LOGICAL ranges — the full span the coalescer decided to
+  // fetch before splitting into maxChunkBytes-sized chunks. A
+  // logical-range entry exists from the moment its chunks are queued
+  // until the assembled bytes are cached. Lets a later enqueue whose
+  // interval is fully covered by the logical range attach via one
+  // entry, even when no single chunk's range alone contains it.
+  // Without this, a request for the whole arc_offsets section after a
+  // prefetch of that same section misses on both inFlightRanges (no
+  // chunk covers all 5 chunks' span) and the byte-range cache (each
+  // chunk is its own entry), and ends up re-fetching the whole
+  // section through a parallel family.
+  private inFlightLogicalRanges: InFlightRange[] = [];
   // Byte-range cache: every coalesced GET lands here so that future
   // requests whose [start, end) falls inside an already-fetched range
   // serve from memory. LRU by recency (most recent at the end of the
@@ -394,6 +425,9 @@ export class CtopoClient {
     string,
     { requests: number; requestBytes: number }
   >();
+  // Per-section "bytes actually used" counter. See CtopoClientStats
+  // .usefulBytesBySection for what each section's accounting means.
+  private readonly statUsefulBytesBySection = new Map<string, number>();
 
   private constructor(args: {
     fetcher: RangeFetcher;
@@ -544,49 +578,35 @@ export class CtopoClient {
     const arcCoordsPrefetchBytes =
       opts.arcCoordsPrefetchBytes ?? DEFAULT_ARC_COORDS_PREFETCH;
 
-    // Speculative skeleton prefetch — fills any gaps in what the
-    // front prefetch already covers. With a generous frontPrefetchBytes
-    // these calls hit cache; with a tiny / zero front prefetch they
-    // issue real GETs. Either way they're fire-and-forget.
+    // Speculative skeleton fetches — kick off the long-lived caches
+    // for arc_offsets, arc_coord_blocks, and arc_coords_dict now so
+    // they overlap with whatever the caller does immediately after
+    // open. Each of these getter methods memoizes its parsed result
+    // in a dedicated per-client promise (arcOffsetsPromise etc.), so
+    // the merge path's first fetchArcs call returns from cache with
+    // no second fetch.
     //
-    // arc_offsets / arc_coords_dict / arc_coord_blocks are tagged
-    // "high" priority: they're each only a few hundred KiB but the
-    // entire boundary-compute / fetchArcs path blocks on them, so we
-    // want HTTP/2 to prioritize their bandwidth over the bulk
-    // property GETs that callers fire immediately after open.
+    // We deliberately do NOT route these through prefetchPrefix +
+    // the byte-range LRU. The LRU is sized for transient fetches
+    // (default 32 MiB) and the bulk property GETs the caller fires
+    // immediately after open can evict a multi-MiB arc_offsets blob
+    // before the first fetchArcs touches it — leaving the merge to
+    // re-fetch the same bytes through the on-demand path. The
+    // dedicated long-lived caches sidestep that eviction entirely.
+    //
+    // Fire-and-forget: a prefetch failure surfaces on the first
+    // dependent call, mirroring the previous prefetchPrefix
+    // semantics.
     if (arcOffsetsPrefetch) {
-      // prefetchPrefix clamps to section.length, so this just means
-      // "the whole arc_offsets section."
-      client.prefetchPrefix(
-        "arc_offsets",
-        "offsets",
-        Number.MAX_SAFE_INTEGER,
-        "high",
-      );
+      void client.getArcOffsets().catch(() => {});
     }
-    // Block-compressed arc_coords: start the dict + block-table
-    // fetches speculatively at "high" priority so they overlap
-    // with the rest of open without contending with bulk property
-    // GETs. Both must arrive before any per-block decompress can
-    // happen, but they don't block each other.
-    const blocksMeta = parsed.meta.arcCoordsBlocks;
-    client.prefetchPrefix(
-      blocksMeta.blockTableSection,
-      "arc_coord_blocks",
-      Number.MAX_SAFE_INTEGER,
-      "high",
-    );
-    if (blocksMeta.dictSection !== undefined) {
-      client.prefetchPrefix(
-        blocksMeta.dictSection,
-        "arc_coords_dict",
-        Number.MAX_SAFE_INTEGER,
-        "high",
-      );
-    }
-    // arc_coords prefix prefetch — warms the byte-range cache so
-    // fetchArcs on top-layer skeleton arcs reads compressed-block
-    // bytes from memory instead of issuing per-block GETs.
+    void client.getArcCoordBlocks().catch(() => {});
+    void client.getArcCoordDict().catch(() => {});
+    // arc_coords prefix prefetch — this one stays as a byte-range
+    // cache warmup because fetchArcs reads compressed-block bytes
+    // through the byte-range path (each block goes through
+    // enqueueSectionFetch("arcs", ...)). The prefix is small (512 KiB
+    // default) so eviction pressure is negligible.
     if (arcCoordsPrefetchBytes > 0) {
       client.prefetchPrefix("arc_coords", "arcs", arcCoordsPrefetchBytes);
     }
@@ -609,6 +629,16 @@ export class CtopoClient {
     }
     const promise = (async () => {
       const bytes = await this.fetchSectionBytes(entry, signal);
+      // property() hands the caller a typed view over the whole
+      // column. The client can't see which indices the caller
+      // actually reads, but in practice properties are downloaded
+      // because the entire column will be summed/scanned (sidebar
+      // demos, etc.). Tally the full byteLength so callers see
+      // these as ~100% used and the per-section breakdown spot-
+      // lights the lookup-table sections (arc_offsets, CSR triples,
+      // arc_coord_blocks) where indexed-access metering tells a
+      // different story.
+      this.tallyUseful(name, bytes.byteLength);
       return viewDecompressedSection(bytes, entry.dtype);
     })();
     this.propertyCache.set(name, promise);
@@ -628,6 +658,10 @@ export class CtopoClient {
     }
     const promise = (async () => {
       const bytes = await this.fetchSectionBytes(entry, signal);
+      // Same rationale as property(): tally the full slice so
+      // strings show up as fully used and the bench's per-section
+      // breakdown focuses on the internal lookup tables.
+      this.tallyUseful(name, bytes.byteLength);
       return new StringArray(bytes);
     })();
     this.stringsCache.set(name, promise);
@@ -666,6 +700,10 @@ export class CtopoClient {
             ? this.fetchSectionBytes(breaksEntry, signal)
             : Promise.resolve(undefined),
         ]);
+      // Not tallied here: layerGeometry returns the full CSR views,
+      // but useful-byte attribution wants index-level reads. The
+      // mergeArcs primitive does those reads in expandLayerPolygons
+      // and tallies there via the public tallyUseful hook.
       return {
         polyOffsets: viewU32WithDelta(polyBytes, polyEntry.delta === true),
         ringOffsets: viewU32WithDelta(ringBytes, ringEntry.delta === true),
@@ -713,6 +751,10 @@ export class CtopoClient {
     for (const [k, v] of this.statPerFamily) {
       perFamily[k] = { requests: v.requests, requestBytes: v.requestBytes };
     }
+    const usefulBytesBySection: Record<string, number> = {};
+    for (const [k, v] of this.statUsefulBytesBySection) {
+      usefulBytesBySection[k] = v;
+    }
     return {
       requests: this.statRequests,
       requestBytes: this.statRequestBytes,
@@ -722,6 +764,7 @@ export class CtopoClient {
       byteRangeCacheMisses: this.statByteRangeCacheMisses,
       inFlightHits: this.statInFlightHits,
       perFamily,
+      usefulBytesBySection,
     };
   }
 
@@ -737,6 +780,21 @@ export class CtopoClient {
     this.statByteRangeCacheMisses = 0;
     this.statInFlightHits = 0;
     this.statPerFamily.clear();
+    this.statUsefulBytesBySection.clear();
+  }
+
+  // Tally helper for per-section "useful bytes". Called at the
+  // consume site so the counter reflects index-level reads, not
+  // fetch-level downloads. Public so mergeArcs (which lives in
+  // merge.ts but does its CSR reads via the views layerGeometry()
+  // returned) can attribute its index walks back to per-section
+  // accounting. Silent on non-positive input.
+  tallyUseful(name: string, bytes: number): void {
+    if (bytes <= 0) return;
+    this.statUsefulBytesBySection.set(
+      name,
+      (this.statUsefulBytesBySection.get(name) ?? 0) + bytes,
+    );
   }
 
   close(): void {
@@ -753,6 +811,7 @@ export class CtopoClient {
     this.byteRangeCache = [];
     this.byteRangeCacheUsedBytes = 0;
     this.inFlightRanges = [];
+    this.inFlightLogicalRanges = [];
   }
 
   // --- Private: section bytes ---
@@ -870,6 +929,7 @@ export class CtopoClient {
     const out = new Map<number, Uint8Array>();
     let uniqueCount = 0;
     const blocksTouched = new Set<number>();
+    let arcCoordsUseful = 0;
 
     const promises: Promise<void>[] = [];
     for (const arcId of arcIds) {
@@ -890,6 +950,7 @@ export class CtopoClient {
           `ctopo: arc ${arcId} spans block boundary (logical [${logicalStart}, ${logicalEnd}) vs block end ${blockEnd}) — encoder bug`,
         );
       }
+      arcCoordsUseful += lenInBlock;
       out.set(arcId, EMPTY_BYTES);
       promises.push(
         this.getDecompressedArcCoordBlock(blockIdx, blocks).then(
@@ -902,6 +963,14 @@ export class CtopoClient {
         ),
       );
     }
+    // Per-arc lookup tally: each arc lookup reads two u32 entries
+    // from arc_offsets (start, end) and one 3-u32 entry from the
+    // arc_coord_blocks table (uncEnd, compOff, compLen). Counting
+    // distinct blocks for arc_coord_blocks gives the floor — what
+    // we'd need if arc_coord_blocks were randomly addressable.
+    this.tallyUseful("arc_offsets", 8 * uniqueCount);
+    this.tallyUseful("arc_coord_blocks", 12 * blocksTouched.size);
+    this.tallyUseful("arc_coords", arcCoordsUseful);
     if (uniqueCount > 0) {
       perfLog(
         `[ctopo] fetchArcs (blocks): ${uniqueCount} arcs across ${blocksTouched.size} blocks`,
@@ -929,7 +998,12 @@ export class CtopoClient {
           `ctopo: container is missing the "${meta.dictSection}" section`,
         );
       }
-      this.arcCoordDictPromise = this.fetchSectionBytes(entry);
+      this.arcCoordDictPromise = this.fetchSectionBytes(entry).then(bytes => {
+        // The shared dict is consulted by every per-block decompress
+        // — count its full size once at first resolve.
+        this.tallyUseful(entry.name, bytes.byteLength);
+        return bytes;
+      });
     }
     return this.arcCoordDictPromise;
   }
@@ -1105,8 +1179,20 @@ export class CtopoClient {
     start: number,
     end: number,
   ): Promise<Uint8Array> | undefined {
-    // Walk newest-first — most recently issued GETs are the most
-    // likely to still be in flight.
+    // Check logical ranges first — each entry covers the full span of
+    // a coalesced fetch (before chunk splitting), so it can match
+    // requests larger than any single chunk. Walk newest-first.
+    for (let i = this.inFlightLogicalRanges.length - 1; i >= 0; i--) {
+      const r = this.inFlightLogicalRanges[i];
+      if (r.start <= start && end <= r.end) {
+        return r.promise.then((bytes) =>
+          bytes.subarray(start - r.start, end - r.start),
+        );
+      }
+    }
+    // Fallback: per-chunk in-flight entries (still useful for sub-chunk
+    // requests that arrive after the logical range has resolved into
+    // chunks but before all chunks complete).
     for (let i = this.inFlightRanges.length - 1; i >= 0; i--) {
       const r = this.inFlightRanges[i];
       if (r.start <= start && end <= r.end) {
@@ -1200,6 +1286,36 @@ export class CtopoClient {
         }
       }
       if (current !== null) logicals.push(current);
+    }
+
+    // Register each logical range in the in-flight registry BEFORE
+    // chunk dispatch starts. Any enqueueSectionFetch that lands while
+    // these are in flight can attach to a single logical entry rather
+    // than miss because no single chunk covers the requested span.
+    // The promise resolves after stitching (or rejects on error).
+    const logicalResolvers: Array<{
+      entry: InFlightRange;
+      resolve: (bytes: Uint8Array) => void;
+      reject: (err: unknown) => void;
+    }> = [];
+    for (const logical of logicals) {
+      let resolve!: (bytes: Uint8Array) => void;
+      let reject!: (err: unknown) => void;
+      const promise = new Promise<Uint8Array>((res, rej) => {
+        resolve = res;
+        reject = rej;
+      });
+      // Don't let an unhandled rejection escape — callers may not
+      // attach via lookupInFlightRange before we reject on a fetch
+      // error, and the resolver is internal to the dispatch path.
+      promise.catch(() => {});
+      const entry: InFlightRange = {
+        start: logical.start,
+        end: logical.end,
+        promise,
+      };
+      this.inFlightLogicalRanges.push(entry);
+      logicalResolvers.push({ entry, resolve, reject });
     }
 
     // Build the flat chunk list. Each chunk references its parent
@@ -1339,29 +1455,40 @@ export class CtopoClient {
     });
 
     // After all tasks: stitch each logical range back together
-    // (single-chunk case is a free passthrough) and resolve the
-    // per-item promises with the right subarray.
-    for (const logical of logicals) {
+    // (single-chunk case is a free passthrough), resolve the per-item
+    // promises with the right subarray, resolve the in-flight logical
+    // entry so any concurrent enqueueSectionFetch attached to it gets
+    // the assembled bytes, cache the full logical range so subsequent
+    // enqueues hit the byte-range cache, and then unregister the
+    // in-flight entry.
+    for (let i = 0; i < logicals.length; i++) {
+      const logical = logicals[i];
+      const { entry, resolve, reject } = logicalResolvers[i];
       if (logical.error !== undefined) {
         for (const item of logical.items) item.reject(logical.error);
-        continue;
-      }
-      const bytes =
-        logical.chunkBytes.length === 1
-          ? logical.chunkBytes[0]
-          : stitchChunks(logical.start, logical.end, logical.chunkBytes);
-      for (const item of logical.items) {
-        if (item.signal?.aborted) {
-          item.reject(item.signal.reason ?? new Error("aborted"));
-        } else {
-          item.resolve(
-            bytes.subarray(
-              item.start - logical.start,
-              item.end - logical.start,
-            ),
-          );
+        reject(logical.error);
+      } else {
+        const bytes =
+          logical.chunkBytes.length === 1
+            ? logical.chunkBytes[0]
+            : stitchChunks(logical.start, logical.end, logical.chunkBytes);
+        for (const item of logical.items) {
+          if (item.signal?.aborted) {
+            item.reject(item.signal.reason ?? new Error("aborted"));
+          } else {
+            item.resolve(
+              bytes.subarray(
+                item.start - logical.start,
+                item.end - logical.start,
+              ),
+            );
+          }
         }
+        resolve(bytes);
+        this.cacheByteRange(logical.start, logical.end, bytes);
       }
+      const idx = this.inFlightLogicalRanges.indexOf(entry);
+      if (idx >= 0) this.inFlightLogicalRanges.splice(idx, 1);
     }
   }
 
@@ -1409,7 +1536,12 @@ export class CtopoClient {
         fam.requests++;
         fam.requestBytes += bytes.byteLength;
       }
-      this.cacheByteRange(chunk.start, chunk.end, bytes);
+      // Cache happens at the logical-range level after stitching (see
+      // flushPendingSectionFetches' stitch loop). Not caching the
+      // chunk here avoids double-charging the cache budget for
+      // single-chunk logicals where the chunk and logical bytes are
+      // identical, and avoids stranded chunk fragments when the
+      // assembled logical is what later requests target.
       logical.chunkBytes[chunk.index] = bytes;
       resolveChunk(bytes);
     } catch (err) {
@@ -1518,7 +1650,8 @@ export class CtopoClient {
           continue;
         }
         totalPartBytes += part.bytes.byteLength;
-        this.cacheByteRange(chunk.start, chunk.end, part.bytes);
+        // Per-chunk caching skipped — the logical range is cached
+        // after stitch in flushPendingSectionFetches.
         chunk.logical.chunkBytes[chunk.index] = part.bytes;
         inFlightEntries[i].resolve(part.bytes);
         const fam = this.statPerFamily.get(chunk.logical.family);

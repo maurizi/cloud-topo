@@ -266,18 +266,25 @@ async function buildInputPolygons(
   );
   const polygons: InputPolygon[] = [];
   for (let i = 0; i < inputs.length; i++) {
-    expandLayerPolygons(layerCsr[i], inputs[i].indices, polygons);
+    expandLayerPolygons(client, inputs[i].layer, layerCsr[i], inputs[i].indices, polygons);
   }
   return polygons;
 }
 
 function expandLayerPolygons(
+  client: CtopoClient,
+  layer: string,
   csr: LayerGeometry,
   geomIndices: Iterable<number>,
   out: InputPolygon[],
 ): void {
   // Index the sparse multi_poly_breaks table by geom for O(1) lookup
   // per geom we visit. Empty in the typical single-Polygon-only case.
+  // We touch the whole table once; attribute its full byteLength to
+  // the useful-bytes tally for this layer (one call per mergeArcs
+  // — so repeated mergeArcs calls re-walk it, and the bench may see
+  // useful_bytes > section_uncompressed_size for multi_poly_breaks).
+  client.tallyUseful(`${layer}/multi_poly_breaks`, csr.multiPolyBreaks.byteLength);
   const breaksByGeom = new Map<number, number[]>();
   for (let i = 0; i < csr.multiPolyBreaks.length; i += 2) {
     const g = csr.multiPolyBreaks[i];
@@ -290,26 +297,35 @@ function expandLayerPolygons(
     list.push(r);
   }
 
+  // Per geom we visit: read polyOffsets[g] and polyOffsets[g+1]
+  // (8 B u32). For each ring inside the geom: read ringOffsets[r]
+  // and ringOffsets[r+1] (8 B u32). For each arc ref inside the
+  // ring: read arcRefs[a] (4 B i32). Tally bumps reflect those
+  // index-level reads so the per-section coverage tracks the merge's
+  // actual access pattern, not the section's byteLength.
   for (const g of geomIndices) {
     const ringStart = csr.polyOffsets[g];
     const ringEnd = csr.polyOffsets[g + 1];
+    client.tallyUseful(`${layer}/poly_offsets`, 8);
     if (ringStart === ringEnd) continue; // non-polygon geom
     const breaks = breaksByGeom.get(g);
     if (breaks === undefined) {
-      out.push(makeInputPolygon(csr, ringStart, ringEnd));
+      out.push(makeInputPolygon(client, layer, csr, ringStart, ringEnd));
       continue;
     }
     // Polygon entry boundaries within geom g: ringStart, *breaks, ringEnd.
     let prev = ringStart;
     for (const b of breaks) {
-      out.push(makeInputPolygon(csr, prev, b));
+      out.push(makeInputPolygon(client, layer, csr, prev, b));
       prev = b;
     }
-    out.push(makeInputPolygon(csr, prev, ringEnd));
+    out.push(makeInputPolygon(client, layer, csr, prev, ringEnd));
   }
 }
 
 function makeInputPolygon(
+  client: CtopoClient,
+  layer: string,
   csr: LayerGeometry,
   ringStart: number,
   ringEnd: number,
@@ -318,8 +334,10 @@ function makeInputPolygon(
   for (let r = ringStart; r < ringEnd; r++) {
     const arcStart = csr.ringOffsets[r];
     const arcEnd = csr.ringOffsets[r + 1];
+    client.tallyUseful(`${layer}/ring_offsets`, 8);
     const ring = new Array<number>(arcEnd - arcStart);
     for (let a = arcStart; a < arcEnd; a++) ring[a - arcStart] = csr.arcRefs[a];
+    client.tallyUseful(`${layer}/arc_refs`, 4 * (arcEnd - arcStart));
     rings.push(ring);
   }
   return { rings };
