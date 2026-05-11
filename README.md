@@ -16,6 +16,8 @@ cloud-topo (`.ctopo`) is a binary file format that packs a quantized topology â€
 | **Property access**   | Parse entire file to read one column               | Column-oriented sections; fetch only the property you need                                    |
 | **Compression**       | gzip on the wire (server-side)                     | Per-section zstd (with shared dictionary for arc blocks) or Brotli; client-side decompression |
 
+[Benchmarking](https://github.com/maurizi/cloud-topo-bench) against all US census blocks, VTDs, counties and states; the `.topojson` file was 4.4gb and the equivalent `.ctopo` file 1.1gb. Running a `merge` operation to recover US congressional districts from their [block-equivalency files](https://www.census.gov/geographies/mapping-files/2025/dec/rdo/119-congressional-district-bef.html) took 70s and consumed ~240mb.
+
 cloud-topo is best suited for applications that serve large topologies (thousands to millions of features) from static hosting or object storage (S3, GCS, R2) and need to perform selective operations like merging subsets or reading individual properties without downloading everything.
 
 For best performance, host `.ctopo` files behind a CDN that supports **multi-range requests** (multiple byte ranges in one `Range` header, returned as `multipart/byteranges`). The client coalesces the disjoint arc and offset reads a single merge needs into one request when the server supports it, which can collapse a dozen sequential round trips into one. CloudFront supports this; bare S3/GCS/R2 do not (each disjoint chunk becomes its own request). The client falls back transparently â€” multi-range is a performance optimization, not a requirement.
