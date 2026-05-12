@@ -145,6 +145,30 @@ export interface ContainerMeta {
     // Target uncompressed bytes per block (last block may be smaller).
     readonly targetBlockSize: number;
   };
+  // Present iff arc_offsets is shipped in partitioned form: one
+  // independently-decodable zstd frame per arc-coord block, sharing
+  // a trained dict. Absent for the legacy monolithic arc_offsets
+  // section (small files, or files produced by older encoders); the
+  // reader dispatches on this field's presence. Block ordering and
+  // count match arcCoordsBlocks exactly — partition i of arc_offsets
+  // covers exactly the arcs that block i of arc_coords does.
+  readonly arcOffsetsBlocks?: {
+    // Trained dict section name. Optional like arcCoordsBlocks.dictSection.
+    readonly dictSection?: string;
+    // u32 triples [firstArcId, compressedOffset, compressedLength] per
+    // partition. firstArcId is the smallest arc id whose offsets live
+    // in this partition; the partition covers arc ids
+    // [firstArcId_i, firstArcId_{i+1}). compressedOffset is relative
+    // to the start of partitionsSection. Lets block selection bypass
+    // the global arc_offsets table — given an arcId, binary-search
+    // firstArcId to find blockIdx without first decompressing any
+    // arc_offsets bytes.
+    readonly blockTableSection: string;
+    // Section name carrying the concatenation of per-block compressed
+    // arc-offsets frames.
+    readonly partitionsSection: string;
+    readonly blockCount: number;
+  };
   readonly layers: ReadonlyArray<{
     readonly name: string;
     readonly numGeometries: number;

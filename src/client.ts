@@ -268,9 +268,14 @@ const DEFAULT_COALESCE_GAP = 64 * 1024;
 // the median-of-3 sweep showed shrinking to 8 KiB cuts 13-34% of merge
 // wall-clock without regressing on mobile (100ms RTT).
 const DEFAULT_ARCS_COALESCE_GAP = 8 * 1024;
-// Offsets default — same width. Bridge bytes here are 4B per arc id,
-// so even a generous gap pulls only kilobytes of unrelated entries
-const DEFAULT_OFFSETS_COALESCE_GAP = 1 * 1024 * 1024;
+// Offsets default. Used by per-partition fetches in the
+// partitioned-arc_offsets path. Partitions are 100s of bytes each, so
+// a generous gap bridges huge numbers of unfetched partitions and
+// erases the savings; the simulation in
+// bench-out/national/*.offsets-partition-sim.csv showed 4 KiB as the
+// sweet spot for hierarchical-hilbert on national CDs (~4.86 MiB
+// fetched / 11 reqs vs ~13.6 MiB fetched at 64 KiB).
+const DEFAULT_OFFSETS_COALESCE_GAP = 4 * 1024;
 const DEFAULT_GAP_BY_FAMILY: Readonly<Record<string, number>> = {
   arcs: DEFAULT_ARCS_COALESCE_GAP,
   offsets: DEFAULT_OFFSETS_COALESCE_GAP,
@@ -324,6 +329,11 @@ export class CtopoClient {
   // Section base for arc_coords — added to per-arc offsets to produce
   // absolute file byte intervals for fetchArcs.
   private readonly arcCoordsBase: number;
+  // Section base for arc_offsets_partitions — only meaningful when
+  // meta.arcOffsetsBlocks is present (the partitioned path). Added
+  // to per-partition `compressedOffset` from the offsets-blocks table
+  // to produce absolute file byte intervals.
+  private readonly arcOffsetsPartitionsBase: number = 0;
   // arc_offsets is fetched whole on first access and decompressed
   // once. The resulting Uint32Array is cached for the client's
   // lifetime — fetchArcs needs random access into it for every
@@ -373,6 +383,21 @@ export class CtopoClient {
   // touches many arcs in a small set of blocks; caching the
   // decompressed block amortizes the per-block decompress over
   // every arc that lives in it.
+  // Partitioned-arc_offsets state — populated lazily on first arc
+  // fetch when meta.arcOffsetsBlocks is present. Mirror of the
+  // arc_coords block-compression machinery above. The block table
+  // here stores [firstArcId, compOff, compLen] triples per partition
+  // (compOff is relative to arc_offsets_partitions, not arc_coords).
+  private arcOffsetsBlocksPromise: Promise<Uint32Array> | undefined;
+  private arcOffsetsDictPromise: Promise<Uint8Array | undefined> | undefined;
+  // Per-partition decompressed local-offset arrays. Same caching
+  // discipline as decompressedArcCoordBlockCache. fetchArcs typically
+  // touches several arcs in the same partition, so the per-partition
+  // decompress amortizes well.
+  private readonly decompressedArcOffsetsBlockCache = new Map<
+    number,
+    Promise<Uint32Array>
+  >();
   private readonly decompressedArcCoordBlockCache = new Map<
     number,
     Promise<Uint8Array>
@@ -459,7 +484,20 @@ export class CtopoClient {
     }
     this.arcCoordsBase = arcCoords.offset;
 
-    if (this.sectionByName.get("arc_offsets") === undefined) {
+    // arc_offsets is required in the monolithic format; the
+    // partitioned format relies on arc_offsets_partitions + _blocks
+    // instead, signaled by meta.arcOffsetsBlocks.
+    if (this.meta.arcOffsetsBlocks !== undefined) {
+      const partitions = this.sectionByName.get(
+        this.meta.arcOffsetsBlocks.partitionsSection,
+      );
+      if (partitions === undefined) {
+        throw new Error(
+          `ctopo: container is missing the "${this.meta.arcOffsetsBlocks.partitionsSection}" section referenced by arcOffsetsBlocks META`,
+        );
+      }
+      this.arcOffsetsPartitionsBase = partitions.offset;
+    } else if (this.sectionByName.get("arc_offsets") === undefined) {
       throw new Error("ctopo: container is missing the arc_offsets section");
     }
   }
@@ -598,7 +636,16 @@ export class CtopoClient {
     // dependent call, mirroring the previous prefetchPrefix
     // semantics.
     if (arcOffsetsPrefetch) {
-      void client.getArcOffsets().catch(() => {});
+      if (parsed.meta.arcOffsetsBlocks !== undefined) {
+        // Partitioned path: the block table + dict are the
+        // structural-critical pair (parallel to arc_coord_blocks /
+        // arc_coords_dict). The per-partition payload itself stays
+        // on-demand.
+        void client.getArcOffsetsBlocks().catch(() => {});
+        void client.getArcOffsetsDict().catch(() => {});
+      } else {
+        void client.getArcOffsets().catch(() => {});
+      }
     }
     void client.getArcCoordBlocks().catch(() => {});
     void client.getArcCoordDict().catch(() => {});
@@ -735,6 +782,9 @@ export class CtopoClient {
   ): Promise<Map<number, Uint8Array>> {
     this.ensureOpen();
     throwIfAborted(signal);
+    if (this.meta.arcOffsetsBlocks !== undefined) {
+      return this.fetchArcsPartitioned(arcIds);
+    }
     const arcOffsets = await this.getArcOffsets();
     return this.fetchArcsFromBlocks(arcIds, arcOffsets);
   }
@@ -889,8 +939,38 @@ export class CtopoClient {
   // Public alias for offline analyzers that need raw arc byte
   // offsets to compute packing-quality metrics (gap stats, span,
   // etc.). Bench-only — production code paths use fetchArcs.
+  //
+  // On monolithic files this is the same Promise getArcOffsets()
+  // returns. On partitioned files it lazy-stitches every partition
+  // into a single global Uint32Array — slow (decompresses ALL
+  // partitions), but the API stays the same for analyzers.
   arcOffsets(): Promise<Uint32Array> {
-    return this.getArcOffsets();
+    if (this.meta.arcOffsetsBlocks === undefined) {
+      return this.getArcOffsets();
+    }
+    return this.assembleGlobalArcOffsetsFromPartitions();
+  }
+
+  private async assembleGlobalArcOffsetsFromPartitions(): Promise<Uint32Array> {
+    const offsetsBlocks = await this.getArcOffsetsBlocks();
+    const arcBlocks = await this.getArcCoordBlocks();
+    const dictPromise = this.getArcOffsetsDict();
+    const numArcs = this.meta.numArcs;
+    const result = new Uint32Array(numArcs + 1);
+    const blockCount = offsetsBlocks.length / 3;
+    for (let i = 0; i < blockCount; i++) {
+      const firstArcId = offsetsBlocks[i * 3];
+      const blockStart = i === 0 ? 0 : arcBlocks[(i - 1) * 3];
+      const localOffsets = await this.getDecompressedArcOffsetsBlock(
+        i,
+        offsetsBlocks,
+        dictPromise,
+      );
+      for (let k = 0; k < localOffsets.length; k++) {
+        result[firstArcId + k] = blockStart + localOffsets[k];
+      }
+    }
+    return result;
   }
 
   // --- Private: arc offsets + block-compressed arc_coords ---
@@ -980,6 +1060,74 @@ export class CtopoClient {
     return out;
   }
 
+  // Partitioned-arc_offsets variant. Same shape as fetchArcsFromBlocks,
+  // but block selection bypasses the monolithic arc_offsets table —
+  // the arc_offsets_blocks partition table (one entry per arc-coord
+  // block, keyed by firstArcId) tells us which partition contains the
+  // arc id, and per-partition arc_offsets + per-block arc_coords fetch
+  // in parallel. Local offsets inside the partition slot directly into
+  // the decompressed arc_coords block.
+  private async fetchArcsPartitioned(
+    arcIds: Iterable<number>,
+  ): Promise<Map<number, Uint8Array>> {
+    const arcBlocks = await this.getArcCoordBlocks();
+    const offsetsBlocks = await this.getArcOffsetsBlocks();
+    const dictPromise = this.getArcOffsetsDict();
+    const out = new Map<number, Uint8Array>();
+    const arcsByBlock = new Map<number, number[]>();
+
+    for (const arcId of arcIds) {
+      if (out.has(arcId)) continue;
+      const blockIdx = CtopoClient.findArcOffsetsBlock(offsetsBlocks, arcId);
+      const list = arcsByBlock.get(blockIdx);
+      if (list === undefined) arcsByBlock.set(blockIdx, [arcId]);
+      else list.push(arcId);
+      out.set(arcId, EMPTY_BYTES);
+    }
+
+    // Per touched block: partition fetch + arc_coords block fetch
+    // fire in parallel — both only depend on blockIdx (not on each
+    // other), so the per-block work is one critical-path RTT.
+    let uniqueCount = 0;
+    let arcCoordsUseful = 0;
+    let arcOffsetsUseful = 0;
+    await Promise.all(
+      Array.from(arcsByBlock.entries()).map(async ([blockIdx, arcsInBlock]) => {
+        const [localOffsets, blockBytes] = await Promise.all([
+          this.getDecompressedArcOffsetsBlock(
+            blockIdx,
+            offsetsBlocks,
+            dictPromise,
+          ),
+          this.getDecompressedArcCoordBlock(blockIdx, arcBlocks),
+        ]);
+        const firstArcId = offsetsBlocks[blockIdx * 3];
+        for (const arcId of arcsInBlock) {
+          const localIdx = arcId - firstArcId;
+          const arcStart = localOffsets[localIdx];
+          const arcEnd = localOffsets[localIdx + 1];
+          const slice = blockBytes.subarray(arcStart, arcEnd);
+          out.set(arcId, slice);
+          arcCoordsUseful += slice.byteLength;
+          // 2 u32 reads per arc lookup: localOffsets[localIdx] and
+          // localOffsets[localIdx + 1]. Mirrors the monolithic
+          // tally's 8 bytes per arc.
+          arcOffsetsUseful += 8;
+          uniqueCount++;
+        }
+      }),
+    );
+    this.tallyUseful("arc_offsets_partitions", arcOffsetsUseful);
+    this.tallyUseful("arc_offsets_blocks", 12 * arcsByBlock.size);
+    this.tallyUseful("arc_coords", arcCoordsUseful);
+    if (uniqueCount > 0) {
+      perfLog(
+        `[ctopo] fetchArcs (partitioned): ${uniqueCount} arcs across ${arcsByBlock.size} partitions`,
+      );
+    }
+    return out;
+  }
+
   // Returns the shared dict bytes when this file has one, or
   // undefined when there's no shared dict (too few blocks to train
   // one). Caller passes the (possibly-undefined) result to the
@@ -1051,19 +1199,15 @@ export class CtopoClient {
       compression: "zstd",
     };
     const promise = (async () => {
-      // Fetch compressed bytes + dict + decoder in parallel.
-      // Dict + decoder are typically already in flight from open
-      // time, so this Promise.all only waits on the per-block GET
-      // in steady state.
+      // Fetch compressed bytes + dict + decoder in parallel. Dict and
+      // wasm decoder are typically already in flight from open time,
+      // so this Promise.all only waits on the per-block GET in steady
+      // state.
       const [compressed, dict, decode] = await Promise.all([
         this.enqueueSectionFetch("arcs", physicalStart, physicalEnd),
         this.getArcCoordDict(),
         loadZstdWasmDecode(entry),
       ]);
-      // dict-aware path. The shared dict was passed once to
-      // CtopoDecompressor at construction and digested into a DDict
-      // (see src/zstd-wasm/), so per-block decode skips both the
-      // dict-bytes copy and dict-table rebuild.
       const t0 = performance.now();
       const out = decode(compressed, uncSize, dict);
       this.statDecompressMs += performance.now() - t0;
@@ -1072,6 +1216,147 @@ export class CtopoClient {
     })();
     this.decompressedArcCoordBlockCache.set(blockIdx, promise);
     return promise;
+  }
+
+  // --- Private: partitioned arc_offsets ---
+
+  // Fetch + view the [firstArcId, compOff, compLen] triples for the
+  // partitioned arc_offsets layout. Memoized for the client's lifetime.
+  private getArcOffsetsBlocks(): Promise<Uint32Array> {
+    if (this.arcOffsetsBlocksPromise === undefined) {
+      const meta = this.meta.arcOffsetsBlocks;
+      if (meta === undefined) {
+        throw new Error(
+          "ctopo: getArcOffsetsBlocks called on a monolithic-format file",
+        );
+      }
+      const entry = this.sectionByName.get(meta.blockTableSection);
+      if (entry === undefined) {
+        throw new Error(
+          `ctopo: container is missing the "${meta.blockTableSection}" section`,
+        );
+      }
+      this.arcOffsetsBlocksPromise = this.fetchSectionBytes(entry).then(
+        (bytes) =>
+          new Uint32Array(bytes.buffer, bytes.byteOffset, bytes.byteLength / 4),
+      );
+    }
+    return this.arcOffsetsBlocksPromise;
+  }
+
+  // Resolves to undefined when the file has no shared arc_offsets
+  // dict (encoder skipped training; reader uses the no-dict zstd
+  // decode path). Tally the full dict size once at first resolve —
+  // it's read in full by every partition decompress.
+  private getArcOffsetsDict(): Promise<Uint8Array | undefined> {
+    if (this.arcOffsetsDictPromise === undefined) {
+      const meta = this.meta.arcOffsetsBlocks;
+      if (meta === undefined) {
+        throw new Error(
+          "ctopo: getArcOffsetsDict called on a monolithic-format file",
+        );
+      }
+      if (meta.dictSection === undefined) {
+        this.arcOffsetsDictPromise = Promise.resolve(undefined);
+        return this.arcOffsetsDictPromise;
+      }
+      const entry = this.sectionByName.get(meta.dictSection);
+      if (entry === undefined) {
+        throw new Error(
+          `ctopo: container is missing the "${meta.dictSection}" section`,
+        );
+      }
+      this.arcOffsetsDictPromise = this.fetchSectionBytes(entry).then(
+        (bytes) => {
+          this.tallyUseful(entry.name, bytes.byteLength);
+          return bytes;
+        },
+      );
+    }
+    return this.arcOffsetsDictPromise;
+  }
+
+  // Fetch + decompress one partition of arc_offsets into a
+  // delta-decoded Uint32Array of *local* offsets (length = N+1 where
+  // N = arcs in this block; entries[0]=0, entries[N]=block uncompressed
+  // size). Caller adds the block's uncompressed-start to recover
+  // global byte offsets when needed. Mirrors
+  // getDecompressedArcCoordBlock but routes per-partition fetches
+  // through the "offsets" coalescer family.
+  private getDecompressedArcOffsetsBlock(
+    blockIdx: number,
+    offsetsBlocks: Uint32Array,
+    dictPromise: Promise<Uint8Array | undefined>,
+  ): Promise<Uint32Array> {
+    const cached = this.decompressedArcOffsetsBlockCache.get(blockIdx);
+    if (cached !== undefined) return cached;
+    const firstArcId = offsetsBlocks[blockIdx * 3];
+    const nextFirstArcId =
+      blockIdx === offsetsBlocks.length / 3 - 1
+        ? this.meta.numArcs
+        : offsetsBlocks[(blockIdx + 1) * 3];
+    const compOffset = offsetsBlocks[blockIdx * 3 + 1];
+    const compLength = offsetsBlocks[blockIdx * 3 + 2];
+    const physicalStart = this.arcOffsetsPartitionsBase + compOffset;
+    const physicalEnd = physicalStart + compLength;
+    const entries = nextFirstArcId - firstArcId + 1;
+    const uncSize = entries * 4;
+    const entry: SectionEntry = {
+      name: `arc_offsets[partition ${blockIdx}]`,
+      dtype: "u32",
+      offset: physicalStart,
+      length: compLength,
+      compression: "zstd",
+    };
+    const promise = (async () => {
+      const [compressed, dict, decode] = await Promise.all([
+        this.enqueueSectionFetch("offsets", physicalStart, physicalEnd),
+        dictPromise,
+        loadZstdWasmDecode(entry),
+      ]);
+      const t0 = performance.now();
+      const out = decode(compressed, uncSize, dict);
+      this.statDecompressMs += performance.now() - t0;
+      this.statDecompressBytes += out.byteLength;
+      // Undo first-order delta encoding in place — running prefix sum
+      // with u32 wraparound, same as the monolithic arc_offsets path
+      // does via viewU32WithDelta. We do it inline here so we can
+      // hand back a fresh Uint32Array view without a second copy.
+      const view = new Uint32Array(
+        out.buffer,
+        out.byteOffset,
+        out.byteLength / 4,
+      );
+      const decoded = new Uint32Array(view.length);
+      if (view.length > 0) {
+        decoded[0] = view[0];
+        for (let i = 1; i < view.length; i++) {
+          decoded[i] = (decoded[i - 1] + view[i]) >>> 0;
+        }
+      }
+      return decoded;
+    })();
+    this.decompressedArcOffsetsBlockCache.set(blockIdx, promise);
+    return promise;
+  }
+
+  // Binary search the offsets-blocks table (3 u32 per row; firstArcId
+  // is the first u32 of each row) for the partition that contains
+  // arcId. Sibling to findArcCoordBlock at the bottom of this file.
+  private static findArcOffsetsBlock(
+    offsetsBlocks: Uint32Array,
+    arcId: number,
+  ): number {
+    const blockCount = offsetsBlocks.length / 3;
+    // Want the largest i such that offsetsBlocks[i*3] <= arcId.
+    let lo = 0;
+    let hi = blockCount - 1;
+    while (lo < hi) {
+      const mid = (lo + hi + 1) >>> 1;
+      if (offsetsBlocks[mid * 3] <= arcId) lo = mid;
+      else hi = mid - 1;
+    }
+    return lo;
   }
 
   // --- Private: prefetch helpers ---

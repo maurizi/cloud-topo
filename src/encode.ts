@@ -75,8 +75,11 @@ import {
   collectPropertySections,
 } from "./encode-properties";
 import {
-  blockCompressArcCoords,
+  ARC_OFFSETS_PARTITION_MIN_BYTES,
   autoArcCoordDictBytes,
+  autoArcOffsetsDictBytes,
+  blockCompressArcCoords,
+  blockCompressArcOffsets,
   DEFAULT_ARC_COORD_BLOCK_BYTES,
 } from "./encode-compress";
 import { runWithConcurrency, stderrLog, memSnapshot } from "./util";
@@ -308,27 +311,14 @@ export async function encodeContainer(
     elapsedMs: performance.now() - tBuildArcs,
   });
 
-  // arc_offsets is cumulative-monotone — first-order deltas are tiny
-  // (each entry is the previous arc's coord byte length, which fits
-  // comfortably in a few bits per arc). Compressors gain ~10-30% on
-  // the deltas vs the absolute layout, where neighboring u32 values
-  // share most high-order bits and look like noise to LZ.
-  // arc_offsets is structurally front-loaded — every fetchArcs call
-  // needs random access into it, so the open path warms it eagerly.
-  sections.push({
-    name: "arc_offsets",
-    dtype: "u32",
-    bytes: deltaEncodeU32(arcOffsetsBytes),
-    delta: true,
-    frontLoad: true,
-  });
-
   // Block-compressed arc_coords: arc_coords ships as a sequence of
   // independently-decodable zstd frames sharing a raw-content dict.
   // The dict + block table are tiny and required before any per-block
   // decompress; mark both front-loaded. META.arcCoordsBlocks tells
   // the reader how to map logical arc byte ranges (arc_offsets) to
-  // physical block ranges.
+  // physical block ranges. The returned `blockSpecs` doubles as the
+  // partition boundary for arc_offsets (below) when we choose the
+  // partitioned path.
   const tBlockCompress = performance.now();
   const block = await blockCompressArcCoords(arcCoordsBytes, arcOffsetsBytes, {
     targetBlockSize: opts.arcCoordBlockBytes ?? DEFAULT_ARC_COORD_BLOCK_BYTES,
@@ -359,6 +349,61 @@ export async function encodeContainer(
     blockCount: block.blockCount,
     targetBlockSize: block.targetBlockSize,
   };
+
+  // arc_offsets: partitioned along arc_coords block boundaries when
+  // big enough to justify the per-partition overhead; else monolithic.
+  // Both paths are cumulative-monotone u32 with delta encoding (deltas
+  // are tiny — each is the previous arc's coord byte length).
+  // Partition-path metadata is stored in META.arcOffsetsBlocks; the
+  // reader dispatches dynamically. See ARC_OFFSETS_PARTITION_MIN_BYTES.
+  let arcOffsetsBlocksMeta: ContainerMeta["arcOffsetsBlocks"] = undefined;
+  if (arcOffsetsBytes.byteLength >= ARC_OFFSETS_PARTITION_MIN_BYTES) {
+    const tBlockCompressOffsets = performance.now();
+    const offsetsBlock = await blockCompressArcOffsets(
+      arcOffsetsBytes,
+      block.blockSpecs,
+      { dictBytes: autoArcOffsetsDictBytes(arcOffsetsBytes.byteLength) },
+    );
+    opts.onPhaseTiming?.({
+      stage: "block-compress-offsets",
+      elapsedMs: performance.now() - tBlockCompressOffsets,
+    });
+    if (offsetsBlock.dictBytes !== undefined) {
+      sections.push({
+        name: "arc_offsets_dict",
+        dtype: "blob",
+        bytes: offsetsBlock.dictBytes,
+        frontLoad: true,
+      });
+    }
+    sections.push({
+      name: "arc_offsets_blocks",
+      dtype: "u32",
+      bytes: offsetsBlock.blockTableBytes,
+      frontLoad: true,
+    });
+    sections.push({
+      name: "arc_offsets_partitions",
+      dtype: "blob",
+      bytes: offsetsBlock.compressedBytes,
+      frontLoad: false,
+    });
+    arcOffsetsBlocksMeta = {
+      dictSection:
+        offsetsBlock.dictBytes !== undefined ? "arc_offsets_dict" : undefined,
+      blockTableSection: "arc_offsets_blocks",
+      partitionsSection: "arc_offsets_partitions",
+      blockCount: offsetsBlock.blockCount,
+    };
+  } else {
+    sections.push({
+      name: "arc_offsets",
+      dtype: "u32",
+      bytes: deltaEncodeU32(arcOffsetsBytes),
+      delta: true,
+      frontLoad: true,
+    });
+  }
 
   // arc_coords lives in the front-loaded region too. Tier ordering
   // (top-layer perimeter → top-layer interior → lower layers) puts
@@ -465,6 +510,8 @@ export async function encodeContainer(
     layers: layerSummaries,
     metadata: undefined,
     arcCoordsBlocks: arcCoordsBlocksMeta,
+    arcOffsetsBlocks: arcOffsetsBlocksMeta,
+    numArcs,
     compression: opts.compression ?? "zstd",
     onProgress: opts.onProgress,
     onSectionEncoded: opts.onSectionEncoded,
@@ -606,6 +653,11 @@ export async function rewriteContainer(
     // Preserve block-compressed arc_coords metadata so the client
     // knows to use the block decoder after a rewrite.
     arcCoordsBlocks: meta.arcCoordsBlocks,
+    // Preserve the partitioned-arc_offsets metadata too. When the
+    // source file used the monolithic path this is undefined and the
+    // rewrite stays monolithic.
+    arcOffsetsBlocks: meta.arcOffsetsBlocks,
+    numArcs: meta.numArcs,
     // Replaced sections re-compress with this default. Pass-through
     // sections preserve their existing codec (their bytes are already
     // compressed; assembleContainer just forwards them).
@@ -640,6 +692,15 @@ function shouldCompressSection(name: string, _dtype: DType): boolean {
   // block can decompress (chicken-and-egg if it were compressed
   // against another dict).
   if (name === "arc_coords_dict") return false;
+  // Partitioned arc_offsets — same shape as arc_coords block
+  // compression. The _partitions section holds a concatenation of
+  // per-partition zstd frames; re-compressing it as one big stream
+  // would double-encode and break per-partition selective fetches.
+  // The _blocks table and _dict mirror arc_coord_blocks /
+  // arc_coords_dict: small, fetched eagerly, not worth recompressing.
+  if (name === "arc_offsets_partitions") return false;
+  if (name === "arc_offsets_blocks") return false;
+  if (name === "arc_offsets_dict") return false;
   // Everything else (CSR triples, arc_offsets, properties, strings)
   // compresses freely.
   return true;
@@ -733,6 +794,12 @@ interface AssembleInput {
   readonly layers: ReadonlyArray<{ name: string; numGeometries: number }>;
   readonly metadata: string | undefined;
   readonly arcCoordsBlocks: ContainerMeta["arcCoordsBlocks"];
+  readonly arcOffsetsBlocks: ContainerMeta["arcOffsetsBlocks"];
+  // Total number of arcs in the topology. With the monolithic
+  // arc_offsets path the assembler derived this from the section's
+  // byte length; with the partitioned path the section is absent, so
+  // callers pass numArcs explicitly. Both paths set it.
+  readonly numArcs: number;
   readonly compression: Compression;
   // When true, use `sections` in the order given (no front-load
   // re-sort) and use each section's groupBreak flag for compression-
@@ -775,6 +842,8 @@ async function assembleContainer(input: AssembleInput): Promise<Buffer> {
     layers,
     metadata,
     arcCoordsBlocks,
+    arcOffsetsBlocks,
+    numArcs,
     compression: codec,
     preserveSourceOrder,
     onProgress,
@@ -784,14 +853,18 @@ async function assembleContainer(input: AssembleInput): Promise<Buffer> {
   const emit = onProgress ?? noopProgress;
   const tAssemble = performance.now();
 
-  // arc_offsets (numArcs is derived from its uncompressed size) must
-  // be locatable up front. Sections that already declare a codec
-  // pass through unchanged (rewriteContainer's pass-through path).
-  const arcOffsetsRaw = declaredSections.find((s) => s.name === "arc_offsets");
-  if (arcOffsetsRaw === undefined) {
-    throw new Error("ctopo: encoder requires an arc_offsets section");
+  // In the monolithic path arc_offsets must be present; in the
+  // partitioned path it's absent and we rely on the
+  // arc_offsets_partitions / _blocks / _dict triplet referenced by
+  // META.arcOffsetsBlocks. numArcs comes from the caller either way.
+  if (
+    arcOffsetsBlocks === undefined &&
+    declaredSections.find((s) => s.name === "arc_offsets") === undefined
+  ) {
+    throw new Error(
+      "ctopo: encoder requires either an arc_offsets section or arcOffsetsBlocks META",
+    );
   }
-  const numArcs = arcOffsetsRaw.bytes.byteLength / 4 - 1;
 
   // Reorder: front-loaded sections first (in their declared relative
   // order), then everything else. Section table META keeps pointers
@@ -1139,6 +1212,7 @@ async function assembleContainer(input: AssembleInput): Promise<Buffer> {
     bbox,
     metadata,
     arcCoordsBlocks,
+    ...(arcOffsetsBlocks !== undefined ? { arcOffsetsBlocks } : {}),
     layers,
     sections: rawSections.map((s, i) => {
       const p = sectionPlacement[i];

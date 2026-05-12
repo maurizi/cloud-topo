@@ -435,6 +435,247 @@ describe("CtopoClient", () => {
     }
   });
 
+  // -- Partitioned-arc_offsets coverage --
+  //
+  // Threshold is 750 KB raw arc_offsets → roughly 192K arcs. We
+  // synthesize a 200K-arc grid topology so the encoder takes the
+  // partitioned branch without leaking any test-only knobs into the
+  // production API.
+
+  // Build a synthetic N-arc topology — one polygon per arc to keep
+  // the geometry tiny and the encoder fast. Each arc is a unique
+  // 2-point line so the encoder's per-arc bytes are deterministic
+  // and tests can assert exact byteLengths.
+  function syntheticTopology(numArcs: number): Topology {
+    const arcs: number[][][] = new Array(numArcs);
+    const geometries: { type: "Polygon"; arcs: number[][]; properties: { id: string } }[] =
+      new Array(numArcs);
+    for (let i = 0; i < numArcs; i++) {
+      const x = i;
+      const y = i;
+      arcs[i] = [
+        [x, y],
+        [x + 1, y + 1],
+      ];
+      geometries[i] = {
+        type: "Polygon",
+        arcs: [[i]],
+        properties: { id: `a${i}` },
+      };
+    }
+    return {
+      type: "Topology",
+      arcs,
+      bbox: [0, 0, numArcs + 1, numArcs + 1],
+      objects: {
+        block: {
+          type: "GeometryCollection",
+          geometries,
+        },
+      },
+    };
+  }
+
+  // Track a built synthetic fixture across the partitioned tests so
+  // we only pay the encode cost once. vitest's `beforeAll` would
+  // share across the whole describe; this manual memoization is
+  // tightly scoped to the partitioned suite. The encode trains shared
+  // zstd dicts (7 candidates × `zstd --train` ≈ tens of seconds), so
+  // amortizing across the 5 partitioned tests matters.
+  const N_PARTITIONED_ARCS = 200_000;
+  // Default block size (8 KiB) at 32 B/arc = ~256 arcs/block →
+  // ~780 blocks for 200K arcs. Above the 100-block dict-training
+  // threshold (so the round-trip / sparse tests exercise the with-dict
+  // path), but only ~3× over so dict-training isn't the dominant
+  // cost.
+  let cachedPartitionedBuf: Uint8Array | undefined;
+  async function partitionedFixtureBuf(): Promise<Uint8Array> {
+    if (cachedPartitionedBuf === undefined) {
+      cachedPartitionedBuf = await encodeContainer(
+        syntheticTopology(N_PARTITIONED_ARCS),
+      );
+    }
+    return cachedPartitionedBuf;
+  }
+
+  // Encoding 200K arcs + training shared dicts blows the default 5 s
+  // vitest timeout. 5 minutes is plenty even on slow machines and
+  // still bounded so a real hang fails fast.
+  const PARTITIONED_TIMEOUT_MS = 5 * 60_000;
+
+  it(
+    "partitioned arc_offsets: 200K-arc topology triggers the partitioned path",
+    async () => {
+      const buf = await partitionedFixtureBuf();
+      const client = await CtopoClient.openWith(fetcherFor(buf).fetcher, {
+        arcCoordsPrefetchBytes: 0,
+        arcOffsetsPrefetch: false,
+      });
+      expect(client.meta.arcOffsetsBlocks).toBeDefined();
+      expect(client.meta.arcOffsetsBlocks?.blockTableSection).toBe(
+        "arc_offsets_blocks",
+      );
+      expect(client.meta.arcOffsetsBlocks?.partitionsSection).toBe(
+        "arc_offsets_partitions",
+      );
+      expect(client.meta.arcOffsetsBlocks?.blockCount).toBe(
+        client.meta.arcCoordsBlocks.blockCount,
+      );
+
+      const sections = new Set(client.sections.map((s) => s.name));
+      expect(sections.has("arc_offsets")).toBe(false);
+      expect(sections.has("arc_offsets_blocks")).toBe(true);
+      expect(sections.has("arc_offsets_partitions")).toBe(true);
+    },
+    PARTITIONED_TIMEOUT_MS,
+  );
+
+  it(
+    "partitioned arc_offsets: fetchArcs returns expected bytes against the arcOffsets() reference",
+    async () => {
+      const buf = await partitionedFixtureBuf();
+      const client = await CtopoClient.openWith(fetcherFor(buf).fetcher, {
+        arcCoordsPrefetchBytes: 0,
+        arcOffsetsPrefetch: false,
+      });
+
+      // Sample arcs scattered across the section so different
+      // partitions get exercised. Each arc's byte length must match
+      // arcOffsets[id+1] - arcOffsets[id] — that's the contract
+      // whether the path is partitioned or monolithic.
+      const offsets = await client.arcOffsets();
+      const sampleIds = [0, 1, 100, 1_000, 50_000, 100_000, 199_999];
+      const arcs = await client.fetchArcs(sampleIds);
+      for (const id of sampleIds) {
+        const expectedLen = offsets[id + 1] - offsets[id];
+        const got = arcs.get(id);
+        expect(got).toBeDefined();
+        expect(got!.byteLength).toBe(expectedLen);
+      }
+    },
+    PARTITIONED_TIMEOUT_MS,
+  );
+
+  it("partitioned arc_offsets: small fixture stays on the monolithic path", async () => {
+    // Default threshold (750 KB) — 4-arc fixture is ~20 B of
+    // arc_offsets, well below. Guards backward compatibility: small
+    // files keep using the legacy reader code path.
+    const buf = await encodeContainer(fixtureTopology());
+    const client = await CtopoClient.openWith(fetcherFor(buf).fetcher, {
+      arcCoordsPrefetchBytes: 0,
+      arcOffsetsPrefetch: false,
+    });
+    expect(client.meta.arcOffsetsBlocks).toBeUndefined();
+    const arcs = await client.fetchArcs([0, 1, 2, 3]);
+    expect(arcs.size).toBe(4);
+    for (const id of [0, 1, 2, 3]) {
+      expect(arcs.get(id)!.byteLength).toBeGreaterThan(0);
+    }
+  });
+
+  it(
+    "partitioned arc_offsets: sparse fetch decompresses only the touched partitions",
+    async () => {
+      const buf = await partitionedFixtureBuf();
+      const client = await CtopoClient.openWith(fetcherFor(buf).fetcher, {
+        arcCoordsPrefetchBytes: 0,
+        arcOffsetsPrefetch: false,
+      });
+      expect(client.meta.arcOffsetsBlocks).toBeDefined();
+
+      // Fetch arcs that land in two adjacent ids → same or adjacent
+      // partition. Then fetch one ~halfway and one near the end.
+      // Verify the per-partition decompress cache only holds entries
+      // for the touched partitions, not the whole table.
+      client.resetStats();
+      const arcs = await client.fetchArcs([1, 2, 100_000, 199_999]);
+      expect(arcs.size).toBe(4);
+      const partCache = (
+        client as unknown as {
+          decompressedArcOffsetsBlockCache: Map<number, Promise<Uint32Array>>;
+        }
+      ).decompressedArcOffsetsBlockCache;
+      // At most one partition per distinct touched arc-id-cluster;
+      // far less than the total blockCount.
+      expect(partCache.size).toBeLessThan(
+        client.meta.arcOffsetsBlocks!.blockCount,
+      );
+      expect(partCache.size).toBeGreaterThan(0);
+
+      const stats = client.getStats();
+      // 12 B per touched block-table entry; matches the per-partition
+      // decompress cache size.
+      expect(stats.usefulBytesBySection["arc_offsets_blocks"]).toBe(
+        12 * partCache.size,
+      );
+      // 8 B per arc lookup (start + end u32). 4 arcs touched.
+      expect(stats.usefulBytesBySection["arc_offsets_partitions"]).toBe(8 * 4);
+    },
+    PARTITIONED_TIMEOUT_MS,
+  );
+
+  it(
+    "partitioned arc_offsets: no-dict path works when block count is below the training threshold",
+    async () => {
+      // Need partitioned path (arc_offsets >= 750 KB) AND fewer than
+      // 100 arc-coord blocks (so the shared-dict trainer skips dict
+      // training, per encode-compress.ts MIN_SAMPLES = 100). 200K
+      // arcs at ~32 B/arc = ~6.4 MB uncompressed; with
+      // arcCoordBlockBytes = 256 KiB we get ~25 blocks — under the
+      // threshold.
+      const buf = await encodeContainer(
+        syntheticTopology(N_PARTITIONED_ARCS),
+        { arcCoordBlockBytes: 256 * 1024 },
+      );
+      const client = await CtopoClient.openWith(fetcherFor(buf).fetcher, {
+        arcCoordsPrefetchBytes: 0,
+        arcOffsetsPrefetch: false,
+      });
+      expect(client.meta.arcOffsetsBlocks).toBeDefined();
+      expect(client.meta.arcOffsetsBlocks!.blockCount).toBeLessThan(100);
+      expect(client.meta.arcOffsetsBlocks!.dictSection).toBeUndefined();
+      expect(client.meta.arcCoordsBlocks.dictSection).toBeUndefined();
+
+      const offsets = await client.arcOffsets();
+      const sampleIds = [0, 1, 1_000, 100_000, 199_999];
+      const arcs = await client.fetchArcs(sampleIds);
+      for (const id of sampleIds) {
+        expect(arcs.get(id)!.byteLength).toBe(offsets[id + 1] - offsets[id]);
+      }
+    },
+    PARTITIONED_TIMEOUT_MS,
+  );
+
+  it(
+    "partitioned arc_offsets: arcOffsets() slow-path is consistent with fetchArcs",
+    async () => {
+      const buf = await partitionedFixtureBuf();
+      const client = await CtopoClient.openWith(fetcherFor(buf).fetcher, {
+        arcCoordsPrefetchBytes: 0,
+        arcOffsetsPrefetch: false,
+      });
+
+      // The assembled global table must:
+      //   - have length = numArcs + 1
+      //   - be monotonically non-decreasing
+      //   - last offset == total uncompressed arc_coords bytes
+      const offsets = await client.arcOffsets();
+      expect(offsets.length).toBe(N_PARTITIONED_ARCS + 1);
+      expect(offsets[0]).toBe(0);
+      let prev = 0;
+      for (let i = 1; i < offsets.length; i++) {
+        expect(offsets[i]).toBeGreaterThanOrEqual(prev);
+        prev = offsets[i];
+      }
+      const lastBlock = client.meta.arcCoordsBlocks.blockCount - 1;
+      const blocks = await (
+        client as unknown as { getArcCoordBlocks(): Promise<Uint32Array> }
+      ).getArcCoordBlocks();
+      expect(offsets[offsets.length - 1]).toBe(blocks[lastBlock * 3]);
+    },
+    PARTITIONED_TIMEOUT_MS,
+  );
+
   it("block-compressed fetchArcs decompresses each block at most once across all arcs in it", async () => {
     const buf = await encodeContainer(fixtureTopology(), {
       // Fixture has no transform → float64 points, 32 B/arc × 4 arcs

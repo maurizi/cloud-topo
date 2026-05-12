@@ -23,6 +23,16 @@ import { stderrLog, memSnapshot } from "./util";
 
 // --- Types ---
 
+// One block of arc_coords: walks arcs in arc-id order, accumulates
+// arcCoordsBytes[startUncompressed:endUncompressed] until the next
+// arc would overflow targetBlockSize. Exposed on the return so the
+// arc_offsets-partition encoder can align its partitions to the
+// same arc-id ranges.
+export interface ArcCoordBlockSpec {
+  readonly startUncompressed: number;
+  readonly endUncompressed: number;
+}
+
 export interface BlockCompressedArcCoords {
   // Trained zstd shared dict, or undefined for inputs too small to
   // train one (the encoder skips the dictSection in META in that
@@ -38,6 +48,27 @@ export interface BlockCompressedArcCoords {
   readonly compressedBytes: Uint8Array;
   readonly blockCount: number;
   readonly targetBlockSize: number;
+  // The per-block uncompressed ranges (walking arcs in id order),
+  // exposed so a downstream encoder (e.g. blockCompressArcOffsets)
+  // can align its own per-partition payloads to the same arc-id
+  // boundaries.
+  readonly blockSpecs: ReadonlyArray<ArcCoordBlockSpec>;
+}
+
+export interface BlockCompressedArcOffsets {
+  // Trained zstd shared dict, or undefined when block count is below
+  // the dict-training threshold (mirrors BlockCompressedArcCoords).
+  readonly dictBytes: Uint8Array | undefined;
+  // u32 array of triples [firstArcId, compressedOffset, compressedLength]
+  // per partition. firstArcId is the smallest arc id whose offsets
+  // live in this partition; the partition covers arc ids
+  // [firstArcId_i, firstArcId_{i+1}). compressedOffset is relative
+  // to the start of the concatenated partitions blob.
+  readonly blockTableBytes: Uint8Array;
+  // Concatenation of compressed per-partition zstd frames, each
+  // covering one partition's local u32 offsets (delta-encoded).
+  readonly compressedBytes: Uint8Array;
+  readonly blockCount: number;
 }
 
 // --- Constants ---
@@ -168,11 +199,7 @@ export async function blockCompressArcCoords(
   // the next arc would exceed `target` bytes. Each arc lands fully
   // within one block. Tiny edge case: a single arc larger than
   // target — emit it as its own oversized block.
-  interface BlockSpec {
-    readonly startUncompressed: number;
-    readonly endUncompressed: number;
-  }
-  const blockSpecs: BlockSpec[] = [];
+  const blockSpecs: ArcCoordBlockSpec[] = [];
   let cursorArc = 0;
   let blockStart = 0;
   while (cursorArc < numArcs) {
@@ -200,6 +227,16 @@ export async function blockCompressArcCoords(
     });
   }
 
+  // Build the per-block uncompressed payloads — fresh subarrays into
+  // arcCoordsBytes, no copy — and hand them to the shared dict-picker.
+  const blockPayloads: Uint8Array[] = new Array(blockSpecs.length);
+  for (let i = 0; i < blockSpecs.length; i++) {
+    blockPayloads[i] = arcCoordsBytes.subarray(
+      blockSpecs[i].startUncompressed,
+      blockSpecs[i].endUncompressed,
+    );
+  }
+
   // Auto-pick the dict size empirically rather than guess. We
   // train candidate dicts at several sizes, compress a sample of
   // blocks with each (and with no dict at all), and pick the
@@ -209,10 +246,10 @@ export async function blockCompressArcCoords(
   // not dictionary-compress meaningfully; grid-shaped ones might).
   // The user-supplied options.dictBytes is treated as the upper
   // bound — we'll consider sizes up to that.
-  const dictBytes = await autoPickArcCoordDict(
-    arcCoordsBytes,
-    blockSpecs,
+  const dictBytes = await autoPickSharedZstdDict(
+    blockPayloads,
     options.dictBytes,
+    "arc_coords",
   );
 
   // Build BLOCK_COMPRESS_CONCURRENCY persistent streams sharing the
@@ -241,12 +278,7 @@ export async function blockCompressArcCoords(
   const worker = async (s: ZstdFrameStream): Promise<void> => {
     while (cursor < blockSpecs.length) {
       const i = cursor++;
-      const spec = blockSpecs[i];
-      const blockBytes = arcCoordsBytes.subarray(
-        spec.startUncompressed,
-        spec.endUncompressed,
-      );
-      compressedBlocks[i] = await compressFrame(s, blockBytes);
+      compressedBlocks[i] = await compressFrame(s, blockPayloads[i]);
       completed++;
       if (completed % PROGRESS_EVERY === 0 || completed === blockSpecs.length) {
         stderrLog(
@@ -294,38 +326,209 @@ export async function blockCompressArcCoords(
     compressedBytes,
     blockCount: blockSpecs.length,
     targetBlockSize: target,
+    blockSpecs,
+  };
+}
+
+// Below this raw-arc_offsets size the encoder ships arc_offsets as a
+// single zstd-compressed delta-encoded blob (the original format).
+// At this scale, per-partition zstd-frame overhead + the block table
+// + dict cost outweigh the savings from selective fetching, AND the
+// whole monolithic blob already fits in a small number of round-trips
+// on typical networks. Above the threshold, the partitioned path
+// dominates — see bench-out/national/*.offsets-partition-sim.csv.
+export const ARC_OFFSETS_PARTITION_MIN_BYTES = 750 * 1024;
+
+// Dict-size auto-pick for arc_offsets partitions. Each partition is
+// hundreds of bytes (not KiB-MiB like arc_coords), so a tiny dict is
+// the right ballpark — geometric range that the sample-projection
+// picker explores stays the same; the per-call max here just bounds
+// the largest candidate we'd consider training. Matches the
+// auto-dict-size pattern used for arc_coords (auto-pick over 32 KiB →
+// 512 KiB candidates).
+export function autoArcOffsetsDictBytes(arcOffsetsLength: number): number {
+  return Math.min(
+    arcOffsetsLength,
+    Math.max(
+      ARC_COORD_DICT_MIN,
+      Math.min(ARC_COORD_DICT_DEFAULT, ARC_COORD_DICT_MAX),
+    ),
+  );
+}
+
+// Block-compress the global arc_offsets table along the same arc-id
+// boundaries that blockCompressArcCoords produced. For each block
+// covering arc ids [firstArcId_i, firstArcId_{i+1}):
+//   - Extract the N+1 u32 entries arc_offsets[firstArcId_i ..
+//     firstArcId_{i+1}] (N == arcs in block).
+//   - Subtract the block's uncompressed start so the stored values
+//     are *local* byte offsets within the decompressed arc-coords
+//     block (entry[0] == 0, entry[N] == block size in uncompressed
+//     bytes). Local deltas are tiny — typical arc length in bytes —
+//     and compress 3-4× better than the global cumulative form.
+//   - First-order delta-encode (same trick as the monolithic path).
+//   - Compress as one independent zstd frame against a shared dict
+//     trained over the per-block delta-encoded payloads.
+//
+// Returns the trained dict (or undefined), a 3 × u32 block table
+// [firstArcId, compOff, compLen] per partition, and the concatenated
+// frame bytes.
+export async function blockCompressArcOffsets(
+  arcOffsetsBytes: Uint8Array,
+  blockSpecs: ReadonlyArray<ArcCoordBlockSpec>,
+  options: { dictBytes: number },
+): Promise<BlockCompressedArcOffsets> {
+  const arcOffsets = new Uint32Array(
+    arcOffsetsBytes.buffer,
+    arcOffsetsBytes.byteOffset,
+    arcOffsetsBytes.byteLength / 4,
+  );
+  const numArcs = arcOffsets.length - 1;
+
+  // Walk arcs in id order, snapping each to the block whose
+  // uncompressed range covers its start byte. blockSpecs is in arc-id
+  // order and contiguous; a single sweep with a moving block cursor
+  // gives us each partition's [firstArcId, lastArcIdExclusive) range
+  // without binary-searching per arc.
+  const firstArcIdByBlock = new Uint32Array(blockSpecs.length + 1);
+  {
+    let blockIdx = 0;
+    let blockEnd = blockSpecs[0].endUncompressed;
+    for (let arcId = 0; arcId < numArcs; arcId++) {
+      const off = arcOffsets[arcId];
+      while (blockIdx < blockSpecs.length - 1 && off >= blockEnd) {
+        blockIdx++;
+        firstArcIdByBlock[blockIdx] = arcId;
+        blockEnd = blockSpecs[blockIdx].endUncompressed;
+      }
+    }
+    firstArcIdByBlock[blockSpecs.length] = numArcs;
+  }
+
+  // Build per-partition delta-encoded payloads.
+  const payloads = new Array<Uint8Array>(blockSpecs.length);
+  for (let i = 0; i < blockSpecs.length; i++) {
+    const firstArcId = firstArcIdByBlock[i];
+    const nextFirstArcId = firstArcIdByBlock[i + 1];
+    const blockStart = blockSpecs[i].startUncompressed;
+    const entries = nextFirstArcId - firstArcId + 1;
+    const local = new Uint32Array(entries);
+    let prev = 0;
+    for (let k = 0; k < entries; k++) {
+      const v = arcOffsets[firstArcId + k] - blockStart;
+      local[k] = v - prev;
+      prev = v;
+    }
+    payloads[i] = new Uint8Array(
+      local.buffer,
+      local.byteOffset,
+      local.byteLength,
+    );
+  }
+
+  const dictBytes = await autoPickSharedZstdDict(
+    payloads,
+    options.dictBytes,
+    "arc_offsets",
+  );
+
+  // Mirror blockCompressArcCoords' worker-pool pattern: persistent
+  // zstd streams sharing the picked dict, each compressing one
+  // partition as one frame and emitting it via flush(ZSTD_e_end).
+  const compressedFrames = new Array<Buffer>(blockSpecs.length);
+  const PROGRESS_EVERY = 1000;
+  const t0 = Date.now();
+  let completed = 0;
+  stderrLog(
+    `[blockCompressOffsets] start: ${blockSpecs.length} partitions, ` +
+      `dict=${dictBytes !== undefined ? `${(dictBytes.byteLength / 1024).toFixed(0)} KiB` : "(none)"}, ` +
+      `arc_offsets=${(arcOffsetsBytes.byteLength / 1024 / 1024).toFixed(1)} MiB raw, ` +
+      `concurrency=${BLOCK_COMPRESS_CONCURRENCY}`,
+  );
+
+  const poolSize = Math.min(BLOCK_COMPRESS_CONCURRENCY, blockSpecs.length);
+  const streams = new Array<ZstdFrameStream>(poolSize);
+  for (let s = 0; s < poolSize; s++) {
+    streams[s] = makeZstdFrameStream(dictBytes);
+  }
+  let cursor = 0;
+  const worker = async (s: ZstdFrameStream): Promise<void> => {
+    while (cursor < blockSpecs.length) {
+      const i = cursor++;
+      compressedFrames[i] = await compressFrame(s, payloads[i]);
+      completed++;
+      if (
+        completed % PROGRESS_EVERY === 0 ||
+        completed === blockSpecs.length
+      ) {
+        stderrLog(
+          `[blockCompressOffsets] ${completed}/${blockSpecs.length} ` +
+            `t=${((Date.now() - t0) / 1000).toFixed(1)}s ${memSnapshot()}`,
+        );
+      }
+    }
+  };
+  try {
+    await Promise.all(streams.map((s) => worker(s)));
+  } finally {
+    for (const s of streams) closeZstdFrameStream(s);
+  }
+  stderrLog(
+    `[blockCompressOffsets] done in ${((Date.now() - t0) / 1000).toFixed(1)}s`,
+  );
+
+  // Concatenate frames + build the [firstArcId, compOff, compLen] table.
+  let totalCompressed = 0;
+  for (const f of compressedFrames) totalCompressed += f.byteLength;
+  const compressedBytes = new Uint8Array(totalCompressed);
+  const blockTableBytes = new Uint8Array(blockSpecs.length * 12);
+  const tableView = new DataView(blockTableBytes.buffer);
+  let cOff = 0;
+  const framesWritable = compressedFrames as unknown as (Buffer | null)[];
+  for (let i = 0; i < blockSpecs.length; i++) {
+    const f = compressedFrames[i];
+    compressedBytes.set(f, cOff);
+    tableView.setUint32(i * 12 + 0, firstArcIdByBlock[i], true);
+    tableView.setUint32(i * 12 + 4, cOff, true);
+    tableView.setUint32(i * 12 + 8, f.byteLength, true);
+    cOff += f.byteLength;
+    framesWritable[i] = null;
+  }
+
+  return {
+    dictBytes,
+    blockTableBytes,
+    compressedBytes,
+    blockCount: blockSpecs.length,
   };
 }
 
 // --- Internal: dictionary training ---
 
-// Train a zstd shared dictionary from a sample of arc-coord blocks via
+// Train a zstd shared dictionary from a list of per-block payloads via
 // the `zstd --train` CLI. No JS package exposes ZDICT_trainFromBuffer,
 // so the shell-out is currently the simplest path.
 //
 // Trained dicts pack the most-frequent multi-byte sequences from the
 // samples into a compact (10s of KB) dictionary.
 //
+// `logLabel` is the section label printed in stderr progress lines
+// ("arc_coords" / "arc_offsets") so concurrent training passes don't
+// confuse each other in the log.
+//
 // Throws if `zstd` isn't on PATH.
-function trainArcCoordsDict(
-  arcCoordsBytes: Uint8Array,
-  blockSpecs: ReadonlyArray<{
-    readonly startUncompressed: number;
-    readonly endUncompressed: number;
-  }>,
+function trainSharedZstdDict(
+  samples: ReadonlyArray<Uint8Array>,
   targetDictBytes: number,
+  logLabel: string,
 ): Uint8Array | undefined {
   // zstd --train needs ≥~100 samples for stable output. For tiny
   // inputs (test fixtures, very small topologies) we skip the dict
   // entirely — the savings would be tiny anyway, and the encoder
-  // emits arcCoordsBlocks META without dictSection so the reader
-  // falls back to no-dict decode.
+  // emits …Blocks META without dictSection so the reader falls back
+  // to no-dict decode.
   const MIN_SAMPLES = 100;
-  if (blockSpecs.length < MIN_SAMPLES) return undefined;
-  // Train on every block. For large topologies this is in the
-  // 1-5K range and zstd --train completes in a few seconds.
-  const sampleIndices: number[] = [];
-  for (let i = 0; i < blockSpecs.length; i++) sampleIndices.push(i);
+  if (samples.length < MIN_SAMPLES) return undefined;
 
   const tmp = mkdtempSync(join(tmpdir(), "ctopo-dict-"));
   try {
@@ -335,18 +538,14 @@ function trainArcCoordsDict(
     const dictPath = join(tmp, "dict");
     spawnSync("mkdir", ["-p", sampleDir], { stdio: "ignore" });
     let totalSampleBytes = 0;
-    for (let i = 0; i < sampleIndices.length; i++) {
-      const spec = blockSpecs[sampleIndices[i]];
-      const slice = arcCoordsBytes.subarray(
-        spec.startUncompressed,
-        spec.endUncompressed,
-      );
+    for (let i = 0; i < samples.length; i++) {
+      const slice = samples[i];
       const name = `s${i.toString().padStart(6, "0")}`;
       writeFileSync(join(sampleDir, name), slice);
       totalSampleBytes += slice.byteLength;
     }
     stderrLog(
-      `[trainDict] training on ${sampleIndices.length} samples ` +
+      `[trainDict ${logLabel}] training on ${samples.length} samples ` +
         `(${(totalSampleBytes / 1024 / 1024).toFixed(1)} MiB), maxdict=${(targetDictBytes / 1024).toFixed(0)} KiB`,
     );
     const t0 = Date.now();
@@ -364,7 +563,7 @@ function trainArcCoordsDict(
     );
     if (result.error !== undefined) {
       throw new Error(
-        `ctopo: blockCompressArcCoords requires the \`zstd\` CLI on PATH for dict training (got: ${result.error.message})`,
+        `ctopo: trainSharedZstdDict requires the \`zstd\` CLI on PATH for dict training (got: ${result.error.message})`,
       );
     }
     if (result.status !== 0) {
@@ -374,7 +573,7 @@ function trainArcCoordsDict(
     }
     const dictBuf = readFileSync(dictPath);
     stderrLog(
-      `[trainDict] trained ${dictBuf.byteLength} byte dict in ${((Date.now() - t0) / 1000).toFixed(1)}s`,
+      `[trainDict ${logLabel}] trained ${dictBuf.byteLength} byte dict in ${((Date.now() - t0) / 1000).toFixed(1)}s`,
     );
     return new Uint8Array(
       dictBuf.buffer,
@@ -386,45 +585,44 @@ function trainArcCoordsDict(
   }
 }
 
-// Empirically pick the best arc_coords dict size by trying a few
-// candidate sizes (plus no-dict) on a small block sample and
-// projecting to full file size. Returns the trained dict for the
-// best candidate, or undefined if no-dict wins.
+// Empirically pick the best shared-dict size by trying a few candidate
+// sizes (plus no-dict) on a small block sample and projecting to full
+// file size. Returns the trained dict for the best candidate, or
+// undefined if no-dict wins.
 //
-// The cost is one `zstd --train` per candidate (~10s each) and
-// one sample compress per candidate (~1s). For ~3-4 candidates
-// that's ~40s of overhead at encode time.
-async function autoPickArcCoordDict(
-  arcCoordsBytes: Uint8Array,
-  blockSpecs: ReadonlyArray<{
-    readonly startUncompressed: number;
-    readonly endUncompressed: number;
-  }>,
+// `blockPayloads` is the per-block bytes that will be compressed
+// (arc_coords slices for the arc_coords path; per-partition
+// delta-encoded local offsets for the arc_offsets path). `logLabel`
+// disambiguates progress lines.
+//
+// The cost is one `zstd --train` per candidate (~10s each) and one
+// sample compress per candidate (~1s). For ~3-4 candidates that's
+// ~40s of overhead at encode time.
+async function autoPickSharedZstdDict(
+  blockPayloads: ReadonlyArray<Uint8Array>,
   maxDictBytes: number,
+  logLabel: string,
 ): Promise<Uint8Array | undefined> {
   // Need a meaningful number of blocks for both training and the
   // sample test. Skip auto-tuning (and dict entirely) for tiny
   // regions — the savings are too small to justify the overhead.
   const MIN_SAMPLES_FOR_AUTO = 100;
-  if (blockSpecs.length < MIN_SAMPLES_FOR_AUTO) return undefined;
+  if (blockPayloads.length < MIN_SAMPLES_FOR_AUTO) return undefined;
 
   // Pick a small evaluation sample — every Nth block by stride so
   // we cover early/late blocks (different tiers). 100 is enough
   // for a stable ratio estimate without making the sample-compress
   // step expensive.
   const SAMPLE_BLOCKS = 100;
-  const stride = Math.max(1, Math.floor(blockSpecs.length / SAMPLE_BLOCKS));
+  const stride = Math.max(1, Math.floor(blockPayloads.length / SAMPLE_BLOCKS));
   const sampleSlices: Uint8Array[] = [];
-  for (let i = 0; i < blockSpecs.length; i += stride) {
-    const spec = blockSpecs[i];
-    sampleSlices.push(
-      arcCoordsBytes.subarray(spec.startUncompressed, spec.endUncompressed),
-    );
+  for (let i = 0; i < blockPayloads.length; i += stride) {
+    sampleSlices.push(blockPayloads[i]);
     if (sampleSlices.length >= SAMPLE_BLOCKS) break;
   }
-  const projectionFactor = blockSpecs.length / sampleSlices.length;
+  const projectionFactor = blockPayloads.length / sampleSlices.length;
   stderrLog(
-    `[autoDict] tuning on ${sampleSlices.length} sample blocks (${blockSpecs.length} total, ` +
+    `[autoDict ${logLabel}] tuning on ${sampleSlices.length} sample blocks (${blockPayloads.length} total, ` +
       `projection×${projectionFactor.toFixed(1)}, max dict=${(maxDictBytes / 1024).toFixed(0)} KiB)`,
   );
 
@@ -475,13 +673,13 @@ async function autoPickArcCoordDict(
     projectedFileBytes: noDictProjected,
   });
   stderrLog(
-    `[autoDict]   no-dict: sample=${(noDictSampleTotal / 1024).toFixed(0)} KiB, ` +
+    `[autoDict ${logLabel}]   no-dict: sample=${(noDictSampleTotal / 1024).toFixed(0)} KiB, ` +
       `projected=${(noDictProjected / 1024 / 1024).toFixed(2)} MiB`,
   );
 
   // Trained-dict candidates.
   for (const size of candidateSizes) {
-    const dict = trainArcCoordsDict(arcCoordsBytes, blockSpecs, size);
+    const dict = trainSharedZstdDict(blockPayloads, size, logLabel);
     if (dict === undefined) continue;
     const sampleTotal = await compressSampleTotal(dict);
     const projected = sampleTotal * projectionFactor + dict.byteLength;
@@ -491,7 +689,7 @@ async function autoPickArcCoordDict(
       projectedFileBytes: projected,
     });
     stderrLog(
-      `[autoDict]   ${(dict.byteLength / 1024).toFixed(0)} KiB dict: ` +
+      `[autoDict ${logLabel}]   ${(dict.byteLength / 1024).toFixed(0)} KiB dict: ` +
         `sample=${(sampleTotal / 1024).toFixed(0)} KiB, ` +
         `projected=${(projected / 1024 / 1024).toFixed(2)} MiB ` +
         `(incl ${(dict.byteLength / 1024).toFixed(0)} KiB dict)`,
@@ -550,6 +748,6 @@ async function autoPickArcCoordDict(
     chosen = noDict;
     rationale = `no-dict wins by >${(NO_DICT_PENALTY * 100).toFixed(1)}%`;
   }
-  stderrLog(`[autoDict] picked: ${chosen.label} — ${rationale}`);
+  stderrLog(`[autoDict ${logLabel}] picked: ${chosen.label} — ${rationale}`);
   return chosen.dict;
 }
