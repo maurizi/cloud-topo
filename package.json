@@ -70,5 +70,8 @@
     "binary",
     "range-fetch",
     "cloud-optimized"
-  ]
+  ],
+  "dependencies": {
+    "cloud-topo": "file:../cloud-topo"
+  }
 }

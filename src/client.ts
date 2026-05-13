@@ -33,7 +33,8 @@ import {
 import {
   FOOTER_TRAILER_SIZE,
   HEADER_SIZE,
-  readVarintZigzag,
+  readVarintZigzagInto,
+  type VarintCursor,
 } from "./format";
 import {
   StringArray,
@@ -1571,24 +1572,23 @@ export class CtopoClient {
       // length 4 × arcsInBlock: [sx0, sy0, ex0, ey0, sx1, sy1, ...].
       const out = new Int32Array(arcsInBlock * 4);
       const bytes = raw;
-      let off = 0;
+      const cur: VarintCursor = { value: 0, off: 0 };
       let prevSx = 0;
       let prevSy = 0;
       for (let i = 0; i < arcsInBlock; i++) {
-        const dsx = readVarintZigzag(bytes, off);
-        off += dsx.consumed;
-        const dsy = readVarintZigzag(bytes, off);
-        off += dsy.consumed;
-        const dex = readVarintZigzag(bytes, off);
-        off += dex.consumed;
-        const dey = readVarintZigzag(bytes, off);
-        off += dey.consumed;
-        const sx = prevSx + dsx.value;
-        const sy = prevSy + dsy.value;
+        readVarintZigzagInto(bytes, cur);
+        const dsx = cur.value;
+        readVarintZigzagInto(bytes, cur);
+        const dsy = cur.value;
+        readVarintZigzagInto(bytes, cur);
+        const dex = cur.value;
+        readVarintZigzagInto(bytes, cur);
+        const sx = prevSx + dsx;
+        const sy = prevSy + dsy;
         out[i * 4] = sx;
         out[i * 4 + 1] = sy;
-        out[i * 4 + 2] = sx + dex.value;
-        out[i * 4 + 3] = sy + dey.value;
+        out[i * 4 + 2] = sx + dex;
+        out[i * 4 + 3] = sy + cur.value;
         prevSx = sx;
         prevSy = sy;
       }
@@ -1679,6 +1679,7 @@ export class CtopoClient {
     }
     const arcBytes = await this.fetchArcs(ids, signal);
     const out = new Map<number, Int32Array>();
+    const cur: VarintCursor = { value: 0, off: 0 };
     for (const id of ids) {
       const bytes = arcBytes.get(id);
       if (bytes === undefined) {
@@ -1687,15 +1688,15 @@ export class CtopoClient {
       const endpoints = new Int32Array(4);
       let x = 0;
       let y = 0;
-      let off = 0;
+      cur.off = 0;
+      const end = bytes.byteLength;
       let pIdx = 0;
-      while (off < bytes.byteLength) {
-        const dx = readVarintZigzag(bytes, off);
-        off += dx.consumed;
-        const dy = readVarintZigzag(bytes, off);
-        off += dy.consumed;
-        x += dx.value;
-        y += dy.value;
+      while (cur.off < end) {
+        readVarintZigzagInto(bytes, cur);
+        const dx = cur.value;
+        readVarintZigzagInto(bytes, cur);
+        x += dx;
+        y += cur.value;
         if (pIdx === 0) {
           endpoints[0] = x;
           endpoints[1] = y;

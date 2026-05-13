@@ -11,7 +11,7 @@ import { makeBufferFetcher } from "../fetcher";
 import {
   MAGIC,
   VERSION_MAJOR,
-  readVarintZigzag,
+  readVarintZigzagInto,
   unpackVersion,
   writeVarintZigzag,
 } from "../format";
@@ -722,11 +722,13 @@ describe("ctopo format", () => {
       0x0fffffff, -0x10000000, 0x7fffffff, -0x80000000,
     ];
     const buf = new Uint8Array(10);
+    const cur = { value: 0, off: 0 };
     for (const v of cases) {
       const end = writeVarintZigzag(v, buf, 0);
-      const decoded = readVarintZigzag(buf, 0);
-      expect(decoded.consumed).toBe(end);
-      expect(decoded.value).toBe(v);
+      cur.off = 0;
+      readVarintZigzagInto(buf, cur);
+      expect(cur.off).toBe(end);
+      expect(cur.value).toBe(v);
     }
   });
 });

@@ -133,40 +133,42 @@ export function writeVarintZigzag(
   return off;
 }
 
-// Decode a zigzag-LEB128 value at `off` into a packed result:
-//   bits 0..31  consumed byte count (small int)
-//   high bits   decoded signed value
-// Callers unpack via `result.value` / `result.consumed` — using a
-// small object avoids two array allocations per point in the hot
-// decode loop.
-export interface VarintRead {
-  readonly value: number;
-  readonly consumed: number;
+// Caller-owned cursor for zigzag-LEB128 reads. `off` points at the
+// next byte to consume; `value` receives the most recent decoded
+// signed value. The cursor is mutated by readVarintZigzagInto so
+// callers don't pay a per-call object literal allocation.
+export interface VarintCursor {
+  value: number;
+  off: number;
 }
 
-export function readVarintZigzag(buf: Uint8Array, off: number): VarintRead {
+// Decode one zigzag-LEB128 value at `cur.off`. On return:
+//   cur.value = decoded signed value
+//   cur.off   = position immediately after the consumed bytes
+export function readVarintZigzagInto(buf: Uint8Array, cur: VarintCursor): void {
+  let off = cur.off;
   let lo = 0;
-  let n = 0;
   // First 4 bytes: bits 0..27 fit in a 32-bit signed int with room.
   for (let shift = 0; shift < 28; shift += 7) {
-    const b = buf[off + n++];
+    const b = buf[off++];
     lo |= (b & 0x7f) << shift;
     if ((b & 0x80) === 0) {
       // Zigzag decode within signed-int32 range (lo is non-negative
       // here since we've only set bits 0..27).
-      const value = (lo >>> 1) ^ -(lo & 1);
-      return { value, consumed: n };
+      cur.value = (lo >>> 1) ^ -(lo & 1);
+      cur.off = off;
+      return;
     }
   }
   // 5th byte holds bits 28..31 of the unsigned 32-bit accumulator.
   // High bit on a 5th byte means the encoder went past int32 — bug.
-  const b = buf[off + n++];
+  const b = buf[off++];
   if ((b & 0x80) !== 0 || (b & 0xf0) !== 0) {
     throw new Error("ctopo: varint exceeds int32 range");
   }
   const u32 = ((lo >>> 0) | (b << 28)) >>> 0;
   // For uint32 inputs we can't use the signed-shift trick — split the
   // low bit and divide by 2 in float math to land back in JS number range.
-  const value = u32 & 1 ? -((u32 + 1) / 2) : u32 / 2;
-  return { value, consumed: n };
+  cur.value = u32 & 1 ? -((u32 + 1) / 2) : u32 / 2;
+  cur.off = off;
 }

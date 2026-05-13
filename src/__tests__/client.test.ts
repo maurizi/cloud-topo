@@ -8,7 +8,7 @@ import { type Topology } from "topojson-specification";
 import { CtopoClient } from "../client";
 import { makeBufferFetcher, type RangeFetcher } from "../fetcher";
 import { encodeContainer } from "../encode";
-import { readVarintZigzag } from "../format";
+import { readVarintZigzagInto } from "../format";
 
 // Quantized variant of fixtureTopology — adds a `transform` so the
 // encoder takes the delta + varint arc path (and emits arc_endpoints
@@ -279,21 +279,21 @@ describe("CtopoClient", () => {
     // Independently recover endpoints from the raw arc_coords varint
     // stream and confirm they match the dedicated section.
     const arcBytes = await client.fetchArcs(ids);
+    const cur = { value: 0, off: 0 };
     for (const id of ids) {
       const bytes = arcBytes.get(id)!;
       let x = 0;
       let y = 0;
-      let off = 0;
       let sx = 0;
       let sy = 0;
       let pIdx = 0;
-      while (off < bytes.byteLength) {
-        const dx = readVarintZigzag(bytes, off);
-        off += dx.consumed;
-        const dy = readVarintZigzag(bytes, off);
-        off += dy.consumed;
-        x += dx.value;
-        y += dy.value;
+      cur.off = 0;
+      while (cur.off < bytes.byteLength) {
+        readVarintZigzagInto(bytes, cur);
+        const dx = cur.value;
+        readVarintZigzagInto(bytes, cur);
+        x += dx;
+        y += cur.value;
         if (pIdx === 0) {
           sx = x;
           sy = y;

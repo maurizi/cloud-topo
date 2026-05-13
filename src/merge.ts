@@ -14,7 +14,7 @@
 import { type MultiPolygon } from "geojson";
 
 import { type CtopoClient } from "./client";
-import { readVarintZigzag } from "./format";
+import { readVarintZigzagInto, type VarintCursor } from "./format";
 import { type LayerGeometry, type LayerSelection } from "./types";
 
 // Topojson arcs are global across layers, so cancellation works
@@ -101,6 +101,35 @@ interface StitchScratch {
   fragmentByEnd: Map<unknown, Fragment>;
   stitched: Set<number>;
 }
+// Direct-indexed arc-id → CSR-row table for buildPolygonsByArc. One
+// Int32Array per client, sized to client.meta.numArcs, kept alive
+// for the client's lifetime. The packing layout (8 bits generation,
+// 24 bits row) plus the per-merge generation bump are explained at
+// the use site in buildPolygonsByArc; the WeakMap here keeps the
+// buffer scoped to the client without growing the public API.
+interface ArcGenState {
+  index: Int32Array;
+  gen: number;
+}
+const arcGenStateByClient = new WeakMap<CtopoClient, ArcGenState>();
+function getArcGenIndex(client: CtopoClient, numArcs: number): Int32Array {
+  let s = arcGenStateByClient.get(client);
+  if (s === undefined) {
+    s = { index: new Int32Array(numArcs), gen: 0 };
+    arcGenStateByClient.set(client, s);
+  }
+  return s.index;
+}
+function bumpArcGen(client: CtopoClient): number {
+  // Caller is responsible for the per-client WeakMap entry existing
+  // (we created it in getArcGenIndex earlier in the same call). Wrap
+  // at 0xff so the high byte of the packed slot can never collide
+  // with a stale generation; caller handles the rare wrap-and-reset.
+  const s = arcGenStateByClient.get(client) as ArcGenState;
+  s.gen = (s.gen + 1) & 0xff;
+  return s.gen;
+}
+
 const stitchScratchByClient = new WeakMap<CtopoClient, StitchScratch>();
 function getStitchScratch(client: CtopoClient): StitchScratch {
   let s = stitchScratchByClient.get(client);
@@ -622,33 +651,74 @@ function buildPolygonsByArc(
   const totalArcs = signedArcIds.length;
   const pool = getPool(client);
   // Pass 1: count memberships per arc id while assigning row indices.
-  // indexByArcId is local — only needed in this pass to bridge "arc
-  // id → CSR row". The consumers reach the same row via rowByArc[k]
-  // (filled here), so we drop the Map at function exit and keep only
-  // the Int32Array. counts stays as number[]: V8 holds it as a packed
-  // SMI elements array and Scavenge handles its growth cheaply;
-  // pooling it as Int32Array measured as a net wash here (the extra
-  // pool entry's external-memory footprint cost as much Mark-Compact
-  // as the alloc churn it saved).
-  const indexByArcId = new Map<number, number>();
+  //
+  // Replaced `new Map<number, number>()` with a direct-indexed
+  // Int32Array. V8 Map<number, number>'s .get/.set sit on the
+  // general hash path with HeapNumber boxing per access; merge bench
+  // (national CD) showed buildPolygonsByArc at 3.9s self / 5.7% of
+  // profile dominated by those calls.
+  //
+  // Layout: one Int32Array of length `meta.numArcs`, held for the
+  // client's lifetime. Each slot packs a generation marker in the
+  // high 8 bits and the per-merge row index in the low 24 bits. A
+  // slot is "present in this merge" iff its high byte matches the
+  // current generation. No per-merge zero-fill: bumping the
+  // generation counter logically invalidates every slot in O(1).
+  // When the counter would overflow (every 256 merges), we reset the
+  // array — a single .fill(0) amortized to ~free.
+  //
+  // Memory cost: numArcs × 4 bytes resident, kept alive on the
+  // client. ~80 MiB at national (20M arcs). Per-merge cost is one
+  // typed-array read per arc reference; no hashing, no probing, no
+  // allocation.
+  //
+  // Row capacity per merge: 2^24 = 16M. National merges peak in the
+  // 100K-row range; well under the cap. We throw if a merge ever
+  // approaches it so the regression is loud rather than silent.
+  const ARC_GEN_SHIFT = 24;
+  const ARC_ROW_MASK = (1 << ARC_GEN_SHIFT) - 1;
+  const arcGenIndex = getArcGenIndex(client, client.meta.numArcs);
+  let curGen = bumpArcGen(client);
+  if (curGen === 0) {
+    // Wrapped past 0xff — reset stale generations so the next lookup
+    // can't false-match.
+    arcGenIndex.fill(0);
+    curGen = bumpArcGen(client);
+  }
+  const curGenShifted = curGen << ARC_GEN_SHIFT;
+
+  // counts stays as number[]: V8 holds it as a packed SMI elements
+  // array and Scavenge handles its growth cheaply; pooling it as
+  // Int32Array measured as a net wash here (the extra pool entry's
+  // external-memory footprint cost as much Mark-Compact as the alloc
+  // churn it saved).
   const counts: number[] = [];
   const rowByArc = pool.acquire(totalArcs);
+  let numUnique = 0;
   for (let k = 0; k < totalArcs; k++) {
     const signed = signedArcIds[k];
     const id = signed < 0 ? ~signed : signed;
-    let idx = indexByArcId.get(id);
-    if (idx === undefined) {
-      idx = indexByArcId.size;
-      indexByArcId.set(id, idx);
-      counts.push(1);
-    } else {
+    const slot = arcGenIndex[id];
+    let idx: number;
+    if ((slot & ~ARC_ROW_MASK) === curGenShifted) {
+      idx = slot & ARC_ROW_MASK;
       counts[idx]++;
+    } else {
+      idx = numUnique++;
+      arcGenIndex[id] = curGenShifted | idx;
+      counts.push(1);
     }
     rowByArc[k] = idx;
   }
+  if (numUnique > ARC_ROW_MASK) {
+    throw new Error(
+      `ctopo: buildPolygonsByArc unique-arc count ${numUnique} exceeds packed-row cap ${ARC_ROW_MASK}; widen ARC_GEN_SHIFT`,
+    );
+  }
+
   // Build CSR offsets from counts via prefix sum. Pool buffers may
   // carry stale data, so set offsets[0] explicitly.
-  const numArcs = indexByArcId.size;
+  const numArcs = numUnique;
   const offsets = pool.acquire(numArcs + 1);
   offsets[0] = 0;
   for (let i = 0; i < numArcs; i++) offsets[i + 1] = offsets[i] + counts[i];
@@ -821,43 +891,42 @@ function makeNumericEndpointLookup(
 // ring decode). Decodes the first and last (dx, dy) points from each
 // arc's varint stream and packs into the same 52-bit Number key
 // makeNumericEndpointLookup uses — so stitchArcs is key-type-
-// agnostic. Per-arc memoization across start/end so we don't walk
-// the same arc twice (stitchArcs reads each arc's endpoints once,
-// but a Fragment merge may revisit; cheap insurance).
+// agnostic.
+//
+// No per-call memoization: stitchArcs visits each unsigned arc id
+// exactly once in its boundary list (forward or reverse, never both
+// directions in the same call), so a per-call start/end cache has a
+// measured 0% hit rate (417,703 lookups, 0 hits on the national CD
+// merge). Adding the Maps was pure overhead — removed.
 function makeNumericEndpointLookupFromBytes(
   arcBytes: ReadonlyMap<number, Uint8Array>,
   client: CtopoClient,
 ): EndpointLookup<number> {
-  const startCache = new Map<number, number>();
-  const endCache = new Map<number, number>();
+  // One cursor reused across every start/end read in this lookup.
+  // Sync hot path; no concurrency to worry about.
+  const cur: VarintCursor = { value: 0, off: 0 };
   function readStartPacked(arcId: number): number {
-    const cached = startCache.get(arcId);
-    if (cached !== undefined) return cached;
     const bytes = requireArcBytes(arcBytes, arcId);
-    const dx = readVarintZigzag(bytes, 0);
-    const dy = readVarintZigzag(bytes, dx.consumed);
-    const packed = packCoord(dx.value, dy.value);
-    startCache.set(arcId, packed);
-    return packed;
+    cur.off = 0;
+    readVarintZigzagInto(bytes, cur);
+    const dx = cur.value;
+    readVarintZigzagInto(bytes, cur);
+    return packCoord(dx, cur.value);
   }
   function readEndPacked(arcId: number): number {
-    const cached = endCache.get(arcId);
-    if (cached !== undefined) return cached;
     const bytes = requireArcBytes(arcBytes, arcId);
     let x = 0;
     let y = 0;
-    let off = 0;
-    while (off < bytes.byteLength) {
-      const dx = readVarintZigzag(bytes, off);
-      off += dx.consumed;
-      const dy = readVarintZigzag(bytes, off);
-      off += dy.consumed;
-      x += dx.value;
-      y += dy.value;
+    cur.off = 0;
+    const end = bytes.byteLength;
+    while (cur.off < end) {
+      readVarintZigzagInto(bytes, cur);
+      const dx = cur.value;
+      readVarintZigzagInto(bytes, cur);
+      x += dx;
+      y += cur.value;
     }
-    const packed = packCoord(x, y);
-    endCache.set(arcId, packed);
-    return packed;
+    return packCoord(x, y);
   }
   void client;
   return {
@@ -879,14 +948,16 @@ function makeEndpointLookup(
   client: CtopoClient,
 ): EndpointLookup<string> {
   const isQuantized = client.transform !== null;
+  const cur: VarintCursor = { value: 0, off: 0 };
 
   function readStart(arcId: number): [number, number] {
     const bytes = requireArcBytes(arcBytes, arcId);
     if (isQuantized) {
-      // First (dx, dy) varint pair = absolute first point (delta from origin).
-      const dx = readVarintZigzag(bytes, 0);
-      const dy = readVarintZigzag(bytes, dx.consumed);
-      return [dx.value, dy.value];
+      cur.off = 0;
+      readVarintZigzagInto(bytes, cur);
+      const dx = cur.value;
+      readVarintZigzagInto(bytes, cur);
+      return [dx, cur.value];
     }
     const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
     return [view.getFloat64(0, true), view.getFloat64(8, true)];
@@ -895,18 +966,16 @@ function makeEndpointLookup(
   function readEnd(arcId: number): [number, number] {
     const bytes = requireArcBytes(arcBytes, arcId);
     if (isQuantized) {
-      // Quantized arc is varint-encoded deltas — walk every pair to
-      // accumulate onto the absolute end point.
       let x = 0;
       let y = 0;
-      let off = 0;
-      while (off < bytes.byteLength) {
-        const dx = readVarintZigzag(bytes, off);
-        off += dx.consumed;
-        const dy = readVarintZigzag(bytes, off);
-        off += dy.consumed;
-        x += dx.value;
-        y += dy.value;
+      cur.off = 0;
+      const end = bytes.byteLength;
+      while (cur.off < end) {
+        readVarintZigzagInto(bytes, cur);
+        const dx = cur.value;
+        readVarintZigzagInto(bytes, cur);
+        x += dx;
+        y += cur.value;
       }
       return [x, y];
     }
@@ -1060,59 +1129,72 @@ function decodeRing(
   arcBytes: ReadonlyMap<number, Uint8Array>,
   client: CtopoClient,
 ): number[][] {
-  const isQuantized = client.transform !== null;
   const t = client.transform;
+  const isQuantized = t !== null;
+  const kx = isQuantized ? t.scale[0] : 0;
+  const ky = isQuantized ? t.scale[1] : 0;
+  const tx = isQuantized ? t.translate[0] : 0;
+  const ty = isQuantized ? t.translate[1] : 0;
   const ring: number[][] = [];
+  // One cursor for the whole ring; reused per arc varint walk.
+  const cur: VarintCursor = { value: 0, off: 0 };
 
   for (const signed of arcIds) {
     const arcId = signed >= 0 ? signed : ~signed;
     const forward = signed >= 0;
     const bytes = requireArcBytes(arcBytes, arcId);
-    const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
-    const points = decodeArcPoints(view, isQuantized, t);
-    if (!forward) points.reverse();
-    // Drop last point of each arc — it's shared with the next arc's
-    // start; the final ring closure point is appended explicitly.
-    for (let i = 0; i < points.length - 1; i++) ring.push(points[i]);
+    const segStart = ring.length;
+
+    if (isQuantized) {
+      // Walk varints and append each point directly to the ring. The
+      // [x,y] pairs live on as the GeoJSON output; the per-arc number[]
+      // wrapper and DataView the old shape allocated are pure garbage.
+      let x = 0;
+      let y = 0;
+      cur.off = 0;
+      const end = bytes.byteLength;
+      while (cur.off < end) {
+        readVarintZigzagInto(bytes, cur);
+        const dx = cur.value;
+        readVarintZigzagInto(bytes, cur);
+        x += dx;
+        y += cur.value;
+        ring.push([x * kx + tx, y * ky + ty]);
+      }
+    } else {
+      const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+      const numPoints = bytes.byteLength / 16;
+      for (let i = 0; i < numPoints; i++) {
+        const off = i * 16;
+        ring.push([view.getFloat64(off, true), view.getFloat64(off + 8, true)]);
+      }
+    }
+
+    const segLen = ring.length - segStart;
+    if (segLen === 0) continue;
+
+    if (forward) {
+      // Last point is shared with the next arc's start — drop it.
+      ring.pop();
+    } else {
+      // Reverse this arc's segment in place, then drop the new tail
+      // (which was the first decoded point, i.e. the shared join
+      // with the next arc in the backward walk).
+      let lo = segStart;
+      let hi = ring.length - 1;
+      while (lo < hi) {
+        const tmp = ring[lo];
+        ring[lo] = ring[hi];
+        ring[hi] = tmp;
+        lo++;
+        hi--;
+      }
+      ring.pop();
+    }
   }
 
   if (ring.length > 0) ring.push(ring[0]);
   return ring;
-}
-
-function decodeArcPoints(
-  view: DataView,
-  isQuantized: boolean,
-  t: TransformDef,
-): number[][] {
-  if (isQuantized) {
-    if (t === null) throw new Error("ctopo: quantized arc with null transform");
-    const bytes = new Uint8Array(view.buffer, view.byteOffset, view.byteLength);
-    const points: number[][] = [];
-    let x = 0;
-    let y = 0;
-    let off = 0;
-    while (off < bytes.byteLength) {
-      const dx = readVarintZigzag(bytes, off);
-      off += dx.consumed;
-      const dy = readVarintZigzag(bytes, off);
-      off += dy.consumed;
-      x += dx.value;
-      y += dy.value;
-      points.push([
-        x * t.scale[0] + t.translate[0],
-        y * t.scale[1] + t.translate[1],
-      ]);
-    }
-    return points;
-  }
-  const numPoints = view.byteLength / 16;
-  const points = new Array<number[]>(numPoints);
-  for (let i = 0; i < numPoints; i++) {
-    const off = i * 16;
-    points[i] = [view.getFloat64(off, true), view.getFloat64(off + 8, true)];
-  }
-  return points;
 }
 
 // --- ringArea (shoelace) ---
