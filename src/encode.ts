@@ -77,8 +77,10 @@ import {
 import {
   ARC_OFFSETS_PARTITION_MIN_BYTES,
   autoArcCoordDictBytes,
+  autoArcEndpointsDictBytes,
   autoArcOffsetsDictBytes,
   blockCompressArcCoords,
+  blockCompressArcEndpoints,
   blockCompressArcOffsets,
   DEFAULT_ARC_COORD_BLOCK_BYTES,
 } from "./encode-compress";
@@ -180,7 +182,7 @@ export interface EncodeOptions {
   // decodable zstd block within arc_coords. Smaller blocks reduce
   // wasted bandwidth on selective per-arc fetches; larger blocks
   // improve compression ratio. Aligned to whole-arc boundaries at
-  // emit time. Defaults to DEFAULT_ARC_COORD_BLOCK_BYTES (16 KiB).
+  // emit time. Defaults to DEFAULT_ARC_COORD_BLOCK_BYTES (4 KiB).
   readonly arcCoordBlockBytes?: number;
   // App-specific sections to front-load alongside the encoder's
   // structural front-loaded set (arc_coords_dict, arc_coord_blocks,
@@ -194,6 +196,16 @@ export interface EncodeOptions {
   // Sort order algorithm for arc_coords packing.
   // Default 'hierarchical-hilbert'. See SpatialSort docs for the alternatives
   readonly spatialSort?: SpatialSort;
+  // Emit a dedicated `arc_endpoints` section (per-arc absolute start +
+  // end quantized coordinates), block-partitioned along the same arc-id
+  // boundaries as arc_coords. Lets mergeArcs do its stitching without
+  // fetching arc_coords at all, and lets `merge` skip the per-arc
+  // varint walk in arc_coords just to read an endpoint. Adds ~2–4% to
+  // file size on the national topo. Default true for quantized inputs;
+  // silently ignored for un-quantized inputs (the un-quantized endpoint
+  // shape would be 32 B/arc raw — large enough we'd want a separate
+  // representation and we don't have a consumer for it yet).
+  readonly emitArcEndpoints?: boolean;
   // Bench instrumentation hooks. Both fire synchronously and should
   // stay cheap. No-op when omitted; no behavior change.
   readonly onSectionEncoded?: (event: SectionEncodedEvent) => void;
@@ -302,10 +314,8 @@ export async function encodeContainer(
   });
 
   const tBuildArcs = performance.now();
-  const { arcOffsetsBytes, arcCoordsBytes, bytesPerPoint } = buildArcSections(
-    input,
-    arcOrder,
-  );
+  const { arcOffsetsBytes, arcCoordsBytes, bytesPerPoint, arcEndpoints } =
+    buildArcSections(input, arcOrder);
   opts.onPhaseTiming?.({
     stage: "build-arcs",
     elapsedMs: performance.now() - tBuildArcs,
@@ -403,6 +413,54 @@ export async function encodeContainer(
       delta: true,
       frontLoad: true,
     });
+  }
+
+  // arc_endpoints: per-arc absolute (startX, startY, endX, endY)
+  // partitioned along arc_coords block boundaries. Quantized inputs
+  // only; consumers (mergeArcs, merge endpoint reads) skip the
+  // arc_coords varint walk when this section is present. Knob off by
+  // setting emitArcEndpoints=false; un-quantized inputs are silently
+  // skipped (buildArcSections returns undefined endpoints).
+  let arcEndpointsBlocksMeta: ContainerMeta["arcEndpointsBlocks"] = undefined;
+  if (arcEndpoints !== undefined && opts.emitArcEndpoints !== false) {
+    const tBlockCompressEndpoints = performance.now();
+    const endpointsBlock = await blockCompressArcEndpoints(
+      arcEndpoints.bytes,
+      block.blockSpecs,
+      arcOffsetsBytes,
+      { dictBytes: autoArcEndpointsDictBytes(arcEndpoints.bytes.byteLength) },
+    );
+    opts.onPhaseTiming?.({
+      stage: "block-compress-endpoints",
+      elapsedMs: performance.now() - tBlockCompressEndpoints,
+    });
+    if (endpointsBlock.dictBytes !== undefined) {
+      sections.push({
+        name: "arc_endpoints_dict",
+        dtype: "blob",
+        bytes: endpointsBlock.dictBytes,
+        frontLoad: true,
+      });
+    }
+    sections.push({
+      name: "arc_endpoint_blocks",
+      dtype: "u32",
+      bytes: endpointsBlock.blockTableBytes,
+      frontLoad: true,
+    });
+    sections.push({
+      name: "arc_endpoints",
+      dtype: "blob",
+      bytes: endpointsBlock.compressedBytes,
+      frontLoad: false,
+    });
+    arcEndpointsBlocksMeta = {
+      dictSection:
+        endpointsBlock.dictBytes !== undefined ? "arc_endpoints_dict" : undefined,
+      blockTableSection: "arc_endpoint_blocks",
+      partitionsSection: "arc_endpoints",
+      blockCount: endpointsBlock.blockCount,
+    };
   }
 
   // arc_coords lives in the front-loaded region too. Tier ordering
@@ -511,6 +569,7 @@ export async function encodeContainer(
     metadata: undefined,
     arcCoordsBlocks: arcCoordsBlocksMeta,
     arcOffsetsBlocks: arcOffsetsBlocksMeta,
+    arcEndpointsBlocks: arcEndpointsBlocksMeta,
     numArcs,
     compression: opts.compression ?? "zstd",
     onProgress: opts.onProgress,
@@ -657,6 +716,11 @@ export async function rewriteContainer(
     // source file used the monolithic path this is undefined and the
     // rewrite stays monolithic.
     arcOffsetsBlocks: meta.arcOffsetsBlocks,
+    // Preserve arc_endpoints meta when the source file had it
+    // (quantized inputs with emitArcEndpoints on). Pass-through
+    // sections carry the actual bytes; this field tells readers
+    // where to find them in the rebuilt file.
+    arcEndpointsBlocks: meta.arcEndpointsBlocks,
     numArcs: meta.numArcs,
     // Replaced sections re-compress with this default. Pass-through
     // sections preserve their existing codec (their bytes are already
@@ -701,6 +765,12 @@ function shouldCompressSection(name: string, _dtype: DType): boolean {
   if (name === "arc_offsets_partitions") return false;
   if (name === "arc_offsets_blocks") return false;
   if (name === "arc_offsets_dict") return false;
+  // arc_endpoints mirrors arc_offsets exactly: per-partition zstd
+  // frames already compressed, a small u32 block table fetched
+  // eagerly, and an optional trained dict that wouldn't recompress.
+  if (name === "arc_endpoints") return false;
+  if (name === "arc_endpoint_blocks") return false;
+  if (name === "arc_endpoints_dict") return false;
   // Everything else (CSR triples, arc_offsets, properties, strings)
   // compresses freely.
   return true;
@@ -795,6 +865,7 @@ interface AssembleInput {
   readonly metadata: string | undefined;
   readonly arcCoordsBlocks: ContainerMeta["arcCoordsBlocks"];
   readonly arcOffsetsBlocks: ContainerMeta["arcOffsetsBlocks"];
+  readonly arcEndpointsBlocks: ContainerMeta["arcEndpointsBlocks"];
   // Total number of arcs in the topology. With the monolithic
   // arc_offsets path the assembler derived this from the section's
   // byte length; with the partitioned path the section is absent, so
@@ -843,6 +914,7 @@ async function assembleContainer(input: AssembleInput): Promise<Buffer> {
     metadata,
     arcCoordsBlocks,
     arcOffsetsBlocks,
+    arcEndpointsBlocks,
     numArcs,
     compression: codec,
     preserveSourceOrder,
@@ -1213,6 +1285,7 @@ async function assembleContainer(input: AssembleInput): Promise<Buffer> {
     metadata,
     arcCoordsBlocks,
     ...(arcOffsetsBlocks !== undefined ? { arcOffsetsBlocks } : {}),
+    ...(arcEndpointsBlocks !== undefined ? { arcEndpointsBlocks } : {}),
     layers,
     sections: rawSections.map((s, i) => {
       const p = sectionPlacement[i];

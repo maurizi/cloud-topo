@@ -20,6 +20,7 @@ import { tmpdir } from "os";
 import { join } from "path";
 
 import { stderrLog, memSnapshot } from "./util";
+import { VARINT_MAX_BYTES, writeVarintZigzag } from "./format";
 
 // --- Types ---
 
@@ -74,8 +75,13 @@ export interface BlockCompressedArcOffsets {
 // --- Constants ---
 
 // Default block size for block-compressed arc_coords.
-// Aligned to whole arcs at emit time.
-export const DEFAULT_ARC_COORD_BLOCK_BYTES = 8 * 1024;
+// Aligned to whole arcs at emit time. 4 KiB pays a small per-block
+// compression-ratio cost (~10–20% vs 8 KiB) and ~2x the block-table
+// overhead in exchange for materially less block-edge waste on
+// sparse merges — measured on national CDs: ~−12 MiB downloaded /
+// −9% mobile wall-clock vs the previous 8 KiB default. See
+// cloud-topo-bench/bench-out/national/.
+export const DEFAULT_ARC_COORD_BLOCK_BYTES = 4 * 1024;
 
 // Auto-pick dict size from arc_coords uncompressed length.
 // We use a *trained* dict via `zstd --train`.
@@ -478,6 +484,187 @@ export async function blockCompressArcOffsets(
   );
 
   // Concatenate frames + build the [firstArcId, compOff, compLen] table.
+  let totalCompressed = 0;
+  for (const f of compressedFrames) totalCompressed += f.byteLength;
+  const compressedBytes = new Uint8Array(totalCompressed);
+  const blockTableBytes = new Uint8Array(blockSpecs.length * 12);
+  const tableView = new DataView(blockTableBytes.buffer);
+  let cOff = 0;
+  const framesWritable = compressedFrames as unknown as (Buffer | null)[];
+  for (let i = 0; i < blockSpecs.length; i++) {
+    const f = compressedFrames[i];
+    compressedBytes.set(f, cOff);
+    tableView.setUint32(i * 12 + 0, firstArcIdByBlock[i], true);
+    tableView.setUint32(i * 12 + 4, cOff, true);
+    tableView.setUint32(i * 12 + 8, f.byteLength, true);
+    cOff += f.byteLength;
+    framesWritable[i] = null;
+  }
+
+  return {
+    dictBytes,
+    blockTableBytes,
+    compressedBytes,
+    blockCount: blockSpecs.length,
+  };
+}
+
+// --- arc_endpoints (per-arc absolute start + end, partitioned) ---
+
+// Same block boundaries as arc_coords / arc_offsets — partition i
+// covers arc ids [firstArcIdByBlock[i], firstArcIdByBlock[i+1]). Each
+// partition's payload is a zigzag-varint stream over four interleaved
+// channels per arc:
+//   d_startX = startX - prevStartX  (prev = 0 at block start)
+//   d_startY = startY - prevStartY
+//   d_endX   = endX   - startX      (intra-arc span on X)
+//   d_endY   = endY   - startY      (intra-arc span on Y)
+// Interleaved (not concatenated) so the reader decodes one arc at a
+// time without two passes over the buffer. With hierarchical-Hilbert
+// ordering the start-to-start deltas stay small (spatially adjacent
+// arcs), and intra-arc spans are bounded by the arc's quantized
+// bbox — most arcs encode in 4-8 bytes of varint.
+//
+// A partition is independently decodable: the first arc's start is a
+// delta from (0,0), so the decoder doesn't need state from any earlier
+// partition.
+export interface BlockCompressedArcEndpoints {
+  readonly dictBytes: Uint8Array | undefined;
+  // u32 triples [firstArcId, compressedOffset, compressedLength] per
+  // partition. compressedOffset is relative to the start of the
+  // concatenated partitions blob.
+  readonly blockTableBytes: Uint8Array;
+  readonly compressedBytes: Uint8Array;
+  readonly blockCount: number;
+}
+
+// Auto-pick dict size. Same band as arc_offsets — partitions are
+// hundreds of bytes to a few KiB, well below the arc_coords dict
+// regime.
+export function autoArcEndpointsDictBytes(arcEndpointsLength: number): number {
+  return Math.min(
+    arcEndpointsLength,
+    Math.max(
+      ARC_COORD_DICT_MIN,
+      Math.min(ARC_COORD_DICT_DEFAULT, ARC_COORD_DICT_MAX),
+    ),
+  );
+}
+
+export async function blockCompressArcEndpoints(
+  arcEndpoints: Int32Array,
+  blockSpecs: ReadonlyArray<ArcCoordBlockSpec>,
+  arcOffsetsBytes: Uint8Array,
+  options: { dictBytes: number },
+): Promise<BlockCompressedArcEndpoints> {
+  const arcOffsets = new Uint32Array(
+    arcOffsetsBytes.buffer,
+    arcOffsetsBytes.byteOffset,
+    arcOffsetsBytes.byteLength / 4,
+  );
+  const numArcs = arcOffsets.length - 1;
+  if (arcEndpoints.length !== numArcs * 4) {
+    throw new Error(
+      `ctopo: blockCompressArcEndpoints expected ${numArcs * 4} entries, got ${arcEndpoints.length}`,
+    );
+  }
+
+  // Mirror blockCompressArcOffsets' arc-id → block mapping. blockSpecs
+  // is arc-id-ordered and contiguous; one sweep with a moving cursor
+  // recovers each partition's [firstArcId, nextFirstArcId).
+  const firstArcIdByBlock = new Uint32Array(blockSpecs.length + 1);
+  {
+    let blockIdx = 0;
+    let blockEnd = blockSpecs[0].endUncompressed;
+    for (let arcId = 0; arcId < numArcs; arcId++) {
+      const off = arcOffsets[arcId];
+      while (blockIdx < blockSpecs.length - 1 && off >= blockEnd) {
+        blockIdx++;
+        firstArcIdByBlock[blockIdx] = arcId;
+        blockEnd = blockSpecs[blockIdx].endUncompressed;
+      }
+    }
+    firstArcIdByBlock[blockSpecs.length] = numArcs;
+  }
+
+  // Per-partition varint payloads. Worst case 5 bytes × 4 ints per arc
+  // = 20 bytes/arc; allocate scratch at that ceiling and slice down.
+  const payloads = new Array<Uint8Array>(blockSpecs.length);
+  for (let i = 0; i < blockSpecs.length; i++) {
+    const firstArcId = firstArcIdByBlock[i];
+    const nextFirstArcId = firstArcIdByBlock[i + 1];
+    const arcsInBlock = nextFirstArcId - firstArcId;
+    const scratch = new Uint8Array(arcsInBlock * 4 * VARINT_MAX_BYTES);
+    let off = 0;
+    let prevStartX = 0;
+    let prevStartY = 0;
+    for (let a = firstArcId; a < nextFirstArcId; a++) {
+      const base = a * 4;
+      const sx = arcEndpoints[base];
+      const sy = arcEndpoints[base + 1];
+      const ex = arcEndpoints[base + 2];
+      const ey = arcEndpoints[base + 3];
+      off = writeVarintZigzag(sx - prevStartX, scratch, off);
+      off = writeVarintZigzag(sy - prevStartY, scratch, off);
+      off = writeVarintZigzag(ex - sx, scratch, off);
+      off = writeVarintZigzag(ey - sy, scratch, off);
+      prevStartX = sx;
+      prevStartY = sy;
+    }
+    payloads[i] = scratch.subarray(0, off);
+  }
+
+  const dictBytes = await autoPickSharedZstdDict(
+    payloads,
+    options.dictBytes,
+    "arc_endpoints",
+  );
+
+  // Mirror blockCompressArcOffsets' worker-pool pattern.
+  const compressedFrames = new Array<Buffer>(blockSpecs.length);
+  const PROGRESS_EVERY = 1000;
+  const t0 = Date.now();
+  let completed = 0;
+  let rawTotal = 0;
+  for (const p of payloads) rawTotal += p.byteLength;
+  stderrLog(
+    `[blockCompressEndpoints] start: ${blockSpecs.length} partitions, ` +
+      `dict=${dictBytes !== undefined ? `${(dictBytes.byteLength / 1024).toFixed(0)} KiB` : "(none)"}, ` +
+      `arc_endpoints=${(rawTotal / 1024 / 1024).toFixed(2)} MiB raw, ` +
+      `concurrency=${BLOCK_COMPRESS_CONCURRENCY}`,
+  );
+
+  const poolSize = Math.min(BLOCK_COMPRESS_CONCURRENCY, blockSpecs.length);
+  const streams = new Array<ZstdFrameStream>(poolSize);
+  for (let s = 0; s < poolSize; s++) {
+    streams[s] = makeZstdFrameStream(dictBytes);
+  }
+  let cursor = 0;
+  const worker = async (s: ZstdFrameStream): Promise<void> => {
+    while (cursor < blockSpecs.length) {
+      const i = cursor++;
+      compressedFrames[i] = await compressFrame(s, payloads[i]);
+      completed++;
+      if (
+        completed % PROGRESS_EVERY === 0 ||
+        completed === blockSpecs.length
+      ) {
+        stderrLog(
+          `[blockCompressEndpoints] ${completed}/${blockSpecs.length} ` +
+            `t=${((Date.now() - t0) / 1000).toFixed(1)}s ${memSnapshot()}`,
+        );
+      }
+    }
+  };
+  try {
+    await Promise.all(streams.map((s) => worker(s)));
+  } finally {
+    for (const s of streams) closeZstdFrameStream(s);
+  }
+  stderrLog(
+    `[blockCompressEndpoints] done in ${((Date.now() - t0) / 1000).toFixed(1)}s`,
+  );
+
   let totalCompressed = 0;
   for (const f of compressedFrames) totalCompressed += f.byteLength;
   const compressedBytes = new Uint8Array(totalCompressed);

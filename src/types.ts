@@ -169,6 +169,32 @@ export interface ContainerMeta {
     readonly partitionsSection: string;
     readonly blockCount: number;
   };
+  // Present iff the encoder emitted a dedicated arc-endpoints section
+  // (quantized inputs only, opt-in via EncodeOptions.emitArcEndpoints,
+  // default on). For each arc, holds the absolute (startX, startY,
+  // endX, endY) quantized coordinates so mergeArcs / merge endpoint
+  // lookup can skip walking the full arc varint stream in arc_coords.
+  // Block-partitioned along the same arc-id boundaries as
+  // arcCoordsBlocks so a sparse merge's endpoint fetches line up with
+  // its coord fetches (or, in the mergeArcs-only case, replace them
+  // entirely). Absent on legacy files; reader falls back to the
+  // arc_coords varint-walk path when undefined.
+  readonly arcEndpointsBlocks?: {
+    // Trained dict section name. Optional like the other block-
+    // compressed sections.
+    readonly dictSection?: string;
+    // u32 triples [firstArcId, compressedOffset, compressedLength] per
+    // partition. firstArcId is the smallest arc id whose endpoints
+    // live in this partition; the partition covers arc ids
+    // [firstArcId_i, firstArcId_{i+1}). compressedOffset is relative
+    // to the start of partitionsSection. blockCount and the per-block
+    // arc-id ranges match arcCoordsBlocks exactly.
+    readonly blockTableSection: string;
+    // Section name carrying the concatenation of per-block compressed
+    // arc-endpoints frames.
+    readonly partitionsSection: string;
+    readonly blockCount: number;
+  };
   readonly layers: ReadonlyArray<{
     readonly name: string;
     readonly numGeometries: number;

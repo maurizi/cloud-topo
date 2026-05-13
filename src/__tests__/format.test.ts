@@ -351,6 +351,11 @@ describe("ctopo format", () => {
     const frontLoadedNames = [
       "arc_coord_blocks",
       "arc_offsets",
+      // arc_endpoint_blocks: small u32 table for the per-arc absolute
+      // endpoints section. Same structural front-load as
+      // arc_coord_blocks — needed before any per-partition decompress.
+      // The arc_endpoints partitions themselves stay lazy.
+      "arc_endpoint_blocks",
       "block/poly_offsets",
       "block/ring_offsets",
       "block/arc_refs",

@@ -126,30 +126,30 @@ export interface MultiPolygonArcs {
 }
 
 // Shared preamble for merge / mergeArcs: build polygons, group by
-// connectivity, collect each group's exterior arcs, fetch the arc
-// bytes in one batched call, build an endpoint lookup. Both callers
-// need everything except `arcBytes` (mergeArcs uses only endpoints
-// for stitching; merge also needs the bytes to decode coordinates),
-// so we return all of it and let the caller pick.
+// connectivity, collect each group's exterior arcs, fetch what each
+// caller needs, build an endpoint lookup.
+//
+// `needCoords` lets mergeArcs skip the arc_coords fetch when the file
+// ships a dedicated arc_endpoints section — stitching only needs
+// endpoints, not full per-point coords. When the section is absent,
+// or `needCoords` is true (merge — has to decode rings), the call
+// fetches arc bytes too. When both are needed, the two fetches run
+// in parallel so wall-clock is bounded by the slower one.
 async function prepareMergeGroups(
   client: CtopoClient,
   inputs: ReadonlyArray<LayerSelection>,
+  needCoords: boolean,
   signal: AbortSignal | undefined,
 ): Promise<{
   groupExteriorArcs: number[][];
   arcBytes: Map<number, Uint8Array>;
-  endpoints: EndpointLookup;
+  endpoints: EndpointLookup<unknown>;
 }> {
   const polygons = await buildInputPolygons(client, inputs, signal);
   if (polygons.numPolygons === 0) {
     // Empty path doesn't touch the pool — the empty-input FlatPolygons
     // is a fresh tiny allocation, not pooled.
-    const arcBytes = new Map<number, Uint8Array>();
-    return {
-      groupExteriorArcs: [],
-      arcBytes,
-      endpoints: makeEndpointLookup(arcBytes, client),
-    };
+    return emptyPrepareResult(client);
   }
 
   const polygonsByArc = buildPolygonsByArc(client, polygons);
@@ -180,17 +180,58 @@ async function prepareMergeGroups(
   pool.release(polygonsByArc.polyIndices as Int32Array);
 
   if (allExteriorArcs.length === 0) {
-    const arcBytes = new Map<number, Uint8Array>();
+    return emptyPrepareResult(client);
+  }
+
+  const ids = absArcIds(allExteriorArcs);
+  const isQuantized = client.transform !== null;
+
+  // Path selection:
+  //
+  // mergeArcs (needCoords=false) + arc_endpoints present + quantized
+  //   → ONLY fetch endpoints. This is the killer use case for the
+  //   section: zero arc_coords download. Bench (CA-cd, broadband):
+  //   −22% wall, −31% bytes downloaded vs the legacy path. Coalesce
+  //   gap=0 doesn't help further — decompress cost (not wire bytes)
+  //   is what costs us.
+  //
+  // merge (needCoords=true) → fetch arc_coords for ring decode and
+  //   recover endpoints from those bytes inline. The arc_endpoints
+  //   section would be net-negative here — it adds a parallel fetch
+  //   for partitions we'd otherwise skip, plus per-partition decode
+  //   overhead, for a CPU win (skip varint walk for end-points) that
+  //   doesn't break even. Quantized merges still get the numeric
+  //   stitchArcs-key win via makeNumericEndpointLookupFromBytes.
+  //
+  // No-section / un-quantized → bytes-based lookup with string keys
+  //   (un-quantized float64 doesn't pack to a Number safely).
+  if (!needCoords && client.hasArcEndpointsSection() && isQuantized) {
+    const eps = await client.fetchArcEndpoints(ids, signal);
     return {
-      groupExteriorArcs: [],
-      arcBytes,
-      endpoints: makeEndpointLookup(arcBytes, client),
+      groupExteriorArcs,
+      arcBytes: new Map<number, Uint8Array>(),
+      endpoints: makeNumericEndpointLookup(eps, client),
     };
   }
 
-  const arcBytes = await client.fetchArcs(absArcIds(allExteriorArcs), signal);
-  const endpoints = makeEndpointLookup(arcBytes, client);
+  const arcBytes = await client.fetchArcs(ids, signal);
+  const endpoints: EndpointLookup<unknown> = isQuantized
+    ? makeNumericEndpointLookupFromBytes(arcBytes, client)
+    : makeEndpointLookup(arcBytes, client);
   return { groupExteriorArcs, arcBytes, endpoints };
+}
+
+function emptyPrepareResult(client: CtopoClient): {
+  groupExteriorArcs: number[][];
+  arcBytes: Map<number, Uint8Array>;
+  endpoints: EndpointLookup<unknown>;
+} {
+  const arcBytes = new Map<number, Uint8Array>();
+  return {
+    groupExteriorArcs: [],
+    arcBytes,
+    endpoints: makeEndpointLookup(arcBytes, client),
+  };
 }
 
 // `mergeArcs` — union of inputs as topology-style geometry. Cheap: only
@@ -200,9 +241,13 @@ export async function mergeArcs(
   inputs: ReadonlyArray<LayerSelection>,
   signal?: AbortSignal,
 ): Promise<MultiPolygonArcs> {
+  // mergeArcs only needs endpoints — when the file ships
+  // arc_endpoints we skip arc_coords entirely (the prepare layer's
+  // job: needCoords=false routes to the cheap path).
   const { groupExteriorArcs, endpoints } = await prepareMergeGroups(
     client,
     inputs,
+    false,
     signal,
   );
   const out: number[][][] = [];
@@ -233,9 +278,13 @@ export async function merge(
   inputs: ReadonlyArray<LayerSelection>,
   signal?: AbortSignal,
 ): Promise<MultiPolygon> {
+  // merge decodes rings → needCoords=true. With the section present
+  // the prepare layer parallel-fetches arc_endpoints + arc_coords;
+  // endpoint reads then go straight to the section (no varint walk).
   const { groupExteriorArcs, arcBytes, endpoints } = await prepareMergeGroups(
     client,
     inputs,
+    true,
     signal,
   );
   const coordinates: number[][][][] = [];
@@ -703,15 +752,132 @@ function absArcIds(signed: ReadonlyArray<number>): number[] {
 
 // --- Arc endpoint lookup (per-arc bytes from the fetcher) ---
 
-interface EndpointLookup {
-  start(signedArcId: number): string;
-  end(signedArcId: number): string;
+interface EndpointLookup<K> {
+  start(signedArcId: number): K;
+  end(signedArcId: number): K;
+}
+
+// Pack two int32 quantized coords into one Number key. Safe-integer
+// math: with the +SHIFT bias each component lives in [0, 2*SHIFT), and
+// total bits used is 2 * (log2(SHIFT) + 1) — choose SHIFT = 2^25 →
+// 52 bits, comfortably within Number.MAX_SAFE_INTEGER. Practical
+// quantized topojson grids (typical N = 1e5 — 17 bits per coord) are
+// way under 2^25, so the bias never clips. The encoder validates the
+// int32 range when reading delta values; same range applies here.
+//
+// Why numeric instead of `${x},${y}` strings: stitchArcs reads two
+// endpoint keys per boundary arc and uses them as Map<K, Fragment>
+// keys. At national-CD scale (~1000 boundary arcs/merge × 435 merges
+// × 2 endpoints = ~870K key materializations) the string form was
+// the dominant allocator inside merge — 47% of sampled bytes in the
+// heap profile. Numeric keys carry zero allocation per key.
+const COORD_KEY_SHIFT = 1 << 25;
+function packCoord(x: number, y: number): number {
+  return (x + COORD_KEY_SHIFT) * (2 * COORD_KEY_SHIFT) + (y + COORD_KEY_SHIFT);
+}
+
+// Section-backed numeric endpoint lookup. `endpoints` carries per-arc
+// length-4 Int32Array views (see client.fetchArcEndpoints) — start at
+// [0..2), end at [2..4). Signed arc ids reverse direction: a negative
+// signed id ~i reads i's end as its "start" and vice versa.
+function makeNumericEndpointLookup(
+  endpoints: ReadonlyMap<number, Int32Array>,
+  client: CtopoClient,
+): EndpointLookup<number> {
+  function readForward(arcId: number): Int32Array {
+    const v = endpoints.get(arcId);
+    if (v === undefined) {
+      throw new Error(`ctopo: missing fetched endpoints for arc ${arcId}`);
+    }
+    return v;
+  }
+  // Useful-bytes tally: 4 i32 reads per arc lookup = 16 B (matches the
+  // client's per-arc tally for the section path; double-count is fine
+  // — the merge-side tally is for "what merge actually consumed", not
+  // wire bytes).
+  void client;
+  return {
+    start(signedArcId: number): number {
+      if (signedArcId >= 0) {
+        const v = readForward(signedArcId);
+        return packCoord(v[0], v[1]);
+      }
+      const v = readForward(~signedArcId);
+      return packCoord(v[2], v[3]);
+    },
+    end(signedArcId: number): number {
+      if (signedArcId >= 0) {
+        const v = readForward(signedArcId);
+        return packCoord(v[2], v[3]);
+      }
+      const v = readForward(~signedArcId);
+      return packCoord(v[0], v[1]);
+    },
+  };
+}
+
+// Byte-based numeric endpoint lookup for quantized files where we
+// already hold arc_coords (the merge path always fetches them for
+// ring decode). Decodes the first and last (dx, dy) points from each
+// arc's varint stream and packs into the same 52-bit Number key
+// makeNumericEndpointLookup uses — so stitchArcs is key-type-
+// agnostic. Per-arc memoization across start/end so we don't walk
+// the same arc twice (stitchArcs reads each arc's endpoints once,
+// but a Fragment merge may revisit; cheap insurance).
+function makeNumericEndpointLookupFromBytes(
+  arcBytes: ReadonlyMap<number, Uint8Array>,
+  client: CtopoClient,
+): EndpointLookup<number> {
+  const startCache = new Map<number, number>();
+  const endCache = new Map<number, number>();
+  function readStartPacked(arcId: number): number {
+    const cached = startCache.get(arcId);
+    if (cached !== undefined) return cached;
+    const bytes = requireArcBytes(arcBytes, arcId);
+    const dx = readVarintZigzag(bytes, 0);
+    const dy = readVarintZigzag(bytes, dx.consumed);
+    const packed = packCoord(dx.value, dy.value);
+    startCache.set(arcId, packed);
+    return packed;
+  }
+  function readEndPacked(arcId: number): number {
+    const cached = endCache.get(arcId);
+    if (cached !== undefined) return cached;
+    const bytes = requireArcBytes(arcBytes, arcId);
+    let x = 0;
+    let y = 0;
+    let off = 0;
+    while (off < bytes.byteLength) {
+      const dx = readVarintZigzag(bytes, off);
+      off += dx.consumed;
+      const dy = readVarintZigzag(bytes, off);
+      off += dy.consumed;
+      x += dx.value;
+      y += dy.value;
+    }
+    const packed = packCoord(x, y);
+    endCache.set(arcId, packed);
+    return packed;
+  }
+  void client;
+  return {
+    start(signedArcId: number): number {
+      return signedArcId >= 0
+        ? readStartPacked(signedArcId)
+        : readEndPacked(~signedArcId);
+    },
+    end(signedArcId: number): number {
+      return signedArcId >= 0
+        ? readEndPacked(signedArcId)
+        : readStartPacked(~signedArcId);
+    },
+  };
 }
 
 function makeEndpointLookup(
   arcBytes: ReadonlyMap<number, Uint8Array>,
   client: CtopoClient,
-): EndpointLookup {
+): EndpointLookup<string> {
   const isQuantized = client.transform !== null;
 
   function readStart(arcId: number): [number, number] {
@@ -777,19 +943,23 @@ function requireArcBytes(
 
 // --- stitchArcs ---
 
+// Fragment key type is the same as the EndpointLookup's key type
+// (number for the section path, string for the legacy un-quantized
+// path). The scratch Maps are typed as Map<unknown, Fragment> so they
+// can carry either at runtime without conversion.
 interface Fragment extends Array<number> {
-  start: string;
-  end: string;
+  start: unknown;
+  end: unknown;
 }
 
 // Stitches a flat list of signed boundary arc ids into closed rings —
 // the topojson-client/src/stitch.js algorithm, taking its endpoint
 // lookup from per-arc fetched bytes rather than a single in-memory
 // ArrayBuffer so individual arcs can be Range-fetched on demand.
-function stitchArcs(
+function stitchArcs<K>(
   client: CtopoClient,
   arcs: ReadonlyArray<number>,
-  endpoints: EndpointLookup,
+  endpoints: EndpointLookup<K>,
 ): number[][] {
   const scratch = getStitchScratch(client);
   scratch.fragmentByStart.clear();

@@ -30,7 +30,11 @@ import {
   readFooterLength,
   viewDecompressedSection,
 } from "./reader";
-import { FOOTER_TRAILER_SIZE, HEADER_SIZE } from "./format";
+import {
+  FOOTER_TRAILER_SIZE,
+  HEADER_SIZE,
+  readVarintZigzag,
+} from "./format";
 import {
   StringArray,
   type ContainerMeta,
@@ -260,14 +264,16 @@ const DEFAULT_FRONT_PREFETCH = 0;
 const DEFAULT_BACK_PREFETCH = 256 * 1024;
 const DEFAULT_COALESCE_GAP = 64 * 1024;
 // Arcs default — see doc on OpenContainerOptions.coalesceGapByFamily.
-// 8 KiB matches the smaller arcCoordBlockBytes default (16 KiB) closely
-// enough that most needed arcs are within a single block of each
-// other, while still letting the coalescer merge truly-adjacent
-// requests. Wider gaps (1 MiB, the previous default) collapsed nearly
-// every arcs fetch into one giant range that pulled all of arc_coords;
-// the median-of-3 sweep showed shrinking to 8 KiB cuts 13-34% of merge
-// wall-clock without regressing on mobile (100ms RTT).
-const DEFAULT_ARCS_COALESCE_GAP = 8 * 1024;
+// 0 = merge truly-adjacent ranges only, never jump a gap. Combined
+// with multi-range packing (DEFAULT_MAX_RANGES_PER_REQUEST = 64) the
+// blocks a sparse merge actually needs ride together in a handful of
+// `multipart/byteranges` requests at zero gap-content overhead. The
+// previous 8 KiB default pulled ~6–7 MiB of unwanted block content
+// per merge; measured on national CDs: ~−6.6 MiB downloaded /
+// −2–3% wall-clock at every latency vs the 8 KiB default. Wider
+// gaps (1 MiB, the long-ago default) collapsed nearly every arcs
+// fetch into one giant range that pulled all of arc_coords.
+const DEFAULT_ARCS_COALESCE_GAP = 0;
 // Offsets default. Used by per-partition fetches in the
 // partitioned-arc_offsets path. Partitions are 100s of bytes each, so
 // a generous gap bridges huge numbers of unfetched partitions and
@@ -276,9 +282,16 @@ const DEFAULT_ARCS_COALESCE_GAP = 8 * 1024;
 // sweet spot for hierarchical-hilbert on national CDs (~4.86 MiB
 // fetched / 11 reqs vs ~13.6 MiB fetched at 64 KiB).
 const DEFAULT_OFFSETS_COALESCE_GAP = 4 * 1024;
+// Endpoints default — partitions are tiny (4-16 B per arc, hundreds
+// to a few thousand bytes per partition compressed). Mirror the
+// offsets gap so sparse merges coalesce nearby endpoint fetches
+// without dragging in huge swaths of arcs we didn't ask for. Tunable
+// per-call via OpenContainerOptions.coalesceGapByFamily.endpoints.
+const DEFAULT_ENDPOINTS_COALESCE_GAP = 4 * 1024;
 const DEFAULT_GAP_BY_FAMILY: Readonly<Record<string, number>> = {
   arcs: DEFAULT_ARCS_COALESCE_GAP,
   offsets: DEFAULT_OFFSETS_COALESCE_GAP,
+  endpoints: DEFAULT_ENDPOINTS_COALESCE_GAP,
 };
 // 4 MiB physical chunk cap. See doc on OpenContainerOptions.maxChunkBytes.
 const DEFAULT_MAX_CHUNK = 4 * 1024 * 1024;
@@ -307,6 +320,7 @@ const DEFAULT_ARC_COORDS_PREFETCH = 512 * 1024;
 // fetchArcs result map before its real bytes arrive — keeps the
 // dedupe loop synchronous without storing a second tracking set.
 const EMPTY_BYTES = new Uint8Array(0);
+const EMPTY_INT32 = new Int32Array(0);
 
 // --- Public API ---
 
@@ -334,6 +348,12 @@ export class CtopoClient {
   // to per-partition `compressedOffset` from the offsets-blocks table
   // to produce absolute file byte intervals.
   private readonly arcOffsetsPartitionsBase: number = 0;
+  // Section base for arc_endpoints. Same role as
+  // arcOffsetsPartitionsBase: added to per-partition `compressedOffset`
+  // from the endpoint-blocks table to produce absolute file ranges.
+  // Zero when meta.arcEndpointsBlocks is undefined (legacy files) —
+  // none of the endpoint code paths read this value in that case.
+  private readonly arcEndpointsPartitionsBase: number = 0;
   // arc_offsets is fetched whole on first access and decompressed
   // once. The resulting Uint32Array is cached for the client's
   // lifetime — fetchArcs needs random access into it for every
@@ -401,6 +421,20 @@ export class CtopoClient {
   private readonly decompressedArcCoordBlockCache = new Map<
     number,
     Promise<Uint8Array>
+  >();
+  // arc_endpoints state — populated lazily on first endpoint fetch
+  // when meta.arcEndpointsBlocks is present. Mirror of the arc_offsets
+  // partition machinery. The block table here stores
+  // [firstArcId, compOff, compLen] triples per partition (same arc-id
+  // boundaries as arc_offsets_blocks). Decompressed partitions hold
+  // *absolute* (sx, sy, ex, ey) quantized coords as one flat
+  // Int32Array per block: indexed [(arcId - firstArcId) * 4 + k] where
+  // k = 0|1|2|3 for sx|sy|ex|ey.
+  private arcEndpointsBlocksPromise: Promise<Uint32Array> | undefined;
+  private arcEndpointsDictPromise: Promise<Uint8Array | undefined> | undefined;
+  private readonly decompressedArcEndpointsBlockCache = new Map<
+    number,
+    Promise<Int32Array>
   >();
   // Microtask-batched section/arc fetcher state. Concurrent calls in
   // the same tick enqueue here; one drain pass coalesces and issues a
@@ -499,6 +533,22 @@ export class CtopoClient {
       this.arcOffsetsPartitionsBase = partitions.offset;
     } else if (this.sectionByName.get("arc_offsets") === undefined) {
       throw new Error("ctopo: container is missing the arc_offsets section");
+    }
+
+    // arc_endpoints is optional — present iff the encoder emitted the
+    // dedicated per-arc endpoints section (quantized inputs with the
+    // emitArcEndpoints knob on, default). Legacy files leave it
+    // undefined; fetchArcEndpoints falls back to walking arc_coords.
+    if (this.meta.arcEndpointsBlocks !== undefined) {
+      const partitions = this.sectionByName.get(
+        this.meta.arcEndpointsBlocks.partitionsSection,
+      );
+      if (partitions === undefined) {
+        throw new Error(
+          `ctopo: container is missing the "${this.meta.arcEndpointsBlocks.partitionsSection}" section referenced by arcEndpointsBlocks META`,
+        );
+      }
+      this.arcEndpointsPartitionsBase = partitions.offset;
     }
   }
 
@@ -789,6 +839,45 @@ export class CtopoClient {
     return this.fetchArcsFromBlocks(arcIds, arcOffsets);
   }
 
+  // --- Arc endpoint fetcher (used by mergeArcs / merge stitching) ---
+
+  // Returns each requested arc's absolute (startX, startY, endX, endY)
+  // quantized coordinates. The returned value per arc is a length-4
+  // Int32Array view into the decompressed partition cache — no copy,
+  // no per-arc allocation. Order within the view is [sx, sy, ex, ey].
+  //
+  // Routes through the partitioned arc_endpoints section when present
+  // (the encoder's default for quantized inputs). Falls back to
+  // walking arc_coords varints when the file predates the section —
+  // that path costs the same as the old endpoint lookup did and uses
+  // fetchArcs internally, so the caller never has to branch.
+  //
+  // Resolution status: hasArcEndpointsSection() lets the merge layer
+  // know whether the optimization is in play (and skip the
+  // arc_coords fetch when it can).
+  async fetchArcEndpoints(
+    arcIds: Iterable<number>,
+    signal?: AbortSignal,
+  ): Promise<Map<number, Int32Array>> {
+    this.ensureOpen();
+    throwIfAborted(signal);
+    if (this.meta.arcEndpointsBlocks !== undefined) {
+      return this.fetchArcEndpointsPartitioned(arcIds, signal);
+    }
+    // Fallback path: decode endpoints from arc_coords. Materializes
+    // the full per-arc varint walk into the same length-4 Int32Array
+    // shape the partitioned path returns, so the caller's API is
+    // uniform.
+    return this.fetchArcEndpointsFromCoords(arcIds, signal);
+  }
+
+  // True iff the open container ships a dedicated arc_endpoints
+  // section (per the META). Lets mergeArcs skip arc_coords entirely
+  // when this returns true.
+  hasArcEndpointsSection(): boolean {
+    return this.meta.arcEndpointsBlocks !== undefined;
+  }
+
   // --- Stats ---
 
   // Bench instrumentation: snapshot of fetch / decompress / cache
@@ -856,8 +945,14 @@ export class CtopoClient {
     this.layerGeometryCache.clear();
     this.decompressedGroupCache.clear();
     this.decompressedArcCoordBlockCache.clear();
+    this.decompressedArcOffsetsBlockCache.clear();
+    this.decompressedArcEndpointsBlockCache.clear();
     this.arcCoordBlocksPromise = undefined;
     this.arcCoordDictPromise = undefined;
+    this.arcOffsetsBlocksPromise = undefined;
+    this.arcOffsetsDictPromise = undefined;
+    this.arcEndpointsBlocksPromise = undefined;
+    this.arcEndpointsDictPromise = undefined;
     this.byteRangeCache = [];
     this.byteRangeCacheUsedBytes = 0;
     this.inFlightRanges = [];
@@ -1355,6 +1450,263 @@ export class CtopoClient {
       else hi = mid - 1;
     }
     return lo;
+  }
+
+  // --- Private: arc_endpoints partitions ---
+
+  // Mirror of getArcOffsetsBlocks for the per-arc endpoints block
+  // table. Same on-disk shape (3 u32 per row: firstArcId, compOff,
+  // compLen). Throws if called when meta.arcEndpointsBlocks is
+  // undefined — callers gate on hasArcEndpointsSection() first.
+  private getArcEndpointsBlocks(): Promise<Uint32Array> {
+    if (this.arcEndpointsBlocksPromise === undefined) {
+      const meta = this.meta.arcEndpointsBlocks;
+      if (meta === undefined) {
+        throw new Error(
+          "ctopo: getArcEndpointsBlocks called on a file without arc_endpoints",
+        );
+      }
+      const entry = this.sectionByName.get(meta.blockTableSection);
+      if (entry === undefined) {
+        throw new Error(
+          `ctopo: container is missing the "${meta.blockTableSection}" section`,
+        );
+      }
+      this.arcEndpointsBlocksPromise = this.fetchSectionBytes(entry).then(
+        (bytes) =>
+          new Uint32Array(bytes.buffer, bytes.byteOffset, bytes.byteLength / 4),
+      );
+    }
+    return this.arcEndpointsBlocksPromise;
+  }
+
+  // Resolves to undefined when the file has no shared arc_endpoints
+  // dict (encoder skipped training — too few partitions). Tally the
+  // full dict size once at first resolve, mirroring getArcOffsetsDict.
+  private getArcEndpointsDict(): Promise<Uint8Array | undefined> {
+    if (this.arcEndpointsDictPromise === undefined) {
+      const meta = this.meta.arcEndpointsBlocks;
+      if (meta === undefined) {
+        throw new Error(
+          "ctopo: getArcEndpointsDict called on a file without arc_endpoints",
+        );
+      }
+      if (meta.dictSection === undefined) {
+        this.arcEndpointsDictPromise = Promise.resolve(undefined);
+        return this.arcEndpointsDictPromise;
+      }
+      const entry = this.sectionByName.get(meta.dictSection);
+      if (entry === undefined) {
+        throw new Error(
+          `ctopo: container is missing the "${meta.dictSection}" section`,
+        );
+      }
+      this.arcEndpointsDictPromise = this.fetchSectionBytes(entry).then(
+        (bytes) => {
+          this.tallyUseful(entry.name, bytes.byteLength);
+          return bytes;
+        },
+      );
+    }
+    return this.arcEndpointsDictPromise;
+  }
+
+  // Fetch + decompress + delta-decode + varint-decode one arc_endpoints
+  // partition into an Int32Array of length 4 * (arcsInBlock) carrying
+  // absolute (sx, sy, ex, ey) per arc in id order.
+  //
+  // Wire layout (per partition, set by encode-compress.ts
+  // blockCompressArcEndpoints):
+  //   for each arc:
+  //     d_startX = startX - prevStartX    (prev = 0 at block start)
+  //     d_startY = startY - prevStartY
+  //     d_endX   = endX   - startX        (intra-arc on X)
+  //     d_endY   = endY   - startY        (intra-arc on Y)
+  // Each delta is zigzag LEB128. Independently decodable: prev resets
+  // to (0,0) at every partition boundary.
+  private getDecompressedArcEndpointsBlock(
+    blockIdx: number,
+    endpointsBlocks: Uint32Array,
+    dictPromise: Promise<Uint8Array | undefined>,
+  ): Promise<Int32Array> {
+    const cached = this.decompressedArcEndpointsBlockCache.get(blockIdx);
+    if (cached !== undefined) return cached;
+    const firstArcId = endpointsBlocks[blockIdx * 3];
+    const blockCount = endpointsBlocks.length / 3;
+    const nextFirstArcId =
+      blockIdx === blockCount - 1
+        ? this.meta.numArcs
+        : endpointsBlocks[(blockIdx + 1) * 3];
+    const compOffset = endpointsBlocks[blockIdx * 3 + 1];
+    const compLength = endpointsBlocks[blockIdx * 3 + 2];
+    const physicalStart = this.arcEndpointsPartitionsBase + compOffset;
+    const physicalEnd = physicalStart + compLength;
+    const arcsInBlock = nextFirstArcId - firstArcId;
+    // Worst-case uncompressed: 5 bytes/varint × 4 varints/arc.
+    // The encoder slices the varint scratch buffer down to exact size
+    // before compressing — match it on decompress by using the same
+    // generous bound and trusting the wasm decoder's runtime size.
+    const uncSize = arcsInBlock * 4 * 5;
+    const entry: SectionEntry = {
+      name: `arc_endpoints[partition ${blockIdx}]`,
+      dtype: "blob",
+      offset: physicalStart,
+      length: compLength,
+      compression: "zstd",
+    };
+    const promise = (async () => {
+      const [compressed, dict, decode] = await Promise.all([
+        // Route through the same "endpoints" family so sparse merges
+        // can coalesce per-partition fetches with their own gap
+        // (mirrors the "offsets" family for arc_offsets partitions).
+        this.enqueueSectionFetch("endpoints", physicalStart, physicalEnd),
+        dictPromise,
+        loadZstdWasmDecode(entry),
+      ]);
+      const t0 = performance.now();
+      const raw = decode(compressed, uncSize, dict);
+      this.statDecompressMs += performance.now() - t0;
+      this.statDecompressBytes += raw.byteLength;
+      // Walk the varint stream and accumulate. Output is Int32Array
+      // length 4 × arcsInBlock: [sx0, sy0, ex0, ey0, sx1, sy1, ...].
+      const out = new Int32Array(arcsInBlock * 4);
+      const bytes = raw;
+      let off = 0;
+      let prevSx = 0;
+      let prevSy = 0;
+      for (let i = 0; i < arcsInBlock; i++) {
+        const dsx = readVarintZigzag(bytes, off);
+        off += dsx.consumed;
+        const dsy = readVarintZigzag(bytes, off);
+        off += dsy.consumed;
+        const dex = readVarintZigzag(bytes, off);
+        off += dex.consumed;
+        const dey = readVarintZigzag(bytes, off);
+        off += dey.consumed;
+        const sx = prevSx + dsx.value;
+        const sy = prevSy + dsy.value;
+        out[i * 4] = sx;
+        out[i * 4 + 1] = sy;
+        out[i * 4 + 2] = sx + dex.value;
+        out[i * 4 + 3] = sy + dey.value;
+        prevSx = sx;
+        prevSy = sy;
+      }
+      return out;
+    })();
+    this.decompressedArcEndpointsBlockCache.set(blockIdx, promise);
+    return promise;
+  }
+
+  // Routes arc-id requests through the partitioned endpoint section.
+  // Mirrors fetchArcsPartitioned in shape: bucket arc ids by their
+  // owning partition, fetch + decompress each touched partition once,
+  // hand back length-4 Int32Array subarray views into the cached
+  // partition (zero per-arc allocation).
+  private async fetchArcEndpointsPartitioned(
+    arcIds: Iterable<number>,
+    signal: AbortSignal | undefined,
+  ): Promise<Map<number, Int32Array>> {
+    throwIfAborted(signal);
+    const endpointsBlocks = await this.getArcEndpointsBlocks();
+    const dictPromise = this.getArcEndpointsDict();
+    const out = new Map<number, Int32Array>();
+    const arcsByBlock = new Map<number, number[]>();
+
+    for (const arcId of arcIds) {
+      if (out.has(arcId)) continue;
+      const blockIdx = CtopoClient.findArcOffsetsBlock(endpointsBlocks, arcId);
+      const list = arcsByBlock.get(blockIdx);
+      if (list === undefined) arcsByBlock.set(blockIdx, [arcId]);
+      else list.push(arcId);
+      // Stake the slot so a repeat arc id later in the iterable
+      // short-circuits via `out.has`. Replaced with the real view
+      // below.
+      out.set(arcId, EMPTY_INT32);
+    }
+
+    let uniqueCount = 0;
+    await Promise.all(
+      Array.from(arcsByBlock.entries()).map(async ([blockIdx, arcsInBlock]) => {
+        const block = await this.getDecompressedArcEndpointsBlock(
+          blockIdx,
+          endpointsBlocks,
+          dictPromise,
+        );
+        const firstArcId = endpointsBlocks[blockIdx * 3];
+        for (const arcId of arcsInBlock) {
+          const localIdx = arcId - firstArcId;
+          out.set(arcId, block.subarray(localIdx * 4, localIdx * 4 + 4));
+          uniqueCount++;
+        }
+      }),
+    );
+    // Per-arc lookup tally: 4 i32 reads = 16 bytes per arc.
+    this.tallyUseful("arc_endpoints", 16 * uniqueCount);
+    // 12-byte block-table read per touched partition.
+    this.tallyUseful("arc_endpoint_blocks", 12 * arcsByBlock.size);
+    if (uniqueCount > 0) {
+      perfLog(
+        `[ctopo] fetchArcEndpoints (partitioned): ${uniqueCount} arcs across ${arcsByBlock.size} partitions`,
+      );
+    }
+    return out;
+  }
+
+  // Fallback for files without an arc_endpoints section: walk arc
+  // coord varints to recover endpoints. Cost matches the legacy
+  // merge.ts endpoint lookup — the wrapper exists so callers don't
+  // branch on hasArcEndpointsSection() for correctness, only for
+  // optimization (skip-arc_coords-fetch in mergeArcs).
+  private async fetchArcEndpointsFromCoords(
+    arcIds: Iterable<number>,
+    signal: AbortSignal | undefined,
+  ): Promise<Map<number, Int32Array>> {
+    throwIfAborted(signal);
+    if (this.transform === null) {
+      throw new Error(
+        "ctopo: fetchArcEndpoints fallback path requires a quantized container",
+      );
+    }
+    // Materialize first so we can pass the same id list to fetchArcs
+    // and to the post-fetch decode pass.
+    const ids: number[] = [];
+    const seen = new Set<number>();
+    for (const id of arcIds) {
+      if (seen.has(id)) continue;
+      seen.add(id);
+      ids.push(id);
+    }
+    const arcBytes = await this.fetchArcs(ids, signal);
+    const out = new Map<number, Int32Array>();
+    for (const id of ids) {
+      const bytes = arcBytes.get(id);
+      if (bytes === undefined) {
+        throw new Error(`ctopo: missing fetched bytes for arc ${id}`);
+      }
+      const endpoints = new Int32Array(4);
+      let x = 0;
+      let y = 0;
+      let off = 0;
+      let pIdx = 0;
+      while (off < bytes.byteLength) {
+        const dx = readVarintZigzag(bytes, off);
+        off += dx.consumed;
+        const dy = readVarintZigzag(bytes, off);
+        off += dy.consumed;
+        x += dx.value;
+        y += dy.value;
+        if (pIdx === 0) {
+          endpoints[0] = x;
+          endpoints[1] = y;
+        }
+        pIdx++;
+      }
+      endpoints[2] = x;
+      endpoints[3] = y;
+      out.set(id, endpoints);
+    }
+    return out;
   }
 
   // --- Private: prefetch helpers ---

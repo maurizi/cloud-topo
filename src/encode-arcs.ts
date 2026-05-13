@@ -62,6 +62,15 @@ export type SpatialSort =
 
 // --- Public API ---
 
+// Per-arc absolute endpoints, computed during the same arc walk that
+// emits arc_coords. Layout is interleaved [startX, startY, endX, endY]
+// per arc — i.e. arc id `k` reads from indices [4k, 4k+4). Int32Array
+// for the quantized path; the un-quantized path skips endpoint capture
+// (a 4×f64 section would be enormous and we'd need a different format).
+export interface ArcEndpoints {
+  readonly bytes: Int32Array;
+}
+
 export function buildArcSections(
   topology: Topology,
   arcOrder: Uint32Array,
@@ -69,6 +78,10 @@ export function buildArcSections(
   arcOffsetsBytes: Uint8Array;
   arcCoordsBytes: Uint8Array;
   bytesPerPoint: 8 | 16;
+  // Per-arc absolute (startX, startY, endX, endY) — quantized path
+  // only. Undefined when the input is un-quantized. Caller decides
+  // whether to encode this into a dedicated section.
+  arcEndpoints: ArcEndpoints | undefined;
 } {
   const numArcs = topology.arcs.length;
   const isQuantized = topology.transform !== undefined;
@@ -97,6 +110,7 @@ export function buildArcSections(
       arcOffsetsBytes: typedArrayBytes(offsets),
       arcCoordsBytes: coords,
       bytesPerPoint,
+      arcEndpoints: undefined,
     };
   }
 
@@ -104,15 +118,37 @@ export function buildArcSections(
   // varint(zigzag(dx)) varint(zigzag(dy)) — typical deltas (< 256
   // quantization units) shrink from 8 bytes to 2-3 bytes per point.
   // Allocate the worst case (10 bytes per point) up front, slice at end.
+  //
+  // We also capture per-arc absolute (start, end) endpoints in the
+  // same walk — they're a free byproduct of running the dx/dy
+  // accumulator that the merge-side stitcher would otherwise have to
+  // rebuild via a full varint walk per boundary arc.
   const scratch = new Uint8Array(totalPoints * 2 * VARINT_MAX_BYTES);
+  const endpointsBuf = new Int32Array(numArcs * 4);
   let byteOffset = 0;
   for (let newId = 0; newId < numArcs; newId++) {
     offsets[newId] = byteOffset;
     const arc = topology.arcs[arcOrder[newId]];
+    let absX = 0;
+    let absY = 0;
+    let pIdx = 0;
     for (const point of arc) {
-      byteOffset = writeVarintZigzag(point[0], scratch, byteOffset);
-      byteOffset = writeVarintZigzag(point[1], scratch, byteOffset);
+      const dx = point[0];
+      const dy = point[1];
+      byteOffset = writeVarintZigzag(dx, scratch, byteOffset);
+      byteOffset = writeVarintZigzag(dy, scratch, byteOffset);
+      absX += dx;
+      absY += dy;
+      if (pIdx === 0) {
+        endpointsBuf[newId * 4] = absX;
+        endpointsBuf[newId * 4 + 1] = absY;
+      }
+      pIdx++;
     }
+    // arc.length === 0 leaves all four entries at 0, matching the
+    // "no points" arc the varint stream encodes (a zero-byte slice).
+    endpointsBuf[newId * 4 + 2] = absX;
+    endpointsBuf[newId * 4 + 3] = absY;
   }
   offsets[numArcs] = byteOffset;
   const coords = scratch.subarray(0, byteOffset);
@@ -121,6 +157,7 @@ export function buildArcSections(
     arcOffsetsBytes: typedArrayBytes(offsets),
     arcCoordsBytes: coords,
     bytesPerPoint,
+    arcEndpoints: { bytes: endpointsBuf },
   };
 }
 

@@ -8,6 +8,52 @@ import { type Topology } from "topojson-specification";
 import { CtopoClient } from "../client";
 import { makeBufferFetcher, type RangeFetcher } from "../fetcher";
 import { encodeContainer } from "../encode";
+import { readVarintZigzag } from "../format";
+
+// Quantized variant of fixtureTopology — adds a `transform` so the
+// encoder takes the delta + varint arc path (and emits arc_endpoints
+// by default). Same unit square geometry, but coords are deltas in
+// quantization units (each delta = 1 unit) and the transform maps
+// back to floats so reader round-trips behave like the un-quantized
+// version. Used by the arc_endpoints tests where the section's
+// presence is the thing under test.
+function quantizedFixtureTopology(): Topology {
+  return {
+    type: "Topology",
+    arcs: [
+      [
+        [0, 0],
+        [1, 0],
+      ],
+      [
+        [1, 0],
+        [0, 1],
+      ],
+      [
+        [0, 1],
+        [-1, 0],
+      ],
+      [
+        [0, 1],
+        [0, -1],
+      ],
+    ],
+    bbox: [0, 0, 1, 1],
+    transform: { scale: [1, 1], translate: [0, 0] },
+    objects: {
+      block: {
+        type: "GeometryCollection",
+        geometries: [
+          {
+            type: "Polygon",
+            arcs: [[0, 1, 2, 3]],
+            properties: { id: "B", population: 100 },
+          },
+        ],
+      },
+    },
+  };
+}
 
 function fixtureTopology(): Topology {
   return {
@@ -214,6 +260,72 @@ describe("CtopoClient", () => {
     expect(requests).toEqual([
       [popSection.offset, popSection.offset + popSection.length],
     ]);
+  });
+
+  it("fetchArcEndpoints round-trips per-arc start/end coords matching arc_coords", async () => {
+    // Quantized fixture: the encoder only emits arc_endpoints for
+    // quantized inputs (un-quantized would need a float64 shape we
+    // don't have a consumer for).
+    const buf = await encodeContainer(quantizedFixtureTopology());
+    const { fetcher } = recordingFetcher(buf);
+    const client = await CtopoClient.openWith(fetcher);
+
+    expect(client.hasArcEndpointsSection()).toBe(true);
+
+    const arcCount = client.meta.numArcs;
+    const ids = Array.from({ length: arcCount }, (_, i) => i);
+    const endpoints = await client.fetchArcEndpoints(ids);
+
+    // Independently recover endpoints from the raw arc_coords varint
+    // stream and confirm they match the dedicated section.
+    const arcBytes = await client.fetchArcs(ids);
+    for (const id of ids) {
+      const bytes = arcBytes.get(id)!;
+      let x = 0;
+      let y = 0;
+      let off = 0;
+      let sx = 0;
+      let sy = 0;
+      let pIdx = 0;
+      while (off < bytes.byteLength) {
+        const dx = readVarintZigzag(bytes, off);
+        off += dx.consumed;
+        const dy = readVarintZigzag(bytes, off);
+        off += dy.consumed;
+        x += dx.value;
+        y += dy.value;
+        if (pIdx === 0) {
+          sx = x;
+          sy = y;
+        }
+        pIdx++;
+      }
+      const got = endpoints.get(id)!;
+      expect([got[0], got[1], got[2], got[3]]).toEqual([sx, sy, x, y]);
+    }
+  });
+
+  it("fetchArcEndpoints falls back to arc_coords decode when the section is absent", async () => {
+    // Encode with the section disabled (simulates legacy files) to
+    // exercise the arc_coords varint-walk fallback path. Must be
+    // quantized — the fallback only supports quantized files (the
+    // public API contract).
+    const buf = await encodeContainer(quantizedFixtureTopology(), {
+      emitArcEndpoints: false,
+    });
+    const { fetcher } = recordingFetcher(buf);
+    const client = await CtopoClient.openWith(fetcher);
+    expect(client.hasArcEndpointsSection()).toBe(false);
+
+    const ids = [0, 1, 2];
+    const endpoints = await client.fetchArcEndpoints(ids);
+    // Endpoints should still come back, derived from arc_coords. Just
+    // sanity-check the shape; the previous test pins the values.
+    for (const id of ids) {
+      const got = endpoints.get(id);
+      expect(got).toBeDefined();
+      expect(got!.length).toBe(4);
+    }
   });
 
   it("fetchArcs coalesces concurrent arcs into two GETs (offsets + coords) and reuses cache on repeats", async () => {
