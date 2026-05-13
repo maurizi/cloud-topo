@@ -1319,20 +1319,18 @@ export class CtopoClient {
       this.statDecompressMs += performance.now() - t0;
       this.statDecompressBytes += out.byteLength;
       // Undo first-order delta encoding in place — running prefix sum
-      // with u32 wraparound, same as the monolithic arc_offsets path
-      // does via viewU32WithDelta. We do it inline here so we can
-      // hand back a fresh Uint32Array view without a second copy.
-      const view = new Uint32Array(
+      // with u32 wraparound, walking forward so we read each entry
+      // before overwriting it. `out` is freshly allocated by the wasm
+      // decoder and not aliased anywhere, so it's safe to mutate in
+      // place — saving one Uint32Array allocation per partition
+      // (~4 KiB external buffer × hundreds of partitions per merge).
+      const decoded = new Uint32Array(
         out.buffer,
         out.byteOffset,
         out.byteLength / 4,
       );
-      const decoded = new Uint32Array(view.length);
-      if (view.length > 0) {
-        decoded[0] = view[0];
-        for (let i = 1; i < view.length; i++) {
-          decoded[i] = (decoded[i - 1] + view[i]) >>> 0;
-        }
+      for (let i = 1; i < decoded.length; i++) {
+        decoded[i] = (decoded[i - 1] + decoded[i]) >>> 0;
       }
       return decoded;
     })();

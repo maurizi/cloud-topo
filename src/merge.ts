@@ -20,6 +20,101 @@ import { type LayerGeometry, type LayerSelection } from "./types";
 // Topojson arcs are global across layers, so cancellation works
 // uniformly even for multi-layer inputs.
 
+// --- Int32Array pool (per-client, encapsulated here) ---
+
+// Reuses the per-merge Int32Arrays (signedArcIds, polyOffsets,
+// polyIndices, rowByArc, offsets) across mergeArcs/merge calls on the
+// same client. Without pooling each merge allocates ~1 MiB of
+// external memory; on the national bench (~435 merges) that's
+// hundreds of MiB of external-buffer churn that drives V8
+// Mark-Compact pauses. WeakMap-keyed by client so:
+//   - pools don't leak between clients running in the same process
+//   - pool lifetime is tied to client lifetime (no manual cleanup)
+//   - no API surface added to CtopoClient
+// Concurrent merges interleave on the event loop but only one runs
+// synchronously at a time; each acquires buffers during its sync
+// block and releases before the next await — peak in-flight is ~one
+// merge's worth.
+class Int32ArrayPool {
+  private free: Int32Array[] = [];
+  private static readonly MAX_FREE = 32;
+
+  // Acquire an Int32Array of exactly `size` elements. Returns a
+  // subarray view of a pooled larger buffer when available, or a
+  // fresh allocation otherwise. Contents are NOT zeroed — caller
+  // must initialize any slot it reads (current callers write every
+  // slot before reading, except polyOffsets[0] / offsets[0] which
+  // are set explicitly).
+  acquire(size: number): Int32Array {
+    let bestIdx = -1;
+    let bestLen = Infinity;
+    for (let i = 0; i < this.free.length; i++) {
+      const len = this.free[i].length;
+      if (len >= size && len < bestLen) {
+        bestIdx = i;
+        bestLen = len;
+      }
+    }
+    if (bestIdx >= 0) {
+      const buf = this.free[bestIdx];
+      this.free[bestIdx] = this.free[this.free.length - 1];
+      this.free.pop();
+      return buf.subarray(0, size);
+    }
+    return new Int32Array(size);
+  }
+
+  release(buf: Int32Array): void {
+    if (this.free.length >= Int32ArrayPool.MAX_FREE) return;
+    // Recover a full-length view of the underlying ArrayBuffer so a
+    // subsequent acquire(larger) can use the entire capacity.
+    const full =
+      buf.byteOffset === 0 && buf.length * 4 === buf.buffer.byteLength
+        ? buf
+        : new Int32Array(buf.buffer, 0, buf.buffer.byteLength / 4);
+    this.free.push(full);
+  }
+}
+
+const poolByClient = new WeakMap<CtopoClient, Int32ArrayPool>();
+function getPool(client: CtopoClient): Int32ArrayPool {
+  let pool = poolByClient.get(client);
+  if (pool === undefined) {
+    pool = new Int32ArrayPool();
+    poolByClient.set(client, pool);
+  }
+  return pool;
+}
+
+// Per-client scratch space for stitchArcs. The three structures (two
+// Maps + one Set) are allocated fresh on each stitchArcs call in the
+// naive version — across the national merge that's ~thousands of
+// short-lived Map/Set instances, each carrying its own hash-table
+// backing. Holding one instance per client and `.clear()`ing between
+// uses keeps the underlying hash storage alive across calls, so Map
+// growth happens once (during the first/biggest call) rather than
+// every time. Safe to share because stitchArcs is fully synchronous —
+// no merge can interleave another stitchArcs on the same client
+// between clear() and the end of the function.
+interface StitchScratch {
+  fragmentByStart: Map<unknown, Fragment>;
+  fragmentByEnd: Map<unknown, Fragment>;
+  stitched: Set<number>;
+}
+const stitchScratchByClient = new WeakMap<CtopoClient, StitchScratch>();
+function getStitchScratch(client: CtopoClient): StitchScratch {
+  let s = stitchScratchByClient.get(client);
+  if (s === undefined) {
+    s = {
+      fragmentByStart: new Map(),
+      fragmentByEnd: new Map(),
+      stitched: new Set(),
+    };
+    stitchScratchByClient.set(client, s);
+  }
+  return s;
+}
+
 // --- merge / mergeArcs ---
 
 export interface MultiPolygonArcs {
@@ -46,7 +141,9 @@ async function prepareMergeGroups(
   endpoints: EndpointLookup;
 }> {
   const polygons = await buildInputPolygons(client, inputs, signal);
-  if (polygons.length === 0) {
+  if (polygons.numPolygons === 0) {
+    // Empty path doesn't touch the pool — the empty-input FlatPolygons
+    // is a fresh tiny allocation, not pooled.
     const arcBytes = new Map<number, Uint8Array>();
     return {
       groupExteriorArcs: [],
@@ -55,7 +152,7 @@ async function prepareMergeGroups(
     };
   }
 
-  const polygonsByArc = buildPolygonsByArc(polygons);
+  const polygonsByArc = buildPolygonsByArc(client, polygons);
   const groups = groupPolygonsByConnectivity(polygons, polygonsByArc);
 
   // Collect every group's exterior arcs in one go so we can fetch
@@ -63,10 +160,25 @@ async function prepareMergeGroups(
   // group.
   const allExteriorArcs: number[] = [];
   const groupExteriorArcs: number[][] = groups.map((group) => {
-    const ext = exteriorArcsForGroup(group, polygonsByArc);
+    const ext = exteriorArcsForGroup(group, polygons, polygonsByArc);
     for (const a of ext) allExteriorArcs.push(a);
     return ext;
   });
+
+  // The per-merge Int32Arrays inside FlatPolygons and PolygonsByArc
+  // aren't referenced past this point — groupExteriorArcs is a plain
+  // number[][] that survives. Release the pooled buffers now, BEFORE
+  // the async fetchArcs await, so the next merge's sync block (which
+  // the event loop may interleave during the network wait) can reuse
+  // them. Without this release the pool would balloon to peak-
+  // concurrency size rather than ~one merge's worth.
+  const pool = getPool(client);
+  pool.release(polygons.signedArcIds as Int32Array);
+  pool.release(polygons.polyOffsets as Int32Array);
+  pool.release(polygonsByArc.rowByArc as Int32Array);
+  pool.release(polygonsByArc.offsets as Int32Array);
+  pool.release(polygonsByArc.polyIndices as Int32Array);
+
   if (allExteriorArcs.length === 0) {
     const arcBytes = new Map<number, Uint8Array>();
     return {
@@ -96,7 +208,7 @@ export async function mergeArcs(
   const out: number[][][] = [];
   for (const ext of groupExteriorArcs) {
     if (ext.length === 0) continue;
-    const rings = stitchArcs(ext, endpoints);
+    const rings = stitchArcs(client, ext, endpoints);
     if (rings.length === 0) continue;
     // At most one ring in a connected group can be the exterior;
     // pick the largest by area. Rest become holes of the same
@@ -129,7 +241,7 @@ export async function merge(
   const coordinates: number[][][][] = [];
   for (const ext of groupExteriorArcs) {
     if (ext.length === 0) continue;
-    const rings = stitchArcs(ext, endpoints);
+    const rings = stitchArcs(client, ext, endpoints);
     const decoded = rings
       .map((ring) => decodeRing(ring, arcBytes, client))
       .filter((r) => r.length >= 4);
@@ -251,24 +363,78 @@ export function untransform(
 // One TopoJSON polygon entry as a list of arc rings. Distinct entries
 // of the same MultiPolygon (e.g. island-in-lake) are kept separate so
 // connectivity grouping can recover the original polygon structure.
-interface InputPolygon {
-  readonly rings: ReadonlyArray<ReadonlyArray<number>>;
+// Stored as a flat (poly-major) Int32Array of signed arc ids — ring
+// boundaries are dropped here because none of the merge-core consumers
+// (buildPolygonsByArc / groupPolygonsByConnectivity / exteriorArcsForGroup)
+// care which ring of a polygon a given arc came from, only which
+// polygon. The flat layout is materially cheaper to iterate than the
+// triple-nested polygon[].rings[].arc[] structure it replaces — fewer
+// property loads per arc and (more importantly) no per-ring `number[]`
+// allocation in `makeInputPolygon`, which was a steady source of
+// merge-call survivor pressure during Scavenges.
+interface FlatPolygons {
+  // Number of polygons.
+  readonly numPolygons: number;
+  // Flat signed arc ids across all polygons, in polygon-major order.
+  readonly signedArcIds: Int32Array;
+  // CSR row pointers — polygon p owns signedArcIds[polyOffsets[p]..polyOffsets[p+1]).
+  // Length == numPolygons + 1.
+  readonly polyOffsets: Int32Array;
 }
 
 async function buildInputPolygons(
   client: CtopoClient,
   inputs: ReadonlyArray<LayerSelection>,
   signal: AbortSignal | undefined,
-): Promise<InputPolygon[]> {
-  if (inputs.length === 0) return [];
+): Promise<FlatPolygons> {
+  if (inputs.length === 0) {
+    return {
+      numPolygons: 0,
+      signedArcIds: new Int32Array(0),
+      polyOffsets: new Int32Array(1),
+    };
+  }
   const layerCsr = await Promise.all(
     inputs.map((input) => client.layerGeometry(input.layer, signal)),
   );
-  const polygons: InputPolygon[] = [];
-  for (let i = 0; i < inputs.length; i++) {
-    expandLayerPolygons(client, inputs[i].layer, layerCsr[i], inputs[i].indices, polygons);
+  // Expand each input layer separately. For the single-input case
+  // (the common one — mergeArcs of a single district selection) we
+  // skip the concat copy entirely; the per-layer FlatPolygons is the
+  // result.
+  if (inputs.length === 1) {
+    return expandLayerPolygons(client, inputs[0].layer, layerCsr[0], inputs[0].indices);
   }
-  return polygons;
+  const perLayer: FlatPolygons[] = new Array(inputs.length);
+  for (let i = 0; i < inputs.length; i++) {
+    perLayer[i] = expandLayerPolygons(client, inputs[i].layer, layerCsr[i], inputs[i].indices);
+  }
+  let totalArcs = 0;
+  let totalPolys = 0;
+  for (const fp of perLayer) {
+    totalArcs += fp.signedArcIds.length;
+    totalPolys += fp.numPolygons;
+  }
+  const pool = getPool(client);
+  const signedArcIds = pool.acquire(totalArcs);
+  const polyOffsets = pool.acquire(totalPolys + 1);
+  polyOffsets[0] = 0;
+  let arcCursor = 0;
+  let polyCursor = 0;
+  for (const fp of perLayer) {
+    signedArcIds.set(fp.signedArcIds, arcCursor);
+    for (let p = 0; p < fp.numPolygons; p++) {
+      polyOffsets[polyCursor + p + 1] = fp.polyOffsets[p + 1] + arcCursor;
+    }
+    arcCursor += fp.signedArcIds.length;
+    polyCursor += fp.numPolygons;
+  }
+  // Per-layer arrays are no longer referenced — return them to the
+  // pool so the concatenated result is the only live allocation.
+  for (const fp of perLayer) {
+    pool.release(fp.signedArcIds as Int32Array);
+    pool.release(fp.polyOffsets as Int32Array);
+  }
+  return { numPolygons: totalPolys, signedArcIds, polyOffsets };
 }
 
 function expandLayerPolygons(
@@ -276,14 +442,11 @@ function expandLayerPolygons(
   layer: string,
   csr: LayerGeometry,
   geomIndices: Iterable<number>,
-  out: InputPolygon[],
-): void {
+): FlatPolygons {
   // Index the sparse multi_poly_breaks table by geom for O(1) lookup
   // per geom we visit. Empty in the typical single-Polygon-only case.
   // We touch the whole table once; attribute its full byteLength to
-  // the useful-bytes tally for this layer (one call per mergeArcs
-  // — so repeated mergeArcs calls re-walk it, and the bench may see
-  // useful_bytes > section_uncompressed_size for multi_poly_breaks).
+  // the useful-bytes tally for this layer.
   client.tallyUseful(`${layer}/multi_poly_breaks`, csr.multiPolyBreaks.byteLength);
   const breaksByGeom = new Map<number, number[]>();
   for (let i = 0; i < csr.multiPolyBreaks.length; i += 2) {
@@ -297,103 +460,203 @@ function expandLayerPolygons(
     list.push(r);
   }
 
-  // Per geom we visit: read polyOffsets[g] and polyOffsets[g+1]
-  // (8 B u32). For each ring inside the geom: read ringOffsets[r]
-  // and ringOffsets[r+1] (8 B u32). For each arc ref inside the
-  // ring: read arcRefs[a] (4 B i32). Tally bumps reflect those
-  // index-level reads so the per-section coverage tracks the merge's
-  // actual access pattern, not the section's byteLength.
-  for (const g of geomIndices) {
+  // Pass 1: count. Walks selected geoms to tally:
+  //   - poly count after multi_poly_breaks splits
+  //   - ring count (for useful-bytes tally)
+  //   - total arcs (for exact-sized signedArcIds allocation)
+  // The geomIndices iterable is materialized into a number[] here
+  // because we need to walk it twice (pass 1, pass 2) and Iterable
+  // can be single-use.
+  const geomList: number[] = [];
+  for (const g of geomIndices) geomList.push(g);
+  let polyOffsetsCount = 0;
+  let ringOffsetsCount = 0;
+  let totalArcs = 0;
+  let numPolygons = 0;
+  for (let i = 0; i < geomList.length; i++) {
+    const g = geomList[i];
     const ringStart = csr.polyOffsets[g];
     const ringEnd = csr.polyOffsets[g + 1];
-    client.tallyUseful(`${layer}/poly_offsets`, 8);
-    if (ringStart === ringEnd) continue; // non-polygon geom
+    polyOffsetsCount++;
+    if (ringStart === ringEnd) continue;
+    ringOffsetsCount += ringEnd - ringStart;
+    totalArcs += csr.ringOffsets[ringEnd] - csr.ringOffsets[ringStart];
+    const breaks = breaksByGeom.get(g);
+    numPolygons += breaks === undefined ? 1 : breaks.length + 1;
+  }
+
+  const pool = getPool(client);
+  const signedArcIds = pool.acquire(totalArcs);
+  const polyOffsets = pool.acquire(numPolygons + 1);
+  polyOffsets[0] = 0;
+
+  // Pass 2: fill. For each emitted polygon, copy its slice of
+  // csr.arcRefs into signedArcIds using typed-array set (memcpy-fast).
+  // multi_poly_breaks splits a geom's ring range into multiple
+  // polygons that share contiguous arc ranges.
+  let polyIdx = 0;
+  let arcCursor = 0;
+  for (let i = 0; i < geomList.length; i++) {
+    const g = geomList[i];
+    const ringStart = csr.polyOffsets[g];
+    const ringEnd = csr.polyOffsets[g + 1];
+    if (ringStart === ringEnd) continue;
     const breaks = breaksByGeom.get(g);
     if (breaks === undefined) {
-      out.push(makeInputPolygon(client, layer, csr, ringStart, ringEnd));
+      const arcStart = csr.ringOffsets[ringStart];
+      const arcEnd = csr.ringOffsets[ringEnd];
+      signedArcIds.set(csr.arcRefs.subarray(arcStart, arcEnd), arcCursor);
+      arcCursor += arcEnd - arcStart;
+      polyOffsets[polyIdx + 1] = arcCursor;
+      polyIdx++;
       continue;
     }
-    // Polygon entry boundaries within geom g: ringStart, *breaks, ringEnd.
     let prev = ringStart;
-    for (const b of breaks) {
-      out.push(makeInputPolygon(client, layer, csr, prev, b));
+    for (let bi = 0; bi < breaks.length; bi++) {
+      const b = breaks[bi];
+      const arcStart = csr.ringOffsets[prev];
+      const arcEnd = csr.ringOffsets[b];
+      signedArcIds.set(csr.arcRefs.subarray(arcStart, arcEnd), arcCursor);
+      arcCursor += arcEnd - arcStart;
+      polyOffsets[polyIdx + 1] = arcCursor;
+      polyIdx++;
       prev = b;
     }
-    out.push(makeInputPolygon(client, layer, csr, prev, ringEnd));
+    const arcStart = csr.ringOffsets[prev];
+    const arcEnd = csr.ringOffsets[ringEnd];
+    signedArcIds.set(csr.arcRefs.subarray(arcStart, arcEnd), arcCursor);
+    arcCursor += arcEnd - arcStart;
+    polyOffsets[polyIdx + 1] = arcCursor;
+    polyIdx++;
   }
-}
 
-function makeInputPolygon(
-  client: CtopoClient,
-  layer: string,
-  csr: LayerGeometry,
-  ringStart: number,
-  ringEnd: number,
-): InputPolygon {
-  const rings: number[][] = [];
-  for (let r = ringStart; r < ringEnd; r++) {
-    const arcStart = csr.ringOffsets[r];
-    const arcEnd = csr.ringOffsets[r + 1];
-    client.tallyUseful(`${layer}/ring_offsets`, 8);
-    const ring = new Array<number>(arcEnd - arcStart);
-    for (let a = arcStart; a < arcEnd; a++) ring[a - arcStart] = csr.arcRefs[a];
-    client.tallyUseful(`${layer}/arc_refs`, 4 * (arcEnd - arcStart));
-    rings.push(ring);
-  }
-  return { rings };
+  client.tallyUseful(`${layer}/poly_offsets`, 8 * polyOffsetsCount);
+  client.tallyUseful(`${layer}/ring_offsets`, 8 * ringOffsetsCount);
+  client.tallyUseful(`${layer}/arc_refs`, 4 * totalArcs);
+
+  return { numPolygons, signedArcIds, polyOffsets };
 }
 
 // Map unsigned arc id → indices of the InputPolygons that reference it.
 // An arc with a single membership is on the exterior of its group; an
 // arc with ≥2 memberships is interior (cancels during merge).
+// Compressed-sparse-row layout for "which input polygons reference
+// each arc id". Replaces a `Map<number, number[]>` with one Map for
+// the id-to-row lookup plus two flat Int32Arrays — the small per-arc
+// `number[]` arrays in the old version were a big chunk of merge-phase
+// Scavenge survivor pressure (one short-lived heap object per unique
+// arc, multiplied across hundreds of districts). With CSR, the only
+// merge-call-lifetime allocations are the index Map plus two typed
+// arrays whose storage is tracked as external memory rather than
+// young-gen heap.
+interface PolygonsByArc {
+  // Row pointers. Row i covers polyIndices[offsets[i]..offsets[i+1]).
+  readonly offsets: Int32Array;
+  // Flat polygon-index storage. Each entry is an index into the
+  // `polygons` array passed to buildPolygonsByArc — i.e. "this arc
+  // is a member of input polygon P". Length == sum of per-arc
+  // memberships across all input polygons.
+  readonly polyIndices: Int32Array;
+  // Denormalized: for each arc occurrence at FlatPolygons.signedArcIds[k],
+  // rowByArc[k] is the CSR row in offsets/polyIndices. Lets the
+  // consumers (groupPolygonsByConnectivity / exteriorArcsForGroup)
+  // skip a Map<arcId, row>.get() per arc in their inner loops —
+  // measurable on the national merge.
+  readonly rowByArc: Int32Array;
+}
+
 function buildPolygonsByArc(
-  polygons: ReadonlyArray<InputPolygon>,
-): Map<number, number[]> {
-  const m = new Map<number, number[]>();
-  for (let p = 0; p < polygons.length; p++) {
-    for (const ring of polygons[p].rings) {
-      for (const signed of ring) {
-        const id = signed < 0 ? ~signed : signed;
-        let arr = m.get(id);
-        if (arr === undefined) {
-          arr = [];
-          m.set(id, arr);
-        }
-        arr.push(p);
-      }
+  client: CtopoClient,
+  polygons: FlatPolygons,
+): PolygonsByArc {
+  const { numPolygons, signedArcIds, polyOffsets } = polygons;
+  const totalArcs = signedArcIds.length;
+  const pool = getPool(client);
+  // Pass 1: count memberships per arc id while assigning row indices.
+  // indexByArcId is local — only needed in this pass to bridge "arc
+  // id → CSR row". The consumers reach the same row via rowByArc[k]
+  // (filled here), so we drop the Map at function exit and keep only
+  // the Int32Array. counts stays as number[]: V8 holds it as a packed
+  // SMI elements array and Scavenge handles its growth cheaply;
+  // pooling it as Int32Array measured as a net wash here (the extra
+  // pool entry's external-memory footprint cost as much Mark-Compact
+  // as the alloc churn it saved).
+  const indexByArcId = new Map<number, number>();
+  const counts: number[] = [];
+  const rowByArc = pool.acquire(totalArcs);
+  for (let k = 0; k < totalArcs; k++) {
+    const signed = signedArcIds[k];
+    const id = signed < 0 ? ~signed : signed;
+    let idx = indexByArcId.get(id);
+    if (idx === undefined) {
+      idx = indexByArcId.size;
+      indexByArcId.set(id, idx);
+      counts.push(1);
+    } else {
+      counts[idx]++;
+    }
+    rowByArc[k] = idx;
+  }
+  // Build CSR offsets from counts via prefix sum. Pool buffers may
+  // carry stale data, so set offsets[0] explicitly.
+  const numArcs = indexByArcId.size;
+  const offsets = pool.acquire(numArcs + 1);
+  offsets[0] = 0;
+  for (let i = 0; i < numArcs; i++) offsets[i + 1] = offsets[i] + counts[i];
+  const polyIndices = pool.acquire(offsets[numArcs]);
+  // Pass 2: fill polyIndices using cached rowByArc. Decrement `counts`
+  // as a cursor so the final layout is each arc's row at
+  // [offsets[idx], offsets[idx+1]).
+  for (let p = 0; p < numPolygons; p++) {
+    const start = polyOffsets[p];
+    const end = polyOffsets[p + 1];
+    for (let k = start; k < end; k++) {
+      const idx = rowByArc[k];
+      const slot = offsets[idx + 1] - counts[idx];
+      counts[idx]--;
+      polyIndices[slot] = p;
     }
   }
-  return m;
+  return { offsets, polyIndices, rowByArc };
 }
 
 // BFS: two input polygons are connected iff they share any arc.
 // Each connected component becomes one polygon in the merged output —
 // preserving the original topology's polygon grouping (an island sitting
 // in a lake remains its own polygon, separate from the surrounding mass).
+// Returns one number[] per connected component, each entry being a
+// polygon index into FlatPolygons. Consumers (exteriorArcsForGroup)
+// take this + FlatPolygons to walk the group's arcs.
 function groupPolygonsByConnectivity(
-  polygons: ReadonlyArray<InputPolygon>,
-  polygonsByArc: ReadonlyMap<number, ReadonlyArray<number>>,
-): InputPolygon[][] {
-  const visited = new Uint8Array(polygons.length);
-  const groups: InputPolygon[][] = [];
-  for (let start = 0; start < polygons.length; start++) {
-    if (visited[start] !== 0) continue;
-    visited[start] = 1;
-    const group: InputPolygon[] = [];
-    const stack: number[] = [start];
+  polygons: FlatPolygons,
+  polygonsByArc: PolygonsByArc,
+): number[][] {
+  const { numPolygons, polyOffsets } = polygons;
+  const { offsets, polyIndices, rowByArc } = polygonsByArc;
+  // visited is a per-polygon bit. Fresh Uint8Array per call —
+  // pooling it traded Scavenge for Mark-Compact on the national
+  // bench, net wash. V8 zero-fills typed arrays cheaply.
+  const visited = new Uint8Array(numPolygons);
+  const groups: number[][] = [];
+  for (let seed = 0; seed < numPolygons; seed++) {
+    if (visited[seed] !== 0) continue;
+    visited[seed] = 1;
+    const group: number[] = [seed];
+    const stack: number[] = [seed];
     while (stack.length > 0) {
       const idx = stack.pop() as number;
-      group.push(polygons[idx]);
-      for (const ring of polygons[idx].rings) {
-        for (const signed of ring) {
-          const id = signed < 0 ? ~signed : signed;
-          const neighbors = polygonsByArc.get(id);
-          if (neighbors === undefined) continue;
-          for (const other of neighbors) {
-            if (visited[other] === 0) {
-              visited[other] = 1;
-              stack.push(other);
-            }
+      const arcStart = polyOffsets[idx];
+      const arcEnd = polyOffsets[idx + 1];
+      for (let k = arcStart; k < arcEnd; k++) {
+        const row = rowByArc[k];
+        const rowStart = offsets[row];
+        const rowEnd = offsets[row + 1];
+        for (let r = rowStart; r < rowEnd; r++) {
+          const other = polyIndices[r];
+          if (visited[other] === 0) {
+            visited[other] = 1;
+            stack.push(other);
+            group.push(other);
           }
         }
       }
@@ -407,18 +670,22 @@ function groupPolygonsByConnectivity(
 // belongs to exactly one input polygon. Arcs with ≥2 memberships are
 // interior (shared between two polygons in the group) and cancel.
 function exteriorArcsForGroup(
-  group: ReadonlyArray<InputPolygon>,
-  polygonsByArc: ReadonlyMap<number, ReadonlyArray<number>>,
+  group: ReadonlyArray<number>,
+  polygons: FlatPolygons,
+  polygonsByArc: PolygonsByArc,
 ): number[] {
+  const { signedArcIds, polyOffsets } = polygons;
+  const { offsets, rowByArc } = polygonsByArc;
   const out: number[] = [];
-  for (const poly of group) {
-    for (const ring of poly.rings) {
-      for (const signed of ring) {
-        const id = signed < 0 ? ~signed : signed;
-        const memberships = polygonsByArc.get(id);
-        if (memberships !== undefined && memberships.length < 2) {
-          out.push(signed);
-        }
+  for (let g = 0; g < group.length; g++) {
+    const p = group[g];
+    const arcStart = polyOffsets[p];
+    const arcEnd = polyOffsets[p + 1];
+    for (let k = arcStart; k < arcEnd; k++) {
+      const row = rowByArc[k];
+      // exterior iff exactly one membership
+      if (offsets[row + 1] - offsets[row] < 2) {
+        out.push(signedArcIds[k]);
       }
     }
   }
@@ -520,16 +787,18 @@ interface Fragment extends Array<number> {
 // lookup from per-arc fetched bytes rather than a single in-memory
 // ArrayBuffer so individual arcs can be Range-fetched on demand.
 function stitchArcs(
+  client: CtopoClient,
   arcs: ReadonlyArray<number>,
   endpoints: EndpointLookup,
 ): number[][] {
-  const stitched = new Set<number>();
-  const fragmentByStart = new Map<string, Fragment>();
-  const fragmentByEnd = new Map<string, Fragment>();
+  const scratch = getStitchScratch(client);
+  scratch.fragmentByStart.clear();
+  scratch.fragmentByEnd.clear();
+  scratch.stitched.clear();
+  const { fragmentByStart, fragmentByEnd, stitched } = scratch;
   const fragments: number[][] = [];
-  const remaining = arcs.slice();
 
-  for (const i of remaining) {
+  for (const i of arcs) {
     const startKey = endpoints.start(i);
     const endKey = endpoints.end(i);
 
@@ -541,11 +810,15 @@ function stitchArcs(
       const g = fragmentByStart.get(endKey);
       if (g !== undefined) {
         fragmentByStart.delete(g.start);
-        const fg: Fragment = g === f ? f : (f.concat(g) as Fragment);
-        fg.start = f.start;
-        fg.end = g.end;
-        fragmentByStart.set(fg.start, fg);
-        fragmentByEnd.set(fg.end, fg);
+        // Merge g into f in place. f.concat(g) was the dominant
+        // allocator in the merge phase — at national scale it pushed
+        // ~8 MB / 46% of merge-only sampled allocations through GC.
+        if (g !== f) {
+          for (let k = 0; k < g.length; k++) f.push(g[k]);
+        }
+        f.end = g.end;
+        fragmentByStart.set(f.start, f);
+        fragmentByEnd.set(f.end, f);
       } else {
         fragmentByStart.set(f.start, f);
         fragmentByEnd.set(f.end, f);
@@ -559,11 +832,19 @@ function stitchArcs(
         const g = fragmentByEnd.get(startKey);
         if (g !== undefined) {
           fragmentByEnd.delete(g.end);
-          const gf: Fragment = g === f ? f : (g.concat(f) as Fragment);
-          gf.start = g.start;
-          gf.end = f.end;
-          fragmentByStart.set(gf.start, gf);
-          fragmentByEnd.set(gf.end, gf);
+          // Merge — final order is [...g, ...f]. Append f to g in
+          // place using g as the surviving fragment (its handle is
+          // the one the outer for-loop iteration drops). f is unused
+          // after this iteration of the outer for-loop.
+          if (g === f) {
+            fragmentByStart.set(f.start, f);
+            fragmentByEnd.set(f.end, f);
+          } else {
+            for (let k = 0; k < f.length; k++) g.push(f[k]);
+            g.end = f.end;
+            fragmentByStart.set(g.start, g);
+            fragmentByEnd.set(g.end, g);
+          }
         } else {
           fragmentByStart.set(f.start, f);
           fragmentByEnd.set(f.end, f);
@@ -581,8 +862,8 @@ function stitchArcs(
   // Drain — closed rings end up in either map; collect them and mark
   // each constituent arc as stitched.
   function drain(
-    byEnd: Map<string, Fragment>,
-    byStart: Map<string, Fragment>,
+    byEnd: Map<unknown, Fragment>,
+    byStart: Map<unknown, Fragment>,
   ): void {
     for (const f of byEnd.values()) {
       byStart.delete(f.start);
@@ -596,7 +877,7 @@ function stitchArcs(
 
   // Anything not stitched is a degenerate single-arc ring — preserve
   // it so the caller can decide what to do (matches topojson-client).
-  for (const i of remaining) {
+  for (const i of arcs) {
     if (!stitched.has(i < 0 ? ~i : i)) fragments.push([i]);
   }
   return fragments;
