@@ -13,7 +13,7 @@
 
 import { type MultiPolygon } from "geojson";
 
-import { type CtopoClient } from "./client";
+import { type CtopoCore } from "./client";
 import { readVarintZigzagInto, type VarintCursor } from "./format";
 import { type LayerGeometry, type LayerSelection } from "./types";
 
@@ -30,7 +30,7 @@ import { type LayerGeometry, type LayerSelection } from "./types";
 // Mark-Compact pauses. WeakMap-keyed by client so:
 //   - pools don't leak between clients running in the same process
 //   - pool lifetime is tied to client lifetime (no manual cleanup)
-//   - no API surface added to CtopoClient
+//   - no API surface added to CtopoCore
 // Concurrent merges interleave on the event loop but only one runs
 // synchronously at a time; each acquires buffers during its sync
 // block and releases before the next await — peak in-flight is ~one
@@ -76,8 +76,8 @@ class Int32ArrayPool {
   }
 }
 
-const poolByClient = new WeakMap<CtopoClient, Int32ArrayPool>();
-function getPool(client: CtopoClient): Int32ArrayPool {
+const poolByClient = new WeakMap<CtopoCore, Int32ArrayPool>();
+function getPool(client: CtopoCore): Int32ArrayPool {
   let pool = poolByClient.get(client);
   if (pool === undefined) {
     pool = new Int32ArrayPool();
@@ -111,8 +111,8 @@ interface ArcGenState {
   index: Int32Array;
   gen: number;
 }
-const arcGenStateByClient = new WeakMap<CtopoClient, ArcGenState>();
-function getArcGenIndex(client: CtopoClient, numArcs: number): Int32Array {
+const arcGenStateByClient = new WeakMap<CtopoCore, ArcGenState>();
+function getArcGenIndex(client: CtopoCore, numArcs: number): Int32Array {
   let s = arcGenStateByClient.get(client);
   if (s === undefined) {
     s = { index: new Int32Array(numArcs), gen: 0 };
@@ -120,7 +120,7 @@ function getArcGenIndex(client: CtopoClient, numArcs: number): Int32Array {
   }
   return s.index;
 }
-function bumpArcGen(client: CtopoClient): number {
+function bumpArcGen(client: CtopoCore): number {
   // Caller is responsible for the per-client WeakMap entry existing
   // (we created it in getArcGenIndex earlier in the same call). Wrap
   // at 0xff so the high byte of the packed slot can never collide
@@ -130,8 +130,8 @@ function bumpArcGen(client: CtopoClient): number {
   return s.gen;
 }
 
-const stitchScratchByClient = new WeakMap<CtopoClient, StitchScratch>();
-function getStitchScratch(client: CtopoClient): StitchScratch {
+const stitchScratchByClient = new WeakMap<CtopoCore, StitchScratch>();
+function getStitchScratch(client: CtopoCore): StitchScratch {
   let s = stitchScratchByClient.get(client);
   if (s === undefined) {
     s = {
@@ -165,7 +165,7 @@ export interface MultiPolygonArcs {
 // fetches arc bytes too. When both are needed, the two fetches run
 // in parallel so wall-clock is bounded by the slower one.
 async function prepareMergeGroups(
-  client: CtopoClient,
+  client: CtopoCore,
   inputs: ReadonlyArray<LayerSelection>,
   needCoords: boolean,
   signal: AbortSignal | undefined,
@@ -202,11 +202,11 @@ async function prepareMergeGroups(
   // them. Without this release the pool would balloon to peak-
   // concurrency size rather than ~one merge's worth.
   const pool = getPool(client);
-  pool.release(polygons.signedArcIds as Int32Array);
-  pool.release(polygons.polyOffsets as Int32Array);
-  pool.release(polygonsByArc.rowByArc as Int32Array);
-  pool.release(polygonsByArc.offsets as Int32Array);
-  pool.release(polygonsByArc.polyIndices as Int32Array);
+  pool.release(polygons.signedArcIds);
+  pool.release(polygons.polyOffsets);
+  pool.release(polygonsByArc.rowByArc);
+  pool.release(polygonsByArc.offsets);
+  pool.release(polygonsByArc.polyIndices);
 
   if (allExteriorArcs.length === 0) {
     return emptyPrepareResult(client);
@@ -250,7 +250,7 @@ async function prepareMergeGroups(
   return { groupExteriorArcs, arcBytes, endpoints };
 }
 
-function emptyPrepareResult(client: CtopoClient): {
+function emptyPrepareResult(client: CtopoCore): {
   groupExteriorArcs: number[][];
   arcBytes: Map<number, Uint8Array>;
   endpoints: EndpointLookup<unknown>;
@@ -263,36 +263,235 @@ function emptyPrepareResult(client: CtopoClient): {
   };
 }
 
-// `mergeArcs` — union of inputs as topology-style geometry. Cheap: only
-// arc endpoints are fetched (for stitching), not full coords.
-export async function mergeArcs(
-  client: CtopoClient,
+// --- Flat (transferable) result shapes ---
+//
+// The merge primitives' "real" outputs are typed-array CSR structures
+// (FlatMultiPolygon / FlatMultiPolygonArcs / FlatNeighbors) — these are
+// what crosses the worker boundary, transferred zero-copy. The
+// GeoJSON-shaped exports below (`merge`, `mergeArcs`, `neighbors`) are
+// thin wrappers that rebuild nested-array forms from the flat outputs;
+// the worker side never calls them, but in-process consumers and the
+// existing test suite still do.
+//
+// Ring storage uses parallel ringStarts / ringEnds (rather than a
+// monotonic CSR offset array) so `merge`'s area-sorted ring order
+// inside a polygon doesn't force the encoder to reorder coord bytes
+// after decode.
+export interface FlatMultiPolygon {
+  readonly type: "MultiPolygon";
+  // Packed [x0,y0,x1,y1,...]; already unquantized (cheap fused
+  // multiply-add inside decodeRingFlat) so the main-thread rebuild
+  // walks the buffer with no further math.
+  readonly coords: Float64Array;
+  // Per-ring start/end point indices into `coords`. Length = numRings.
+  readonly ringStarts: Uint32Array;
+  readonly ringEnds: Uint32Array;
+  // CSR over rings — polygon p's rings are
+  // ringStarts/ringEnds[polyRingStarts[p] .. polyRingStarts[p+1]).
+  // Length = numPolys + 1.
+  readonly polyRingStarts: Uint32Array;
+}
+
+export interface FlatMultiPolygonArcs {
+  readonly type: "MultiPolygon";
+  readonly arcs: Int32Array;
+  readonly ringStarts: Uint32Array;
+  readonly ringEnds: Uint32Array;
+  readonly polyRingStarts: Uint32Array;
+}
+
+export interface FlatNeighbors {
+  // Per-geometry adjacency in CSR form. Geometry g's neighbors are
+  // values[offsets[g] .. offsets[g+1]). offsets length = numGeoms + 1.
+  readonly offsets: Uint32Array;
+  readonly values: Uint32Array;
+}
+
+// Growable Float64 buffer — the per-merge scratch into which
+// decodeRingFlat appends ring points. Doubling capacity keeps the
+// amortized cost linear; `finalize()` returns a tightly-sized slice
+// that owns its own ArrayBuffer (so the worker can postMessage with
+// transfer semantics without orphaning pooled storage).
+class Float64Growable {
+  buf: Float64Array;
+  // Number of *floats* written so far (= 2 * point count).
+  len: number;
+  constructor(initialFloats: number) {
+    this.buf = new Float64Array(initialFloats);
+    this.len = 0;
+  }
+  ensure(needFloats: number): void {
+    if (this.len + needFloats <= this.buf.length) return;
+    let cap = this.buf.length;
+    while (cap < this.len + needFloats) cap *= 2;
+    const grown = new Float64Array(cap);
+    grown.set(this.buf.subarray(0, this.len));
+    this.buf = grown;
+  }
+  pushPoint(x: number, y: number): void {
+    this.ensure(2);
+    this.buf[this.len++] = x;
+    this.buf[this.len++] = y;
+  }
+  popPoint(): void {
+    this.len -= 2;
+  }
+  // Reverse points in place from `startFloats` to current end. Operates
+  // on whole (x, y) pairs — same semantics as the in-place reverse in
+  // the legacy decodeRing's number[][] path.
+  reverseRange(startFloats: number): void {
+    let lo = startFloats;
+    let hi = this.len - 2;
+    while (lo < hi) {
+      const x = this.buf[lo];
+      const y = this.buf[lo + 1];
+      this.buf[lo] = this.buf[hi];
+      this.buf[lo + 1] = this.buf[hi + 1];
+      this.buf[hi] = x;
+      this.buf[hi + 1] = y;
+      lo += 2;
+      hi -= 2;
+    }
+  }
+  finalize(): Float64Array {
+    return this.buf.slice(0, this.len);
+  }
+}
+
+// `mergeArcsFlat` — flat-typed-array form of mergeArcs. Returned arcs
+// follow the same stitch-order semantics (no area-based reordering;
+// see mergeArcs for the contract).
+export async function mergeArcsFlat(
+  client: CtopoCore,
   inputs: ReadonlyArray<LayerSelection>,
   signal?: AbortSignal,
-): Promise<MultiPolygonArcs> {
-  // mergeArcs only needs endpoints — when the file ships
-  // arc_endpoints we skip arc_coords entirely (the prepare layer's
-  // job: needCoords=false routes to the cheap path).
+): Promise<FlatMultiPolygonArcs> {
   const { groupExteriorArcs, endpoints } = await prepareMergeGroups(
     client,
     inputs,
     false,
     signal,
   );
-  const out: number[][][] = [];
+  const arcsOut: number[] = [];
+  const ringStarts: number[] = [];
+  const ringEnds: number[] = [];
+  const polyRingStarts: number[] = [0];
   for (const ext of groupExteriorArcs) {
     if (ext.length === 0) continue;
     const rings = stitchArcs(client, ext, endpoints);
     if (rings.length === 0) continue;
-    // At most one ring in a connected group can be the exterior;
-    // pick the largest by area. Rest become holes of the same
-    // polygon. Area is computed from the arc-id stitching using
-    // arc endpoints — but to avoid decoding coords here we defer
-    // ordering to the callers of mergeArcs that actually care.
-    // Topojson-client's mergeArcs returns arcs in stitch order;
-    // we match that contract — `merge` does the area-ordered
-    // exterior selection.
-    out.push(rings);
+    for (const ring of rings) {
+      const start = arcsOut.length;
+      for (let k = 0; k < ring.length; k++) arcsOut.push(ring[k]);
+      ringStarts.push(start);
+      ringEnds.push(arcsOut.length);
+    }
+    polyRingStarts.push(ringStarts.length);
+  }
+  return {
+    type: "MultiPolygon",
+    arcs: new Int32Array(arcsOut),
+    ringStarts: new Uint32Array(ringStarts),
+    ringEnds: new Uint32Array(ringEnds),
+    polyRingStarts: new Uint32Array(polyRingStarts),
+  };
+}
+
+// `mergeFlat` — flat-typed-array form of merge. Largest-area ring per
+// connected component lands first inside its polygon's [polyRingStarts]
+// slice; the rest follow as holes (same semantics as merge).
+export async function mergeFlat(
+  client: CtopoCore,
+  inputs: ReadonlyArray<LayerSelection>,
+  signal?: AbortSignal,
+): Promise<FlatMultiPolygon> {
+  const { groupExteriorArcs, arcBytes, endpoints } = await prepareMergeGroups(
+    client,
+    inputs,
+    true,
+    signal,
+  );
+  // 2048 floats = 1024 points. Grows as needed.
+  const out = new Float64Growable(2048);
+  const ringStarts: number[] = [];
+  const ringEnds: number[] = [];
+  const polyRingStarts: number[] = [0];
+
+  for (const ext of groupExteriorArcs) {
+    if (ext.length === 0) continue;
+    const rings = stitchArcs(client, ext, endpoints);
+    // Per-group ring info — points already live in `out`, so sorting
+    // by area only reorders the (start, end) entries pushed below; no
+    // coord copy needed.
+    interface RingInfo {
+      start: number;
+      end: number;
+      area: number;
+    }
+    const groupRings: RingInfo[] = [];
+    for (const ring of rings) {
+      const before = out.len;
+      const range = decodeRingFlat(ring, arcBytes, client, out);
+      // Same <4-points filter as the legacy path. Rewind so the
+      // discarded ring's bytes don't bloat coords.
+      if (range.end - range.start < 4) {
+        out.len = before;
+        continue;
+      }
+      groupRings.push({
+        start: range.start,
+        end: range.end,
+        area: ringAreaFlat(out.buf, range.start, range.end),
+      });
+    }
+    if (groupRings.length === 0) continue;
+    if (groupRings.length > 1) {
+      groupRings.sort((a, b) => b.area - a.area);
+    }
+    for (let i = 0; i < groupRings.length; i++) {
+      ringStarts.push(groupRings[i].start);
+      ringEnds.push(groupRings[i].end);
+    }
+    polyRingStarts.push(ringStarts.length);
+  }
+
+  return {
+    type: "MultiPolygon",
+    coords: out.finalize(),
+    ringStarts: new Uint32Array(ringStarts),
+    ringEnds: new Uint32Array(ringEnds),
+    polyRingStarts: new Uint32Array(polyRingStarts),
+  };
+}
+
+// --- GeoJSON-shaped wrappers ---
+//
+// Build the nested-array forms from the flat outputs. The worker never
+// calls these; in-process callers (and existing tests) get the same
+// observable shape they did before the flat split.
+
+// `mergeArcs` — union of inputs as topology-style geometry. Cheap: only
+// arc endpoints are fetched (for stitching), not full coords.
+export async function mergeArcs(
+  client: CtopoCore,
+  inputs: ReadonlyArray<LayerSelection>,
+  signal?: AbortSignal,
+): Promise<MultiPolygonArcs> {
+  const flat = await mergeArcsFlat(client, inputs, signal);
+  const out: number[][][] = [];
+  const numPolys = flat.polyRingStarts.length - 1;
+  for (let p = 0; p < numPolys; p++) {
+    const polygon: number[][] = [];
+    const rStart = flat.polyRingStarts[p];
+    const rEnd = flat.polyRingStarts[p + 1];
+    for (let r = rStart; r < rEnd; r++) {
+      const aStart = flat.ringStarts[r];
+      const aEnd = flat.ringEnds[r];
+      const ring = new Array<number>(aEnd - aStart);
+      for (let i = 0; i < ring.length; i++) ring[i] = flat.arcs[aStart + i];
+      polygon.push(ring);
+    }
+    out.push(polygon);
   }
   return { type: "MultiPolygon", arcs: out };
 }
@@ -303,51 +502,43 @@ export async function mergeArcs(
 // topojson-client's `merge` semantics). Within each component the
 // largest-area stitched ring becomes the exterior; the rest are holes.
 export async function merge(
-  client: CtopoClient,
+  client: CtopoCore,
   inputs: ReadonlyArray<LayerSelection>,
   signal?: AbortSignal,
 ): Promise<MultiPolygon> {
-  // merge decodes rings → needCoords=true. With the section present
-  // the prepare layer parallel-fetches arc_endpoints + arc_coords;
-  // endpoint reads then go straight to the section (no varint walk).
-  const { groupExteriorArcs, arcBytes, endpoints } = await prepareMergeGroups(
-    client,
-    inputs,
-    true,
-    signal,
-  );
+  const flat = await mergeFlat(client, inputs, signal);
   const coordinates: number[][][][] = [];
-  for (const ext of groupExteriorArcs) {
-    if (ext.length === 0) continue;
-    const rings = stitchArcs(client, ext, endpoints);
-    const decoded = rings
-      .map((ring) => decodeRing(ring, arcBytes, client))
-      .filter((r) => r.length >= 4);
-    if (decoded.length === 0) continue;
-    if (decoded.length === 1) {
-      coordinates.push(decoded);
-      continue;
+  const numPolys = flat.polyRingStarts.length - 1;
+  for (let p = 0; p < numPolys; p++) {
+    const polygon: number[][][] = [];
+    const rStart = flat.polyRingStarts[p];
+    const rEnd = flat.polyRingStarts[p + 1];
+    for (let r = rStart; r < rEnd; r++) {
+      const pStart = flat.ringStarts[r];
+      const pEnd = flat.ringEnds[r];
+      const ring = new Array<number[]>(pEnd - pStart);
+      for (let i = 0; i < ring.length; i++) {
+        const off = (pStart + i) * 2;
+        ring[i] = [flat.coords[off], flat.coords[off + 1]];
+      }
+      polygon.push(ring);
     }
-    // Largest area = exterior; others are holes inside it. In planar
-    // topology this is exact — a hole strictly contained in the
-    // exterior is necessarily smaller in area.
-    const indexed = decoded.map((r, i) => ({ area: ringArea(r), idx: i }));
-    indexed.sort((a, b) => b.area - a.area);
-    coordinates.push(indexed.map((x) => decoded[x.idx]));
+    coordinates.push(polygon);
   }
   return { type: "MultiPolygon", coordinates };
 }
 
 // --- neighbors ---
 
-// For the given layer, return per-geometry adjacent geometry indices
-// (sorted, deduped). Pure in-memory once the layer's CSR triple is
-// loaded — no arc coord fetch needed.
-export async function neighbors(
-  client: CtopoClient,
+// `neighborsFlat` — CSR adjacency for the layer (one Uint32Array of
+// neighbor ids + one Uint32Array of per-geometry offsets). Pure
+// in-memory once the layer's CSR triple is loaded — no arc coord
+// fetch needed.
+export async function neighborsFlat(
+  client: CtopoCore,
   layer: string,
   signal?: AbortSignal,
-): Promise<readonly (readonly number[])[]> {
+): Promise<FlatNeighbors> {
   const csr = await client.layerGeometry(layer, signal);
   const numGeoms = csr.polyOffsets.length - 1;
   const numArcs = client.meta.numArcs;
@@ -375,10 +566,12 @@ export async function neighbors(
   }
 
   // For each geom, walk its arcs and collect the OTHER geom on each
-  // shared arc.
-  const out: number[][] = [];
+  // shared arc; flatten into the CSR result.
+  const seen = new Set<number>();
+  const offsets = new Uint32Array(numGeoms + 1);
+  const valuesBuf: number[] = [];
   for (let g = 0; g < numGeoms; g++) {
-    const seen = new Set<number>();
+    seen.clear();
     const ringStart = csr.polyOffsets[g];
     const ringEnd = csr.polyOffsets[g + 1];
     for (let r = ringStart; r < ringEnd; r++) {
@@ -393,7 +586,28 @@ export async function neighbors(
     }
     const list = Array.from(seen);
     list.sort((a, b) => a - b);
-    out.push(list);
+    for (let i = 0; i < list.length; i++) valuesBuf.push(list[i]);
+    offsets[g + 1] = valuesBuf.length;
+  }
+  return { offsets, values: new Uint32Array(valuesBuf) };
+}
+
+// `neighbors` — GeoJSON-shaped wrapper around `neighborsFlat`. Returns
+// per-geometry sorted neighbor lists.
+export async function neighbors(
+  client: CtopoCore,
+  layer: string,
+  signal?: AbortSignal,
+): Promise<readonly (readonly number[])[]> {
+  const flat = await neighborsFlat(client, layer, signal);
+  const numGeoms = flat.offsets.length - 1;
+  const out = new Array<number[]>(numGeoms);
+  for (let g = 0; g < numGeoms; g++) {
+    const start = flat.offsets[g];
+    const end = flat.offsets[g + 1];
+    const list = new Array<number>(end - start);
+    for (let i = 0; i < list.length; i++) list[i] = flat.values[start + i];
+    out[g] = list;
   }
   return out;
 }
@@ -401,7 +615,7 @@ export async function neighbors(
 // --- bbox / transform helpers (mirror topojson-client signatures) ---
 
 export function bbox(
-  client: CtopoClient,
+  client: CtopoCore,
 ): readonly [number, number, number, number] {
   return client.meta.bbox;
 }
@@ -461,7 +675,7 @@ interface FlatPolygons {
 }
 
 async function buildInputPolygons(
-  client: CtopoClient,
+  client: CtopoCore,
   inputs: ReadonlyArray<LayerSelection>,
   signal: AbortSignal | undefined,
 ): Promise<FlatPolygons> {
@@ -480,11 +694,21 @@ async function buildInputPolygons(
   // skip the concat copy entirely; the per-layer FlatPolygons is the
   // result.
   if (inputs.length === 1) {
-    return expandLayerPolygons(client, inputs[0].layer, layerCsr[0], inputs[0].indices);
+    return expandLayerPolygons(
+      client,
+      inputs[0].layer,
+      layerCsr[0],
+      inputs[0].indices,
+    );
   }
-  const perLayer: FlatPolygons[] = new Array(inputs.length);
+  const perLayer = new Array<FlatPolygons>(inputs.length);
   for (let i = 0; i < inputs.length; i++) {
-    perLayer[i] = expandLayerPolygons(client, inputs[i].layer, layerCsr[i], inputs[i].indices);
+    perLayer[i] = expandLayerPolygons(
+      client,
+      inputs[i].layer,
+      layerCsr[i],
+      inputs[i].indices,
+    );
   }
   let totalArcs = 0;
   let totalPolys = 0;
@@ -509,14 +733,14 @@ async function buildInputPolygons(
   // Per-layer arrays are no longer referenced — return them to the
   // pool so the concatenated result is the only live allocation.
   for (const fp of perLayer) {
-    pool.release(fp.signedArcIds as Int32Array);
-    pool.release(fp.polyOffsets as Int32Array);
+    pool.release(fp.signedArcIds);
+    pool.release(fp.polyOffsets);
   }
   return { numPolygons: totalPolys, signedArcIds, polyOffsets };
 }
 
 function expandLayerPolygons(
-  client: CtopoClient,
+  client: CtopoCore,
   layer: string,
   csr: LayerGeometry,
   geomIndices: Iterable<number>,
@@ -525,7 +749,10 @@ function expandLayerPolygons(
   // per geom we visit. Empty in the typical single-Polygon-only case.
   // We touch the whole table once; attribute its full byteLength to
   // the useful-bytes tally for this layer.
-  client.tallyUseful(`${layer}/multi_poly_breaks`, csr.multiPolyBreaks.byteLength);
+  client.tallyUseful(
+    `${layer}/multi_poly_breaks`,
+    csr.multiPolyBreaks.byteLength,
+  );
   const breaksByGeom = new Map<number, number[]>();
   for (let i = 0; i < csr.multiPolyBreaks.length; i += 2) {
     const g = csr.multiPolyBreaks[i];
@@ -644,7 +871,7 @@ interface PolygonsByArc {
 }
 
 function buildPolygonsByArc(
-  client: CtopoClient,
+  client: CtopoCore,
   polygons: FlatPolygons,
 ): PolygonsByArc {
   const { numPolygons, signedArcIds, polyOffsets } = polygons;
@@ -852,7 +1079,7 @@ function packCoord(x: number, y: number): number {
 // signed id ~i reads i's end as its "start" and vice versa.
 function makeNumericEndpointLookup(
   endpoints: ReadonlyMap<number, Int32Array>,
-  client: CtopoClient,
+  client: CtopoCore,
 ): EndpointLookup<number> {
   function readForward(arcId: number): Int32Array {
     const v = endpoints.get(arcId);
@@ -900,7 +1127,7 @@ function makeNumericEndpointLookup(
 // merge). Adding the Maps was pure overhead — removed.
 function makeNumericEndpointLookupFromBytes(
   arcBytes: ReadonlyMap<number, Uint8Array>,
-  client: CtopoClient,
+  client: CtopoCore,
 ): EndpointLookup<number> {
   // One cursor reused across every start/end read in this lookup.
   // Sync hot path; no concurrency to worry about.
@@ -945,7 +1172,7 @@ function makeNumericEndpointLookupFromBytes(
 
 function makeEndpointLookup(
   arcBytes: ReadonlyMap<number, Uint8Array>,
-  client: CtopoClient,
+  client: CtopoCore,
 ): EndpointLookup<string> {
   const isQuantized = client.transform !== null;
   const cur: VarintCursor = { value: 0, off: 0 };
@@ -1026,7 +1253,7 @@ interface Fragment extends Array<number> {
 // lookup from per-arc fetched bytes rather than a single in-memory
 // ArrayBuffer so individual arcs can be Range-fetched on demand.
 function stitchArcs<K>(
-  client: CtopoClient,
+  client: CtopoCore,
   arcs: ReadonlyArray<number>,
   endpoints: EndpointLookup<K>,
 ): number[][] {
@@ -1122,33 +1349,38 @@ function stitchArcs<K>(
   return fragments;
 }
 
-// --- decodeRing (per-arc bytes) ---
-
-function decodeRing(
+// --- decodeRingFlat (per-arc bytes → packed Float64) ---
+//
+// Walks each arc's varint stream (or, for un-quantized, its raw f64
+// pairs) and pushes points into `out` in ring order. Mirrors the old
+// number[][] decodeRing semantics exactly: shared join points dropped,
+// reverse-direction arcs reversed in place, the closing duplicate
+// pushed at the end.
+//
+// The returned (start, end) is in *point indices* — multiply by 2 to
+// get float positions inside out.buf.
+function decodeRingFlat(
   arcIds: ReadonlyArray<number>,
   arcBytes: ReadonlyMap<number, Uint8Array>,
-  client: CtopoClient,
-): number[][] {
+  client: CtopoCore,
+  out: Float64Growable,
+): { start: number; end: number } {
   const t = client.transform;
   const isQuantized = t !== null;
   const kx = isQuantized ? t.scale[0] : 0;
   const ky = isQuantized ? t.scale[1] : 0;
   const tx = isQuantized ? t.translate[0] : 0;
   const ty = isQuantized ? t.translate[1] : 0;
-  const ring: number[][] = [];
-  // One cursor for the whole ring; reused per arc varint walk.
+  const ringStartFloats = out.len;
   const cur: VarintCursor = { value: 0, off: 0 };
 
   for (const signed of arcIds) {
     const arcId = signed >= 0 ? signed : ~signed;
     const forward = signed >= 0;
     const bytes = requireArcBytes(arcBytes, arcId);
-    const segStart = ring.length;
+    const segStartFloats = out.len;
 
     if (isQuantized) {
-      // Walk varints and append each point directly to the ring. The
-      // [x,y] pairs live on as the GeoJSON output; the per-arc number[]
-      // wrapper and DataView the old shape allocated are pure garbage.
       let x = 0;
       let y = 0;
       cur.off = 0;
@@ -1159,55 +1391,65 @@ function decodeRing(
         readVarintZigzagInto(bytes, cur);
         x += dx;
         y += cur.value;
-        ring.push([x * kx + tx, y * ky + ty]);
+        out.pushPoint(x * kx + tx, y * ky + ty);
       }
     } else {
-      const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+      const view = new DataView(
+        bytes.buffer,
+        bytes.byteOffset,
+        bytes.byteLength,
+      );
       const numPoints = bytes.byteLength / 16;
+      out.ensure(numPoints * 2);
       for (let i = 0; i < numPoints; i++) {
         const off = i * 16;
-        ring.push([view.getFloat64(off, true), view.getFloat64(off + 8, true)]);
+        out.buf[out.len++] = view.getFloat64(off, true);
+        out.buf[out.len++] = view.getFloat64(off + 8, true);
       }
     }
 
-    const segLen = ring.length - segStart;
-    if (segLen === 0) continue;
+    if (out.len === segStartFloats) continue;
 
     if (forward) {
-      // Last point is shared with the next arc's start — drop it.
-      ring.pop();
+      // Drop the last point — shared join with the next arc's start.
+      out.popPoint();
     } else {
-      // Reverse this arc's segment in place, then drop the new tail
-      // (which was the first decoded point, i.e. the shared join
-      // with the next arc in the backward walk).
-      let lo = segStart;
-      let hi = ring.length - 1;
-      while (lo < hi) {
-        const tmp = ring[lo];
-        ring[lo] = ring[hi];
-        ring[hi] = tmp;
-        lo++;
-        hi--;
-      }
-      ring.pop();
+      // Reverse the arc's segment in place, then drop the new tail
+      // (originally the first decoded point — the shared join in the
+      // backward walk).
+      out.reverseRange(segStartFloats);
+      out.popPoint();
     }
   }
 
-  if (ring.length > 0) ring.push(ring[0]);
-  return ring;
+  if (out.len > ringStartFloats) {
+    // Close the ring with the first point.
+    const sx = out.buf[ringStartFloats];
+    const sy = out.buf[ringStartFloats + 1];
+    out.pushPoint(sx, sy);
+  }
+  return { start: ringStartFloats / 2, end: out.len / 2 };
 }
 
-// --- ringArea (shoelace) ---
+// --- ringAreaFlat (shoelace, on packed Float64) ---
 
-function ringArea(ring: ReadonlyArray<ReadonlyArray<number>>): number {
-  let area = 0;
-  const n = ring.length;
+function ringAreaFlat(
+  coords: Float64Array,
+  startPoint: number,
+  endPoint: number,
+): number {
+  const n = endPoint - startPoint;
   if (n < 3) return 0;
-  let b = ring[n - 1];
-  for (let i = 0; i < n; i++) {
-    const a = b;
-    b = ring[i];
-    area += a[0] * b[1] - a[1] * b[0];
+  let area = 0;
+  let bx = coords[(endPoint - 1) * 2];
+  let by = coords[(endPoint - 1) * 2 + 1];
+  for (let i = startPoint; i < endPoint; i++) {
+    const ax = bx;
+    const ay = by;
+    const off = i * 2;
+    bx = coords[off];
+    by = coords[off + 1];
+    area += ax * by - ay * bx;
   }
   return Math.abs(area);
 }

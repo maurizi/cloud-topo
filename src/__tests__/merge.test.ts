@@ -5,10 +5,10 @@ import { describe, expect, it } from "vitest";
 
 import { type Topology } from "topojson-specification";
 
-import { CtopoClient } from "../client";
-import { makeBufferFetcher } from "../fetcher";
+import { CtopoCore } from "../core/client";
+import { makeBufferFetcher } from "../core/fetcher";
 import { encodeContainer } from "../encode";
-import { merge, mergeArcs, neighbors } from "../merge";
+import { merge, mergeArcs, neighbors } from "../core/merge";
 
 // Canonicalize a stitched ring's vertices: drop the closing duplicate
 // and sort. Tests assert on vertex sets rather than exact coordinate
@@ -73,7 +73,7 @@ function twoBlockTopology(): Topology {
 describe("ctopo merge primitives", () => {
   it("neighbors returns each block's adjacent blocks via shared arcs", async () => {
     const buf = await encodeContainer(twoBlockTopology());
-    const client = await CtopoClient.openWith(makeBufferFetcher(buf));
+    const client = await CtopoCore.openWith(makeBufferFetcher(buf));
     const adj = await neighbors(client, "block");
     expect(adj).toEqual([[1], [0]]);
   });
@@ -82,7 +82,7 @@ describe("ctopo merge primitives", () => {
     const buf = await encodeContainer(twoBlockTopology(), {
       spatialSort: "hilbert",
     });
-    const client = await CtopoClient.openWith(makeBufferFetcher(buf));
+    const client = await CtopoCore.openWith(makeBufferFetcher(buf));
 
     // Single-block — should keep all four of its arcs.
     const single = await mergeArcs(client, [{ layer: "block", indices: [0] }]);
@@ -100,7 +100,7 @@ describe("ctopo merge primitives", () => {
 
   it("merge returns the decoded outer ring as a closed MultiPolygon", async () => {
     const buf = await encodeContainer(twoBlockTopology());
-    const client = await CtopoClient.openWith(makeBufferFetcher(buf));
+    const client = await CtopoCore.openWith(makeBufferFetcher(buf));
     const result = await merge(client, [{ layer: "block", indices: [0, 1] }]);
 
     expect(result.type).toBe("MultiPolygon");
@@ -118,7 +118,7 @@ describe("ctopo merge primitives", () => {
 
   it("merging an empty selection returns an empty MultiPolygon", async () => {
     const buf = await encodeContainer(twoBlockTopology());
-    const client = await CtopoClient.openWith(makeBufferFetcher(buf));
+    const client = await CtopoCore.openWith(makeBufferFetcher(buf));
     const result = await merge(client, [{ layer: "block", indices: [] }]);
     expect(result.coordinates).toEqual([]);
   });
@@ -157,7 +157,7 @@ describe("ctopo merge primitives", () => {
       },
     };
     const buf = await encodeContainer(topology);
-    const client = await CtopoClient.openWith(makeBufferFetcher(buf));
+    const client = await CtopoCore.openWith(makeBufferFetcher(buf));
     const result = await merge(client, [{ layer: "block", indices: [0, 1] }]);
 
     expect(result.type).toBe("MultiPolygon");
@@ -209,7 +209,7 @@ describe("ctopo merge primitives", () => {
       },
     };
     const buf = await encodeContainer(topology);
-    const client = await CtopoClient.openWith(makeBufferFetcher(buf));
+    const client = await CtopoCore.openWith(makeBufferFetcher(buf));
     const result = await merge(client, [{ layer: "block", indices: [0, 1] }]);
 
     expect(result.type).toBe("MultiPolygon");
@@ -279,7 +279,7 @@ describe("ctopo merge primitives", () => {
       },
     };
     const buf = await encodeContainer(topology);
-    const client = await CtopoClient.openWith(makeBufferFetcher(buf));
+    const client = await CtopoCore.openWith(makeBufferFetcher(buf));
     const result = await merge(client, [{ layer: "block", indices: [0, 1] }]);
 
     expect(result.coordinates.length).toBe(1);
@@ -359,7 +359,7 @@ describe("ctopo merge primitives", () => {
       },
     };
     const buf = await encodeContainer(topology);
-    const client = await CtopoClient.openWith(makeBufferFetcher(buf));
+    const client = await CtopoCore.openWith(makeBufferFetcher(buf));
     const result = await merge(client, [{ layer: "block", indices: [0, 1] }]);
 
     expect(result.coordinates.length).toBe(1);
@@ -440,7 +440,7 @@ describe("ctopo merge primitives", () => {
       },
     };
     const buf = await encodeContainer(topology);
-    const client = await CtopoClient.openWith(makeBufferFetcher(buf));
+    const client = await CtopoCore.openWith(makeBufferFetcher(buf));
     const result = await merge(client, [
       { layer: "block", indices: [0, 1, 2, 3] },
     ]);
@@ -498,7 +498,7 @@ describe("ctopo merge primitives", () => {
       },
     };
     const buf = await encodeContainer(topology);
-    const client = await CtopoClient.openWith(makeBufferFetcher(buf));
+    const client = await CtopoCore.openWith(makeBufferFetcher(buf));
     const result = await merge(client, [{ layer: "land", indices: [0] }]);
 
     expect(result.type).toBe("MultiPolygon");
@@ -561,7 +561,7 @@ describe("ctopo merge primitives", () => {
       },
     };
     const buf = await encodeContainer(topology);
-    const client = await CtopoClient.openWith(makeBufferFetcher(buf));
+    const client = await CtopoCore.openWith(makeBufferFetcher(buf));
     const adj = await neighbors(client, "block");
     expect(adj).toEqual([[1], [0], []]);
   });
@@ -640,7 +640,7 @@ describe("ctopo merge primitives", () => {
       },
     };
     const buf = await encodeContainer(topology);
-    const client = await CtopoClient.openWith(makeBufferFetcher(buf));
+    const client = await CtopoCore.openWith(makeBufferFetcher(buf));
     const adj = await neighbors(client, "block");
     expect(adj).toEqual([[1, 2, 3], [0], [0], [0]]);
   });

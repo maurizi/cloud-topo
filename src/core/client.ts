@@ -2,7 +2,7 @@
 // © 2026 Michael Maurizi Jr.
 
 /**
- * CtopoClient — opens a `.ctopo` container over HTTP Range and lazy-loads
+ * CtopoCore — opens a `.ctopo` container over HTTP Range and lazy-loads
  * sections on demand.
  *
  * `openContainer(url)` issues one prefetch GET that covers the header,
@@ -328,13 +328,13 @@ const EMPTY_INT32 = new Int32Array(0);
 export async function openContainer(
   url: string,
   opts: OpenContainerOptions = {},
-): Promise<CtopoClient> {
-  return CtopoClient.open(url, opts);
+): Promise<CtopoCore> {
+  return CtopoCore.open(url, opts);
 }
 
-// --- CtopoClient ---
+// --- CtopoCore ---
 
-export class CtopoClient {
+export class CtopoCore {
   readonly meta: ContainerMeta;
   readonly sections: ReadonlyArray<SectionEntry>;
   readonly transform: ContainerMeta["transform"];
@@ -558,9 +558,9 @@ export class CtopoClient {
   static async open(
     url: string,
     opts: OpenContainerOptions = {},
-  ): Promise<CtopoClient> {
+  ): Promise<CtopoCore> {
     const fetcher = opts.fetcher ?? makeHttpFetcher(url);
-    return CtopoClient.openWith(fetcher, opts);
+    return CtopoCore.openWith(fetcher, opts);
   }
 
   // Fire two GETs in parallel: front prefetch (covers the encoder's
@@ -572,7 +572,7 @@ export class CtopoClient {
   static async openWith(
     fetcher: RangeFetcher,
     opts: OpenContainerOptions = {},
-  ): Promise<CtopoClient> {
+  ): Promise<CtopoCore> {
     const frontPrefetchBytes =
       opts.frontPrefetchBytes ?? DEFAULT_FRONT_PREFETCH;
     const backPrefetchBytes = opts.backPrefetchBytes ?? DEFAULT_BACK_PREFETCH;
@@ -640,7 +640,7 @@ export class CtopoClient {
     );
     const parsed = parseFooter(footerBytes);
 
-    const client = new CtopoClient({
+    const client = new CtopoCore({
       fetcher,
       parsed,
       coalesceGapBytes,
@@ -1174,7 +1174,7 @@ export class CtopoClient {
 
     for (const arcId of arcIds) {
       if (out.has(arcId)) continue;
-      const blockIdx = CtopoClient.findArcOffsetsBlock(offsetsBlocks, arcId);
+      const blockIdx = CtopoCore.findArcOffsetsBlock(offsetsBlocks, arcId);
       const list = arcsByBlock.get(blockIdx);
       if (list === undefined) arcsByBlock.set(blockIdx, [arcId]);
       else list.push(arcId);
@@ -1242,7 +1242,7 @@ export class CtopoClient {
           `ctopo: container is missing the "${meta.dictSection}" section`,
         );
       }
-      this.arcCoordDictPromise = this.fetchSectionBytes(entry).then(bytes => {
+      this.arcCoordDictPromise = this.fetchSectionBytes(entry).then((bytes) => {
         // The shared dict is consulted by every per-block decompress
         // — count its full size once at first resolve.
         this.tallyUseful(entry.name, bytes.byteLength);
@@ -1615,7 +1615,7 @@ export class CtopoClient {
 
     for (const arcId of arcIds) {
       if (out.has(arcId)) continue;
-      const blockIdx = CtopoClient.findArcOffsetsBlock(endpointsBlocks, arcId);
+      const blockIdx = CtopoCore.findArcOffsetsBlock(endpointsBlocks, arcId);
       const list = arcsByBlock.get(blockIdx);
       if (list === undefined) arcsByBlock.set(blockIdx, [arcId]);
       else list.push(arcId);

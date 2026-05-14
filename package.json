@@ -72,6 +72,6 @@
     "cloud-optimized"
   ],
   "dependencies": {
-    "cloud-topo": "file:../cloud-topo"
+    "web-worker": "^1.5.0"
   }
 }

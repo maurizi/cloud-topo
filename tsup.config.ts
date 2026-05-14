@@ -5,6 +5,12 @@ export default defineConfig({
   entry: {
     index: "src/index.ts",
     encode: "src/encode.ts",
+    // Emitted as `dist/worker.js`. The proxy references it via
+    // `new URL("../worker.js", import.meta.url)` from
+    // `dist/proxy/client.js` (after splitting), which esbuild leaves
+    // alone — Vite/webpack/Rollup pick up the URL pattern and bundle
+    // the chunk as a worker module.
+    worker: "src/worker.ts",
   },
   format: ["esm"],
   dts: true,
@@ -21,7 +27,7 @@ export default defineConfig({
   // Node reads the bytes via fs (see src/zstd-wasm/index.ts).
   onSuccess: async () => {
     copyFileSync(
-      "src/zstd-wasm/ctopo_zstd_decoder_bg.wasm",
+      "src/core/zstd-wasm/ctopo_zstd_decoder_bg.wasm",
       "dist/ctopo_zstd_decoder_bg.wasm",
     );
   },

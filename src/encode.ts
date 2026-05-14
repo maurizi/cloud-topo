@@ -46,15 +46,15 @@ import {
   SECTION_NAME_SIZE,
   VERSION,
   alignUp,
-} from "./format";
-import { parseContainer } from "./reader";
+} from "./core/format";
+import { parseContainer } from "./core/reader";
 import {
   type Compression,
   type ContainerMeta,
   type DType,
   type PropertyOverride,
   compressionToWire,
-} from "./types";
+} from "./core/types";
 import {
   buildArcSections,
   computeArcOrder,
@@ -84,7 +84,7 @@ import {
   blockCompressArcOffsets,
   DEFAULT_ARC_COORD_BLOCK_BYTES,
 } from "./encode-compress";
-import { runWithConcurrency, stderrLog, memSnapshot } from "./util";
+import { runWithConcurrency, stderrLog, memSnapshot } from "./core/util";
 
 // --- Types ---
 
@@ -456,7 +456,9 @@ export async function encodeContainer(
     });
     arcEndpointsBlocksMeta = {
       dictSection:
-        endpointsBlock.dictBytes !== undefined ? "arc_endpoints_dict" : undefined,
+        endpointsBlock.dictBytes !== undefined
+          ? "arc_endpoints_dict"
+          : undefined,
       blockTableSection: "arc_endpoint_blocks",
       partitionsSection: "arc_endpoints",
       blockCount: endpointsBlock.blockCount,

@@ -6,21 +6,21 @@ import { describe, expect, it } from "vitest";
 import { type Topology } from "topojson-specification";
 
 import { encodeContainer, rewriteContainer } from "../encode";
-import { CtopoClient } from "../client";
-import { makeBufferFetcher } from "../fetcher";
+import { CtopoCore } from "../core/client";
+import { makeBufferFetcher } from "../core/fetcher";
 import {
   MAGIC,
   VERSION_MAJOR,
   readVarintZigzagInto,
   unpackVersion,
   writeVarintZigzag,
-} from "../format";
+} from "../core/format";
 import {
   parseContainer,
   viewDecompressedSection,
   viewSection,
-} from "../reader";
-import { type SectionEntry, StringArray } from "../types";
+} from "../core/reader";
+import { type SectionEntry, StringArray } from "../core/types";
 import { brotliDecompressSync, zstdDecompressSync } from "zlib";
 import { mkdtempSync, readFileSync, writeFileSync } from "fs";
 import { tmpdir } from "os";
@@ -421,9 +421,9 @@ describe("ctopo format", () => {
     // block D (x=80, tie-broken after C).
     const topology = makeSpatialSortFixture();
     const buf = await encodeContainer(topology, { spatialSort: "hilbert" });
-    // Use CtopoClient to read through the block-decompression path
+    // Use CtopoCore to read through the block-decompression path
     // (the refactored encoder always block-compresses arc_coords).
-    const client = await CtopoClient.openWith(makeBufferFetcher(buf));
+    const client = await CtopoCore.openWith(makeBufferFetcher(buf));
     const arcIds = Array.from({ length: 8 }, (_, i) => i);
     const arcBytes = await client.fetchArcs(arcIds);
     // Each arc has 2 points × 2 float64 = 32 bytes. The first
@@ -483,7 +483,7 @@ describe("ctopo format", () => {
   ] as const) {
     async function recover(topology: Topology): Promise<number[]> {
       const buf = await encodeContainer(topology, { spatialSort: sort });
-      const client = await CtopoClient.openWith(makeBufferFetcher(buf));
+      const client = await CtopoCore.openWith(makeBufferFetcher(buf));
       const arcIds = Array.from({ length: 8 }, (_, i) => i);
       const arcBytes = await client.fetchArcs(arcIds);
       const order: number[] = [];

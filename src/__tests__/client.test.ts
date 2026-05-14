@@ -5,10 +5,10 @@ import { describe, expect, it } from "vitest";
 
 import { type Topology } from "topojson-specification";
 
-import { CtopoClient } from "../client";
-import { makeBufferFetcher, type RangeFetcher } from "../fetcher";
+import { CtopoCore } from "../core/client";
+import { makeBufferFetcher, type RangeFetcher } from "../core/fetcher";
 import { encodeContainer } from "../encode";
-import { readVarintZigzagInto } from "../format";
+import { readVarintZigzagInto } from "../core/format";
 
 // Quantized variant of fixtureTopology — adds a `transform` so the
 // encoder takes the delta + varint arc path (and emits arc_endpoints
@@ -92,7 +92,7 @@ function fixtureTopology(): Topology {
   };
 }
 
-describe("CtopoClient", () => {
+describe("CtopoCore", () => {
   // Buffer-backed fetcher with call counting — wraps makeBufferFetcher
   // so tests can also assert "how many GETs did this drain trigger".
   function fetcherFor(buf: Buffer): {
@@ -146,7 +146,7 @@ describe("CtopoClient", () => {
   it("opens a container and exposes meta", async () => {
     const buf = await encodeContainer(fixtureTopology());
     const { fetcher } = fetcherFor(buf);
-    const client = await CtopoClient.openWith(fetcher);
+    const client = await CtopoCore.openWith(fetcher);
 
     expect(client.meta.numArcs).toBe(4);
     expect(client.meta.layers[0].numGeometries).toBe(1);
@@ -155,7 +155,7 @@ describe("CtopoClient", () => {
   it("dedupes concurrent property() calls into a single fetch", async () => {
     const buf = await encodeContainer(fixtureTopology());
     const { fetcher, calls, reset } = fetcherFor(buf);
-    const client = await CtopoClient.openWith(fetcher);
+    const client = await CtopoCore.openWith(fetcher);
 
     reset();
     const [a, b, c] = await Promise.all([
@@ -196,14 +196,14 @@ describe("CtopoClient", () => {
       },
       suffix: (length, signal) => inner.suffix(length, signal),
     };
-    const client = await CtopoClient.openWith(fetcher);
+    const client = await CtopoCore.openWith(fetcher);
     await expect(client.fetchArcs([0])).rejects.toThrow(/short read/);
   });
 
   it("strings() returns a StringArray that decodes lazily", async () => {
     const buf = await encodeContainer(fixtureTopology());
     const { fetcher } = fetcherFor(buf);
-    const client = await CtopoClient.openWith(fetcher);
+    const client = await CtopoCore.openWith(fetcher);
 
     const ids = await client.strings("block/id");
     expect(ids.length).toBe(1);
@@ -221,7 +221,7 @@ describe("CtopoClient", () => {
       },
       suffix: (length, signal) => inner.suffix(length, signal),
     };
-    const client = await CtopoClient.openWith(fetcher, {
+    const client = await CtopoCore.openWith(fetcher, {
       frontPrefetchBytes: 0,
       arcCoordsPrefetchBytes: 0,
       arcOffsetsPrefetch: false,
@@ -240,7 +240,7 @@ describe("CtopoClient", () => {
     // Force the bootstrap to be tiny so subsequent section fetches
     // actually fire. Capture every Range request's [start, end).
     const { fetcher, requests } = recordingFetcher(buf);
-    const client = await CtopoClient.openWith(fetcher, {
+    const client = await CtopoCore.openWith(fetcher, {
       frontPrefetchBytes: 0,
       arcCoordsPrefetchBytes: 0,
       arcOffsetsPrefetch: false,
@@ -268,7 +268,7 @@ describe("CtopoClient", () => {
     // don't have a consumer for).
     const buf = await encodeContainer(quantizedFixtureTopology());
     const { fetcher } = recordingFetcher(buf);
-    const client = await CtopoClient.openWith(fetcher);
+    const client = await CtopoCore.openWith(fetcher);
 
     expect(client.hasArcEndpointsSection()).toBe(true);
 
@@ -314,7 +314,7 @@ describe("CtopoClient", () => {
       emitArcEndpoints: false,
     });
     const { fetcher } = recordingFetcher(buf);
-    const client = await CtopoClient.openWith(fetcher);
+    const client = await CtopoCore.openWith(fetcher);
     expect(client.hasArcEndpointsSection()).toBe(false);
 
     const ids = [0, 1, 2];
@@ -331,7 +331,7 @@ describe("CtopoClient", () => {
   it("fetchArcs coalesces concurrent arcs into two GETs (offsets + coords) and reuses cache on repeats", async () => {
     const buf = await encodeContainer(fixtureTopology());
     const { fetcher, requests } = recordingFetcher(buf);
-    const client = await CtopoClient.openWith(fetcher, {
+    const client = await CtopoCore.openWith(fetcher, {
       frontPrefetchBytes: 0,
       arcCoordsPrefetchBytes: 0,
       arcOffsetsPrefetch: false,
@@ -356,7 +356,7 @@ describe("CtopoClient", () => {
   it("concurrent fetches across families fire one GET per family (no cross-family bridging)", async () => {
     const buf = await encodeContainer(fixtureTopology());
     const { fetcher, requests } = recordingFetcher(buf);
-    const client = await CtopoClient.openWith(fetcher, {
+    const client = await CtopoCore.openWith(fetcher, {
       frontPrefetchBytes: 0,
       arcCoordsPrefetchBytes: 0,
       arcOffsetsPrefetch: false,
@@ -389,7 +389,7 @@ describe("CtopoClient", () => {
     // frontPrefetchBytes).
     const buf = await encodeContainer(fixtureTopology());
     const { fetcher, requests } = recordingFetcher(buf);
-    await CtopoClient.openWith(fetcher);
+    await CtopoCore.openWith(fetcher);
     // Drain microtasks so every speculative prefetch resolves.
     await new Promise((r) => setTimeout(r, 0));
 
@@ -408,7 +408,7 @@ describe("CtopoClient", () => {
   it("block table + dict are prefetched at open; fetchArcs only needs the block data", async () => {
     const buf = await encodeContainer(fixtureTopology());
     const { fetcher, requests } = recordingFetcher(buf);
-    const client = await CtopoClient.openWith(fetcher, {
+    const client = await CtopoCore.openWith(fetcher, {
       frontPrefetchBytes: 0,
       arcCoordsPrefetchBytes: 0,
       arcOffsetsPrefetch: false,
@@ -430,7 +430,7 @@ describe("CtopoClient", () => {
     // Negative gap makes the coalescer reject every bridge attempt
     // for offsets (since adjacent items have a non-negative gap).
     // Block-compressed arcs fetch whole blocks regardless of gap.
-    const client = await CtopoClient.openWith(fetcher, {
+    const client = await CtopoCore.openWith(fetcher, {
       frontPrefetchBytes: 0,
       arcCoordsPrefetchBytes: 0,
       arcOffsetsPrefetch: false,
@@ -448,7 +448,7 @@ describe("CtopoClient", () => {
   it("concurrent same-family arc fetches coalesce into one GET", async () => {
     const buf = await encodeContainer(fixtureTopology());
     const { fetcher, requests } = recordingFetcher(buf);
-    const client = await CtopoClient.openWith(fetcher, {
+    const client = await CtopoCore.openWith(fetcher, {
       frontPrefetchBytes: 0,
       arcCoordsPrefetchBytes: 0,
       arcOffsetsPrefetch: false,
@@ -465,7 +465,7 @@ describe("CtopoClient", () => {
   it("byte-range cache serves later sub-range requests from an earlier chunk", async () => {
     const buf = await encodeContainer(fixtureTopology());
     const { fetcher, requests } = recordingFetcher(buf);
-    const client = await CtopoClient.openWith(fetcher, {
+    const client = await CtopoCore.openWith(fetcher, {
       frontPrefetchBytes: 0,
       arcCoordsPrefetchBytes: 0,
       arcOffsetsPrefetch: false,
@@ -491,7 +491,7 @@ describe("CtopoClient", () => {
     // network requests needed.
     const buf = await encodeContainer(fixtureTopology());
     const { fetcher, requests } = recordingFetcher(buf);
-    const client = await CtopoClient.openWith(fetcher, {
+    const client = await CtopoCore.openWith(fetcher, {
       arcCoordsPrefetchBytes: 0,
       arcOffsetsPrefetch: false,
     });
@@ -520,14 +520,14 @@ describe("CtopoClient", () => {
       arcCoordBlockBytes: 32,
     });
 
-    const defaultClient = await CtopoClient.openWith(
+    const defaultClient = await CtopoCore.openWith(
       fetcherFor(defaultBuf).fetcher,
       {
         arcCoordsPrefetchBytes: 0,
         arcOffsetsPrefetch: false,
       },
     );
-    const tinyClient = await CtopoClient.openWith(fetcherFor(tinyBuf).fetcher, {
+    const tinyClient = await CtopoCore.openWith(fetcherFor(tinyBuf).fetcher, {
       arcCoordsPrefetchBytes: 0,
       arcOffsetsPrefetch: false,
     });
@@ -559,9 +559,12 @@ describe("CtopoClient", () => {
   // 2-point line so the encoder's per-arc bytes are deterministic
   // and tests can assert exact byteLengths.
   function syntheticTopology(numArcs: number): Topology {
-    const arcs: number[][][] = new Array(numArcs);
-    const geometries: { type: "Polygon"; arcs: number[][]; properties: { id: string } }[] =
-      new Array(numArcs);
+    const arcs = new Array<number[][]>(numArcs);
+    const geometries = new Array<{
+      type: "Polygon";
+      arcs: number[][];
+      properties: { id: string };
+    }>(numArcs);
     for (let i = 0; i < numArcs; i++) {
       const x = i;
       const y = i;
@@ -619,7 +622,7 @@ describe("CtopoClient", () => {
     "partitioned arc_offsets: 200K-arc topology triggers the partitioned path",
     async () => {
       const buf = await partitionedFixtureBuf();
-      const client = await CtopoClient.openWith(fetcherFor(buf).fetcher, {
+      const client = await CtopoCore.openWith(fetcherFor(buf).fetcher, {
         arcCoordsPrefetchBytes: 0,
         arcOffsetsPrefetch: false,
       });
@@ -646,7 +649,7 @@ describe("CtopoClient", () => {
     "partitioned arc_offsets: fetchArcs returns expected bytes against the arcOffsets() reference",
     async () => {
       const buf = await partitionedFixtureBuf();
-      const client = await CtopoClient.openWith(fetcherFor(buf).fetcher, {
+      const client = await CtopoCore.openWith(fetcherFor(buf).fetcher, {
         arcCoordsPrefetchBytes: 0,
         arcOffsetsPrefetch: false,
       });
@@ -673,7 +676,7 @@ describe("CtopoClient", () => {
     // arc_offsets, well below. Guards backward compatibility: small
     // files keep using the legacy reader code path.
     const buf = await encodeContainer(fixtureTopology());
-    const client = await CtopoClient.openWith(fetcherFor(buf).fetcher, {
+    const client = await CtopoCore.openWith(fetcherFor(buf).fetcher, {
       arcCoordsPrefetchBytes: 0,
       arcOffsetsPrefetch: false,
     });
@@ -689,7 +692,7 @@ describe("CtopoClient", () => {
     "partitioned arc_offsets: sparse fetch decompresses only the touched partitions",
     async () => {
       const buf = await partitionedFixtureBuf();
-      const client = await CtopoClient.openWith(fetcherFor(buf).fetcher, {
+      const client = await CtopoCore.openWith(fetcherFor(buf).fetcher, {
         arcCoordsPrefetchBytes: 0,
         arcOffsetsPrefetch: false,
       });
@@ -735,11 +738,10 @@ describe("CtopoClient", () => {
       // arcs at ~32 B/arc = ~6.4 MB uncompressed; with
       // arcCoordBlockBytes = 256 KiB we get ~25 blocks — under the
       // threshold.
-      const buf = await encodeContainer(
-        syntheticTopology(N_PARTITIONED_ARCS),
-        { arcCoordBlockBytes: 256 * 1024 },
-      );
-      const client = await CtopoClient.openWith(fetcherFor(buf).fetcher, {
+      const buf = await encodeContainer(syntheticTopology(N_PARTITIONED_ARCS), {
+        arcCoordBlockBytes: 256 * 1024,
+      });
+      const client = await CtopoCore.openWith(fetcherFor(buf).fetcher, {
         arcCoordsPrefetchBytes: 0,
         arcOffsetsPrefetch: false,
       });
@@ -762,7 +764,7 @@ describe("CtopoClient", () => {
     "partitioned arc_offsets: arcOffsets() slow-path is consistent with fetchArcs",
     async () => {
       const buf = await partitionedFixtureBuf();
-      const client = await CtopoClient.openWith(fetcherFor(buf).fetcher, {
+      const client = await CtopoCore.openWith(fetcherFor(buf).fetcher, {
         arcCoordsPrefetchBytes: 0,
         arcOffsetsPrefetch: false,
       });
@@ -796,7 +798,7 @@ describe("CtopoClient", () => {
       arcCoordBlockBytes: 256,
     });
     const { fetcher } = fetcherFor(buf);
-    const client = await CtopoClient.openWith(fetcher, {
+    const client = await CtopoCore.openWith(fetcher, {
       arcCoordsPrefetchBytes: 0,
       arcOffsetsPrefetch: false,
     });

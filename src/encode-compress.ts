@@ -19,8 +19,8 @@ import { spawnSync } from "child_process";
 import { tmpdir } from "os";
 import { join } from "path";
 
-import { stderrLog, memSnapshot } from "./util";
-import { VARINT_MAX_BYTES, writeVarintZigzag } from "./format";
+import { stderrLog, memSnapshot } from "./core/util";
+import { VARINT_MAX_BYTES, writeVarintZigzag } from "./core/format";
 
 // --- Types ---
 
@@ -235,7 +235,7 @@ export async function blockCompressArcCoords(
 
   // Build the per-block uncompressed payloads — fresh subarrays into
   // arcCoordsBytes, no copy — and hand them to the shared dict-picker.
-  const blockPayloads: Uint8Array[] = new Array(blockSpecs.length);
+  const blockPayloads = new Array<Uint8Array>(blockSpecs.length);
   for (let i = 0; i < blockSpecs.length; i++) {
     blockPayloads[i] = arcCoordsBytes.subarray(
       blockSpecs[i].startUncompressed,
@@ -463,10 +463,7 @@ export async function blockCompressArcOffsets(
       const i = cursor++;
       compressedFrames[i] = await compressFrame(s, payloads[i]);
       completed++;
-      if (
-        completed % PROGRESS_EVERY === 0 ||
-        completed === blockSpecs.length
-      ) {
+      if (completed % PROGRESS_EVERY === 0 || completed === blockSpecs.length) {
         stderrLog(
           `[blockCompressOffsets] ${completed}/${blockSpecs.length} ` +
             `t=${((Date.now() - t0) / 1000).toFixed(1)}s ${memSnapshot()}`,
@@ -645,10 +642,7 @@ export async function blockCompressArcEndpoints(
       const i = cursor++;
       compressedFrames[i] = await compressFrame(s, payloads[i]);
       completed++;
-      if (
-        completed % PROGRESS_EVERY === 0 ||
-        completed === blockSpecs.length
-      ) {
+      if (completed % PROGRESS_EVERY === 0 || completed === blockSpecs.length) {
         stderrLog(
           `[blockCompressEndpoints] ${completed}/${blockSpecs.length} ` +
             `t=${((Date.now() - t0) / 1000).toFixed(1)}s ${memSnapshot()}`,

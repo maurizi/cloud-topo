@@ -231,8 +231,13 @@ export class StringArray {
   private readonly utf8: Uint8Array;
   private readonly decoder: TextDecoder;
   readonly length: number;
+  // Raw section bytes (count + offsets + utf8 data). Exposed so the
+  // worker boundary can ship the underlying ArrayBuffer to the main
+  // thread and rebuild a StringArray there without re-fetching.
+  readonly bytes: Uint8Array;
 
   constructor(bytes: Uint8Array) {
+    this.bytes = bytes;
     this.view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
     this.length = this.view.getUint32(0, true);
     const offsetsStart = 8;

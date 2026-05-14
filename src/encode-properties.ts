@@ -15,7 +15,7 @@
 
 import { type GeometryObject, type Properties } from "topojson-specification";
 
-import { type DType } from "./types";
+import { type DType } from "./core/types";
 import { type BuiltSection } from "./encode";
 import { typedArrayBytes } from "./encode-arcs";
 

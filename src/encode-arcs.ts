@@ -18,7 +18,7 @@
 
 import { type Topology } from "topojson-specification";
 
-import { VARINT_MAX_BYTES, writeVarintZigzag } from "./format";
+import { VARINT_MAX_BYTES, writeVarintZigzag } from "./core/format";
 
 // --- Types ---
 

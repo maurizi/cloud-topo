@@ -81,6 +81,43 @@ export function perfLog(msg: string): void {
   if (perfChannel !== null) perfChannel.postMessage(msg);
 }
 
+// --- Public fetcher spec (cross-worker) ---
+
+// Tagged union describing how the worker should reconstruct the
+// `RangeFetcher`. Only kinds the worker can build from postMessage-
+// safe data appear here — function-based fetchers (e.g. user-provided
+// closures) can't cross the boundary, so the surface intentionally
+// excludes them.
+//
+// Layout per kind:
+//   - "http":   URL string only.
+//   - "buffer": raw bytes; the worker uses them in place (callers may
+//               transfer the underlying ArrayBuffer at open time so
+//               there's no copy).
+export type FetcherSpec =
+  | { readonly kind: "http"; readonly url: string }
+  | { readonly kind: "buffer"; readonly bytes: Uint8Array };
+
+// Reconstruct a `RangeFetcher` from a `FetcherSpec`. Worker-side only:
+// runs once at open time, on the receiving side of the postMessage
+// boundary. Throws on unknown `kind` so format additions can't be
+// silently ignored by older worker bundles.
+export function reconstructFetcher(spec: FetcherSpec): RangeFetcher {
+  switch (spec.kind) {
+    case "http":
+      return makeHttpFetcher(spec.url);
+    case "buffer":
+      return makeBufferFetcher(spec.bytes);
+    default: {
+      const _exhaustive: never = spec;
+      void _exhaustive;
+      throw new Error(
+        `ctopo: unknown fetcher spec kind ${(spec as { kind: string }).kind}`,
+      );
+    }
+  }
+}
+
 // --- Fetcher factories ---
 
 // Lift a "fetch this Range header value" callback into a RangeFetcher.
