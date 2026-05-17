@@ -198,6 +198,30 @@ export interface ContainerMeta {
   readonly layers: ReadonlyArray<{
     readonly name: string;
     readonly numGeometries: number;
+    // Present iff this layer's arc_refs is shipped in partitioned
+    // form: one independently-decodable zstd frame per partition,
+    // partitioned along geom-id boundaries so each partition carries
+    // a contiguous geom range's worth of the layer's arc_refs CSR
+    // slice. Absent for the legacy monolithic `${layer}/arc_refs`
+    // section (small layers, or files produced by older encoders);
+    // the reader dispatches on this field's presence.
+    //
+    // Lets the reader fan out decompress across the zstd worker
+    // pool (vs one giant frame on one worker) and, with partial-
+    // fetch, fetch only the partitions covering a sparse geom
+    // selection.
+    readonly arcRefsBlocks?: {
+      // u32 triples [firstGeomId, compressedOffset, compressedLength]
+      // per partition. firstGeomId is the smallest geom id whose
+      // arc_refs slice lives in this partition; the partition covers
+      // geoms [firstGeomId_i, firstGeomId_{i+1}). compressedOffset
+      // is relative to the start of partitionsSection.
+      readonly blockTableSection: string;
+      // Section name carrying the concatenation of per-partition
+      // compressed arc_refs frames.
+      readonly partitionsSection: string;
+      readonly blockCount: number;
+    };
   }>;
   readonly sections: ReadonlyArray<{
     readonly name: string;

@@ -76,12 +76,15 @@ import {
 } from "./encode-properties";
 import {
   ARC_OFFSETS_PARTITION_MIN_BYTES,
+  ARC_REFS_PARTITION_MIN_BYTES,
+  ARC_REFS_TARGET_PARTITION_BYTES,
   autoArcCoordDictBytes,
   autoArcEndpointsDictBytes,
   autoArcOffsetsDictBytes,
   blockCompressArcCoords,
   blockCompressArcEndpoints,
   blockCompressArcOffsets,
+  blockCompressArcRefs,
   DEFAULT_ARC_COORD_BLOCK_BYTES,
 } from "./encode-compress";
 import { runWithConcurrency } from "./core/util";
@@ -253,7 +256,15 @@ export async function encodeContainer(
   }
 
   const sections: BuiltSection[] = [];
-  const layerSummaries: { name: string; numGeometries: number }[] = [];
+  const layerSummaries: {
+    name: string;
+    numGeometries: number;
+    arcRefsBlocks?: {
+      readonly blockTableSection: string;
+      readonly partitionsSection: string;
+      readonly blockCount: number;
+    };
+  }[] = [];
 
   const numArcs = input.arcs.length;
   const layerNames = Object.keys(input.objects);
@@ -510,12 +521,46 @@ export async function encodeContainer(
       delta: true,
       frontLoad: true,
     });
-    sections.push({
-      name: `${layerName}/arc_refs`,
-      dtype: "i32",
-      bytes: typedArrayBytes(csr.arcRefs),
-      frontLoad: true,
-    });
+    // arc_refs: partitioned for large layers (block, blockgroup);
+    // monolithic for small ones (county, state). Partitioned form
+    // lets the reader fan out decompress across the zstd worker
+    // pool (one frame per partition vs one giant 100+ MiB frame)
+    // and — in a follow-up — fetch only the partitions covering a
+    // sparse selection. Threshold + target size live with the
+    // implementation in encode-compress.ts.
+    if (csr.arcRefs.byteLength >= ARC_REFS_PARTITION_MIN_BYTES) {
+      const refsBlock = await blockCompressArcRefs(
+        csr,
+        ARC_REFS_TARGET_PARTITION_BYTES,
+      );
+      sections.push({
+        name: `${layerName}/arc_refs_blocks`,
+        dtype: "u32",
+        bytes: refsBlock.blockTableBytes,
+        frontLoad: true,
+      });
+      sections.push({
+        name: `${layerName}/arc_refs_partitions`,
+        dtype: "blob",
+        bytes: refsBlock.compressedBytes,
+        frontLoad: false,
+      });
+      const summary = layerSummaries.find((l) => l.name === layerName);
+      if (summary !== undefined) {
+        summary.arcRefsBlocks = {
+          blockTableSection: `${layerName}/arc_refs_blocks`,
+          partitionsSection: `${layerName}/arc_refs_partitions`,
+          blockCount: refsBlock.blockCount,
+        };
+      }
+    } else {
+      sections.push({
+        name: `${layerName}/arc_refs`,
+        dtype: "i32",
+        bytes: typedArrayBytes(csr.arcRefs),
+        frontLoad: true,
+      });
+    }
     // multi_poly_breaks: sparse — typically empty for layers without
     // multi-entry MultiPolygon features. Front-loaded so merge() can
     // recover the original polygon grouping without an extra round trip.
@@ -774,6 +819,13 @@ function shouldCompressSection(name: string, _dtype: DType): boolean {
   if (name === "arc_endpoints") return false;
   if (name === "arc_endpoint_blocks") return false;
   if (name === "arc_endpoints_dict") return false;
+  // Per-layer partitioned arc_refs (e.g. `block/arc_refs_partitions`).
+  // The partitions section is already a concatenation of per-partition
+  // zstd frames; recompressing it would double-encode and break the
+  // per-partition decompress path. The blocks table is small + fetched
+  // eagerly.
+  if (name.endsWith("/arc_refs_partitions")) return false;
+  if (name.endsWith("/arc_refs_blocks")) return false;
   // Everything else (CSR triples, arc_offsets, properties, strings)
   // compresses freely.
   return true;

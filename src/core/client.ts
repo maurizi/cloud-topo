@@ -349,6 +349,13 @@ export class CtopoCore {
   // to per-partition `compressedOffset` from the offsets-blocks table
   // to produce absolute file byte intervals.
   private readonly arcOffsetsPartitionsBase: number = 0;
+  // Per-layer section base for the layer's arc_refs_partitions. Only
+  // populated for layers whose META carries `arcRefsBlocks`; absent
+  // entries mean the layer uses the monolithic `${layer}/arc_refs`
+  // path. Added to per-partition `compressedOffset` from the layer's
+  // arc_refs_blocks table to produce absolute file byte intervals.
+  private readonly arcRefsPartitionsBaseByLayer = new Map<string, number>();
+
   // Section base for arc_endpoints. Same role as
   // arcOffsetsPartitionsBase: added to per-partition `compressedOffset`
   // from the endpoint-blocks table to produce absolute file ranges.
@@ -390,6 +397,21 @@ export class CtopoCore {
   private readonly breaksByGeomCache = new Map<
     string,
     Map<number, number[]>
+  >();
+  // Per-layer arc_refs block table (the u32 quads
+  // [firstGeomId, compOff, compLen, uncLen]). Fetched lazily on first
+  // partitioned-layer geometry load, reused thereafter.
+  private readonly arcRefsBlocksPromiseByLayer = new Map<
+    string,
+    Promise<Uint32Array>
+  >();
+  // Per-layer per-partition decompressed cache. Outer key = layer
+  // name; inner key = partition index. Holds raw decompressed bytes
+  // (concatenation into the layer-wide arc_refs view happens once
+  // per layerGeometry resolve).
+  private readonly decompressedArcRefsCacheByLayer = new Map<
+    string,
+    Map<number, Promise<Uint8Array>>
   >();
   // Decompressed group bytes keyed by `${physicalOffset}:${physicalLength}`.
   // Members of the same compression group share one decompress here,
@@ -543,6 +565,23 @@ export class CtopoCore {
       this.arcOffsetsPartitionsBase = partitions.offset;
     } else if (this.sectionByName.get("arc_offsets") === undefined) {
       throw new Error("ctopo: container is missing the arc_offsets section");
+    }
+
+    // Per-layer arc_refs partitioning: each layer with arcRefsBlocks
+    // META carries its own `${layer}/arc_refs_partitions` section.
+    // Stash the base offset so getDecompressedArcRefsPartition can
+    // build absolute byte ranges from the per-partition `compOff`.
+    for (const layer of this.meta.layers) {
+      if (layer.arcRefsBlocks === undefined) continue;
+      const partitions = this.sectionByName.get(
+        layer.arcRefsBlocks.partitionsSection,
+      );
+      if (partitions === undefined) {
+        throw new Error(
+          `ctopo: container is missing the "${layer.arcRefsBlocks.partitionsSection}" section referenced by layer "${layer.name}".arcRefsBlocks META`,
+        );
+      }
+      this.arcRefsPartitionsBaseByLayer.set(layer.name, partitions.offset);
     }
 
     // arc_endpoints is optional — present iff the encoder emitted the
@@ -785,11 +824,19 @@ export class CtopoCore {
     if (cached !== undefined) return cached;
     const polyEntry = this.sectionEntry(`${layer}/poly_offsets`);
     const ringEntry = this.sectionEntry(`${layer}/ring_offsets`);
-    const arcRefEntry = this.sectionEntry(`${layer}/arc_refs`);
     // multi_poly_breaks is sparse — encoder omits the section entirely
     // for layers with no multi-entry MultiPolygon features. Treat
     // absence as an empty break list.
     const breaksEntry = this.sectionByName.get(`${layer}/multi_poly_breaks`);
+    const layerMeta = this.meta.layers.find((l) => l.name === layer);
+    const partitioned = layerMeta?.arcRefsBlocks !== undefined;
+    // Monolithic-path entry is fetched here so the Promise.all below
+    // can include it; for the partitioned path we substitute an
+    // already-resolved sentinel and assemble the Int32Array via
+    // fetchArcRefsPartitioned.
+    const arcRefEntry = partitioned
+      ? null
+      : this.sectionEntry(`${layer}/arc_refs`);
 
     const promise = (async () => {
       // Fire all section fetches concurrently — when they all share a
@@ -798,15 +845,18 @@ export class CtopoCore {
       // from one fetch. When they're independent sections (layers
       // larger than one group), they parallelize through the normal
       // range pipeline.
-      const [polyBytes, ringBytes, arcRefsBytes, breakBytes] =
-        await Promise.all([
-          this.fetchSectionBytes(polyEntry, signal),
-          this.fetchSectionBytes(ringEntry, signal),
-          this.fetchSectionBytes(arcRefEntry, signal),
-          breaksEntry !== undefined
-            ? this.fetchSectionBytes(breaksEntry, signal)
-            : Promise.resolve(undefined),
-        ]);
+      const [polyBytes, ringBytes, arcRefs, breakBytes] = await Promise.all([
+        this.fetchSectionBytes(polyEntry, signal),
+        this.fetchSectionBytes(ringEntry, signal),
+        partitioned
+          ? this.fetchArcRefsPartitioned(layer, signal)
+          : this.fetchSectionBytes(arcRefEntry!, signal).then(
+              (b) => viewDecompressedSection(b, "i32") as Int32Array,
+            ),
+        breaksEntry !== undefined
+          ? this.fetchSectionBytes(breaksEntry, signal)
+          : Promise.resolve(undefined),
+      ]);
       // Not tallied here: layerGeometry returns the full CSR views,
       // but useful-byte attribution wants index-level reads. The
       // mergeArcs primitive does those reads in expandLayerPolygons
@@ -814,7 +864,7 @@ export class CtopoCore {
       return {
         polyOffsets: viewU32WithDelta(polyBytes, polyEntry.delta === true),
         ringOffsets: viewU32WithDelta(ringBytes, ringEntry.delta === true),
-        arcRefs: viewDecompressedSection(arcRefsBytes, "i32") as Int32Array,
+        arcRefs,
         multiPolyBreaks:
           breakBytes !== undefined
             ? (viewDecompressedSection(breakBytes, "u32") as Uint32Array)
@@ -976,6 +1026,8 @@ export class CtopoCore {
     this.decompressedArcCoordBlockCache.clear();
     this.decompressedArcOffsetsBlockCache.clear();
     this.decompressedArcEndpointsBlockCache.clear();
+    this.arcRefsBlocksPromiseByLayer.clear();
+    this.decompressedArcRefsCacheByLayer.clear();
     this.arcCoordBlocksPromise = undefined;
     this.arcCoordDictPromise = undefined;
     this.arcOffsetsBlocksPromise = undefined;
@@ -1366,6 +1418,117 @@ export class CtopoCore {
       );
     }
     return this.arcOffsetsBlocksPromise;
+  }
+
+  // --- Per-layer partitioned arc_refs ---
+
+  // Block table for this layer's arc_refs partitions, fetched lazily
+  // and reused for every subsequent layerGeometry call against the
+  // same layer.
+  private getArcRefsBlocks(layer: string): Promise<Uint32Array> {
+    const cached = this.arcRefsBlocksPromiseByLayer.get(layer);
+    if (cached !== undefined) return cached;
+    const layerMeta = this.meta.layers.find((l) => l.name === layer);
+    const meta = layerMeta?.arcRefsBlocks;
+    if (meta === undefined) {
+      throw new Error(
+        `ctopo: getArcRefsBlocks called for layer "${layer}" which has no arcRefsBlocks META`,
+      );
+    }
+    const entry = this.sectionByName.get(meta.blockTableSection);
+    if (entry === undefined) {
+      throw new Error(
+        `ctopo: container is missing the "${meta.blockTableSection}" section`,
+      );
+    }
+    const promise = this.fetchSectionBytes(entry).then(
+      (bytes) =>
+        new Uint32Array(bytes.buffer, bytes.byteOffset, bytes.byteLength / 4),
+    );
+    this.arcRefsBlocksPromiseByLayer.set(layer, promise);
+    return promise;
+  }
+
+  // Decompress one arc_refs partition. Mirrors
+  // getDecompressedArcOffsetsBlock: synthesize a section entry for the
+  // partition's compressed slice, route the fetch through the
+  // section coalescer family ("arc_refs"), then decompress via the
+  // shared zstd worker pool. Returns the raw decompressed bytes;
+  // callers wrap them as Int32Array views.
+  private getDecompressedArcRefsPartition(
+    layer: string,
+    partIdx: number,
+    blocks: Uint32Array,
+    base: number,
+  ): Promise<Uint8Array> {
+    let layerCache = this.decompressedArcRefsCacheByLayer.get(layer);
+    if (layerCache === undefined) {
+      layerCache = new Map();
+      this.decompressedArcRefsCacheByLayer.set(layer, layerCache);
+    }
+    const cached = layerCache.get(partIdx);
+    if (cached !== undefined) return cached;
+
+    const compOffset = blocks[partIdx * 4 + 1];
+    const compLength = blocks[partIdx * 4 + 2];
+    const uncLength = blocks[partIdx * 4 + 3];
+    const physicalStart = base + compOffset;
+    const physicalEnd = physicalStart + compLength;
+    const entry: SectionEntry = {
+      name: `${layer}/arc_refs[partition ${partIdx}]`,
+      dtype: "i32",
+      offset: physicalStart,
+      length: compLength,
+      compression: "zstd",
+      uncompressedRegionLength: uncLength,
+    };
+    const promise = (async () => {
+      const [compressed, decode] = await Promise.all([
+        this.enqueueSectionFetch("arc_refs", physicalStart, physicalEnd),
+        loadZstdWasmDecode(entry),
+      ]);
+      const t0 = performance.now();
+      const out = await decode(compressed, uncLength);
+      this.statDecompressMs += performance.now() - t0;
+      this.statDecompressBytes += out.byteLength;
+      return out;
+    })();
+    layerCache.set(partIdx, promise);
+    return promise;
+  }
+
+  // Assemble the layer's full arc_refs Int32Array from the partitioned
+  // form. Fans out one decompress per partition through the zstd
+  // worker pool, then concatenates the decompressed bytes into a
+  // single buffer. The concat is a per-partition memcpy at typed-array
+  // .set() speed — ~30 ms for the national block layer's 163 MiB.
+  private async fetchArcRefsPartitioned(
+    layer: string,
+    signal: AbortSignal | undefined,
+  ): Promise<Int32Array> {
+    throwIfAborted(signal);
+    const base = this.arcRefsPartitionsBaseByLayer.get(layer);
+    if (base === undefined) {
+      throw new Error(
+        `ctopo: fetchArcRefsPartitioned called for layer "${layer}" which has no arc_refs partitions`,
+      );
+    }
+    const blocks = await this.getArcRefsBlocks(layer);
+    const partitionCount = blocks.length / 4;
+    const partBytes = await Promise.all(
+      Array.from({ length: partitionCount }, (_, i) =>
+        this.getDecompressedArcRefsPartition(layer, i, blocks, base),
+      ),
+    );
+    let total = 0;
+    for (const b of partBytes) total += b.byteLength;
+    const out = new Uint8Array(total);
+    let off = 0;
+    for (const b of partBytes) {
+      out.set(b, off);
+      off += b.byteLength;
+    }
+    return new Int32Array(out.buffer, out.byteOffset, out.byteLength / 4);
   }
 
   // Resolves to undefined when the file has no shared arc_offsets

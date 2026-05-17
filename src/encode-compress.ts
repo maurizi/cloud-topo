@@ -684,6 +684,154 @@ export async function blockCompressArcEndpoints(
   };
 }
 
+// --- arc_refs (per-layer CSR arc-id table, partitioned) ---
+
+// Below this raw-arc_refs size a layer ships arc_refs as a single
+// monolithic zstd-compressed section (the original format). At this
+// scale, per-partition zstd-frame overhead + the block-table cost
+// outweigh the parallel-decompress win. Above the threshold, the
+// partitioned path lets the reader fan out decode across the zstd
+// worker pool and (in a later change) fetch only the partitions
+// covering a sparse selection.
+export const ARC_REFS_PARTITION_MIN_BYTES = 2 * 1024 * 1024;
+
+// Target uncompressed bytes per partition. 4 MiB matches the default
+// reader chunk cap (DEFAULT_MAX_CHUNK in client.ts), so each
+// partition's compressed body (~2.3 MiB at the typical 1.7× ratio
+// for raw signed arc ids) fits comfortably in one fetch request.
+// That gives a clean 1:1 fetch-to-decompress pipeline — every range
+// response can drop straight into the zstd worker queue without
+// further splitting. Smaller partitions also fan out finer across
+// the worker pool (40 partitions on the national block layer at
+// 163 MiB raw, vs 10 partitions at 16 MiB target) and unlock
+// finer-grained partial-fetch when a follow-up adds it. The
+// compression-ratio cost is ~3% larger compressed bytes vs 16 MiB
+// frames (less per-frame context warmup) — trivial.
+export const ARC_REFS_TARGET_PARTITION_BYTES = 4 * 1024 * 1024;
+
+export interface BlockCompressedArcRefs {
+  // u32 quads [firstGeomId, compressedOffset, compressedLength,
+  // uncompressedLength] per partition. firstGeomId is the smallest
+  // geom id whose arc_refs slice lives in this partition; the
+  // partition covers geoms [firstGeomId_i, firstGeomId_{i+1}).
+  // compressedOffset is relative to the start of the concatenated
+  // partitions blob. uncompressedLength is the partition's raw arc_refs
+  // byte count (= 4 × arcs-in-partition) — needed by the wasm decoder
+  // to size its output buffer without first decompressing
+  // poly_offsets + ring_offsets to derive it.
+  readonly blockTableBytes: Uint8Array;
+  // Concatenation of compressed per-partition zstd frames. Each
+  // frame's payload is the raw Int32 arc_refs slice for its geoms.
+  readonly compressedBytes: Uint8Array;
+  readonly blockCount: number;
+}
+
+// Block-compress a layer's arc_refs table along geom-id boundaries.
+// Walks geoms accumulating arcRefs byte cost; closes the current
+// partition at the next geom boundary once the target is hit. Each
+// partition compresses as one independent zstd frame; no shared
+// dict (raw signed arc ids don't repeat enough across partitions
+// to justify the training cost — measured: <1% byte-size win).
+export async function blockCompressArcRefs(
+  csr: {
+    readonly polyOffsets: Uint32Array;
+    readonly ringOffsets: Uint32Array;
+    readonly arcRefs: Int32Array;
+  },
+  targetPartitionBytes: number,
+): Promise<BlockCompressedArcRefs> {
+  const numGeoms = csr.polyOffsets.length - 1;
+
+  // First pass: pick partition boundaries.
+  const firstGeomIdPerPartition: number[] = [0];
+  let acc = 0;
+  for (let g = 0; g < numGeoms; g++) {
+    const ringStart = csr.polyOffsets[g];
+    const ringEnd = csr.polyOffsets[g + 1];
+    const arcStart = csr.ringOffsets[ringStart];
+    const arcEnd = csr.ringOffsets[ringEnd];
+    acc += (arcEnd - arcStart) * 4;
+    if (acc >= targetPartitionBytes && g + 1 < numGeoms) {
+      firstGeomIdPerPartition.push(g + 1);
+      acc = 0;
+    }
+  }
+  const blockCount = firstGeomIdPerPartition.length;
+  firstGeomIdPerPartition.push(numGeoms); // sentinel for the last partition's end
+
+  // Second pass: build per-partition payload views over csr.arcRefs.
+  // Using .subarray gives zero-copy slices; the underlying Int32Array
+  // buffer is shared until the zstd stream consumes it.
+  const payloads = new Array<Uint8Array>(blockCount);
+  for (let i = 0; i < blockCount; i++) {
+    const firstGeom = firstGeomIdPerPartition[i];
+    const nextFirstGeom = firstGeomIdPerPartition[i + 1];
+    const arcStart = csr.ringOffsets[csr.polyOffsets[firstGeom]];
+    const arcEnd = csr.ringOffsets[csr.polyOffsets[nextFirstGeom]];
+    const slice = csr.arcRefs.subarray(arcStart, arcEnd);
+    payloads[i] = new Uint8Array(
+      slice.buffer,
+      slice.byteOffset,
+      slice.byteLength,
+    );
+  }
+
+  // Compress each partition as one independent zstd frame. Mirrors
+  // blockCompressArcOffsets' persistent-stream worker pool — keeps
+  // the binding from rebuilding compression contexts per frame.
+  const compressedFrames = new Array<Buffer>(blockCount);
+  const t0 = Date.now();
+  stderrLog(
+    `[blockCompressArcRefs] start: ${blockCount} partitions, ` +
+      `arc_refs=${(csr.arcRefs.byteLength / 1024 / 1024).toFixed(1)} MiB raw, ` +
+      `concurrency=${BLOCK_COMPRESS_CONCURRENCY}`,
+  );
+  const poolSize = Math.min(BLOCK_COMPRESS_CONCURRENCY, blockCount);
+  const streams = new Array<ZstdFrameStream>(poolSize);
+  for (let s = 0; s < poolSize; s++) streams[s] = makeZstdFrameStream(undefined);
+  let cursor = 0;
+  const worker = async (s: ZstdFrameStream): Promise<void> => {
+    while (cursor < blockCount) {
+      const i = cursor++;
+      compressedFrames[i] = await compressFrame(s, payloads[i]);
+    }
+  };
+  try {
+    await Promise.all(streams.map((s) => worker(s)));
+  } finally {
+    for (const s of streams) closeZstdFrameStream(s);
+  }
+  stderrLog(
+    `[blockCompressArcRefs] done in ${((Date.now() - t0) / 1000).toFixed(1)}s`,
+  );
+
+  // Concatenate frames + build the
+  // [firstGeomId, compOff, compLen, uncLen] table.
+  let totalCompressed = 0;
+  for (const f of compressedFrames) totalCompressed += f.byteLength;
+  const compressedBytes = new Uint8Array(totalCompressed);
+  const blockTableBytes = new Uint8Array(blockCount * 16);
+  const tableView = new DataView(blockTableBytes.buffer);
+  let cOff = 0;
+  const framesWritable = compressedFrames as unknown as (Buffer | null)[];
+  for (let i = 0; i < blockCount; i++) {
+    const f = compressedFrames[i];
+    compressedBytes.set(f, cOff);
+    tableView.setUint32(i * 16 + 0, firstGeomIdPerPartition[i], true);
+    tableView.setUint32(i * 16 + 4, cOff, true);
+    tableView.setUint32(i * 16 + 8, f.byteLength, true);
+    tableView.setUint32(i * 16 + 12, payloads[i].byteLength, true);
+    cOff += f.byteLength;
+    framesWritable[i] = null;
+  }
+
+  return {
+    blockTableBytes,
+    compressedBytes,
+    blockCount,
+  };
+}
+
 // --- Internal: dictionary training ---
 
 // Train a zstd shared dictionary from a list of per-block payloads via
