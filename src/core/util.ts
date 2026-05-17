@@ -2,14 +2,12 @@
 // © 2026 Michael Maurizi Jr.
 
 /**
- * Shared utilities used by both the client (browser) and encoder (Node).
- *
- * Tree-shaking ensures browser bundles only pull `runWithConcurrency`;
- * `stderrLog` and `memSnapshot` are Node-only and only imported by the
- * encoder.
+ * Browser-safe shared utilities. Anything that needs `fs` /
+ * `process.memoryUsage()` lives in `util-node.ts` so tsup's chunking
+ * doesn't pull Node-only code into the chunk shared with the browser
+ * client (which broke under Vite with "Module 'fs' has been
+ * externalized for browser compatibility").
  */
-
-import { writeSync } from "fs";
 
 // --- Bounded-concurrency worker pool ---
 
@@ -33,26 +31,4 @@ export async function runWithConcurrency<T>(
   const workers = new Array<Promise<void>>(n);
   for (let i = 0; i < n; i++) workers[i] = worker();
   await Promise.all(workers);
-}
-
-// --- Node-only stderr logging ---
-
-// Unbuffered write to stderr. Node's `process.stderr.write` is block-
-// buffered through docker pipes and lines get swallowed if the process
-// is killed before the buffer flushes; `writeSync(2, ...)` bypasses
-// that.
-export function stderrLog(msg: string): void {
-  writeSync(2, msg + "\n");
-}
-
-// Format `process.memoryUsage()` as a compact one-liner for progress
-// logging during long encode passes.
-export function memSnapshot(): string {
-  const m = process.memoryUsage();
-  return (
-    `rss=${(m.rss / 1024 / 1024).toFixed(0)}M ` +
-    `heap=${(m.heapUsed / 1024 / 1024).toFixed(0)}/${(m.heapTotal / 1024 / 1024).toFixed(0)}M ` +
-    `external=${(m.external / 1024 / 1024).toFixed(0)}M ` +
-    `arrayBuffers=${(m.arrayBuffers / 1024 / 1024).toFixed(0)}M`
-  );
 }

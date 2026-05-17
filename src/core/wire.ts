@@ -80,10 +80,20 @@ export interface WireFlatNeighbors {
   readonly values: ArrayBufferLike;
 }
 
+// `clientId` namespaces every request/response to one CtopoClient
+// proxy. The proxy generates a random clientId per instance; the worker
+// tracks state in a `Map<clientId, ...>`. With this in place a single
+// worker can serve multiple proxies — including proxies on different
+// threads attached via `addPort` — and their `id` counters never have
+// to coordinate (each proxy's per-instance `nextId` is filtered by
+// `clientId` on the response side, so ID collisions across clients are
+// harmless).
+//
 // Discriminated request union — each variant declares its own payload
 // shape so the worker dispatcher and the proxy stay typed end-to-end.
 export type WorkerRequest =
   | {
+      readonly clientId: number;
       readonly id: number;
       readonly method: "open";
       readonly args: {
@@ -93,66 +103,79 @@ export type WorkerRequest =
       };
     }
   | {
+      readonly clientId: number;
       readonly id: number;
       readonly method: "property";
       readonly args: { readonly name: string };
     }
   | {
+      readonly clientId: number;
       readonly id: number;
       readonly method: "strings";
       readonly args: { readonly name: string };
     }
   | {
+      readonly clientId: number;
       readonly id: number;
       readonly method: "layerGeometry";
       readonly args: { readonly layer: string };
     }
   | {
+      readonly clientId: number;
       readonly id: number;
       readonly method: "mergeFlat";
       readonly args: { readonly selections: ReadonlyArray<WireLayerSelection> };
     }
   | {
+      readonly clientId: number;
       readonly id: number;
       readonly method: "mergeArcsFlat";
       readonly args: { readonly selections: ReadonlyArray<WireLayerSelection> };
     }
   | {
+      readonly clientId: number;
       readonly id: number;
       readonly method: "neighborsFlat";
       readonly args: { readonly layer: string };
     }
   | {
+      readonly clientId: number;
       readonly id: number;
       readonly method: "fetchArcs";
       readonly args: { readonly ids: ReadonlyArray<number> };
     }
   | {
+      readonly clientId: number;
       readonly id: number;
       readonly method: "fetchArcEndpoints";
       readonly args: { readonly ids: ReadonlyArray<number> };
     }
   | {
+      readonly clientId: number;
       readonly id: number;
       readonly method: "getStats";
       readonly args: Record<string, never>;
     }
   | {
+      readonly clientId: number;
       readonly id: number;
       readonly method: "resetStats";
       readonly args: Record<string, never>;
     }
   | {
+      readonly clientId: number;
       readonly id: number;
       readonly method: "tallyUseful";
       readonly args: { readonly name: string; readonly bytes: number };
     }
   | {
+      readonly clientId: number;
       readonly id: number;
       readonly method: "hasArcEndpointsSection";
       readonly args: Record<string, never>;
     }
   | {
+      readonly clientId: number;
       readonly id: number;
       readonly method: "close";
       readonly args: Record<string, never>;
@@ -161,13 +184,38 @@ export type WorkerRequest =
 // Sent on its own (no `method`) so the dispatcher can short-circuit
 // without paying the per-method overhead.
 export interface WorkerAbort {
+  readonly clientId: number;
   readonly id: number;
   readonly abort: true;
 }
 
+// Control message — used to attach an additional MessagePort to an
+// already-running worker so another thread can talk to the same
+// container without spawning a second worker. The worker hooks
+// `port.onmessage` and routes its requests by `clientId` just like the
+// primary connection.
+//
+// The port is embedded in the message body (not as a separate
+// `event.ports` slot) so this works uniformly in browsers and in
+// Node's `worker_threads` shim: Node exposes transferred MessagePorts
+// only through structured deserialization of the cloned data,
+// whereas browsers expose them via both `event.data` and
+// `event.ports`. The port must also appear in the postMessage
+// transfer list for both runtimes.
+export interface WorkerAddPort {
+  readonly kind: "addPort";
+  readonly port: MessagePort;
+}
+
 export type WorkerResponse =
-  | { readonly id: number; readonly ok: true; readonly result: unknown }
   | {
+      readonly clientId: number;
+      readonly id: number;
+      readonly ok: true;
+      readonly result: unknown;
+    }
+  | {
+      readonly clientId: number;
       readonly id: number;
       readonly ok: false;
       readonly error: { readonly name: string; readonly message: string };

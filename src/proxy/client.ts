@@ -3,18 +3,26 @@
 
 /**
  * Main-thread `CtopoClient` — proxy around the worker that holds the
- * in-process `CtopoCore`. All container reads (`property`, `strings`,
+ * `CtopoCore`. All container reads (`property`, `strings`,
  * `layerGeometry`, `fetchArcs`, …) and the merge primitives execute
  * in the worker; results come back as transferable typed arrays.
  *
  * Sync getters (`meta`, `sections`, `transform`) read from a snapshot
  * captured at open time so common in-render reads don't pay an RPC.
+ *
+ * One worker can host multiple `CtopoClient` instances (each gets its
+ * own random `clientId` and the worker keeps a `Map<clientId, …>` of
+ * cores). To attach a client running in a different thread, call
+ * `attachPort()` on an existing client and transfer the returned
+ * `MessagePort` to the other thread; that thread passes it as
+ * `openContainer(url, { port })` and skips spawning its own worker.
+ * Two opens against the same URL share the underlying core (and its
+ * byte-range cache) inside the worker.
  */
-
-import Worker from "web-worker";
 
 import { type CtopoClientStats } from "../core/client";
 import { type FetcherSpec } from "../core/fetcher";
+import { spawnWorker } from "../core/worker-host";
 import {
   StringArray,
   type ContainerMeta,
@@ -32,6 +40,7 @@ import type {
   WireOpenContainerOptions,
   WirePropertyResult,
   WireStringsResult,
+  WorkerAddPort,
   WorkerRequest,
   WorkerResponse,
 } from "../core/wire";
@@ -47,13 +56,21 @@ export interface OpenContainerOptions extends WireOpenContainerOptions {
   // `dist/worker.js` chunk the build emits alongside `dist/index.js`.
   // Override when the worker file is hosted at a non-default path
   // (CDN, custom dev server, etc.) or when running against TypeScript
-  // sources at test time.
+  // sources at test time. Ignored when `worker` or `port` is set.
   readonly workerUrl?: string | URL;
   // Caller-supplied Worker. Takes precedence over `workerUrl`. Useful
   // for test rigs that pre-spawn a Worker with a non-standard loader
   // (e.g. vite-node, tsx) or for consumers that want to share one
-  // worker across multiple opens.
+  // worker across multiple opens on the same thread.
   readonly worker?: Worker;
+  // Caller-supplied MessagePort connected to an existing cloud-topo
+  // worker (typically obtained via `attachPort()` on another client
+  // and transferred across a `postMessage` boundary). When set, the
+  // proxy talks to the worker over this port instead of spawning one.
+  // Lets a second thread attach to an already-running cloud-topo
+  // worker; if the underlying container URL matches, the worker
+  // dedupes the core so byte-range caches are shared.
+  readonly port?: MessagePort;
   // FetcherSpec — how the worker should obtain container bytes.
   // Defaults to `{ kind: "http", url }` using the URL passed to
   // `open(url, opts)`. Use `{ kind: "buffer", bytes }` for in-memory
@@ -76,17 +93,43 @@ interface PendingCall {
   onAbort?: () => void;
 }
 
+// Minimal shape shared by `Worker` and `MessagePort` — the proxy only
+// needs `postMessage` + `addEventListener("message", …)` + `start?()`.
+// MessagePort requires `start()`; Worker doesn't.
+interface PortLike {
+  postMessage: (msg: unknown, transfer?: ReadonlyArray<Transferable>) => void;
+  addEventListener: (
+    type: "message",
+    listener: (e: { data: unknown }) => void,
+  ) => void;
+  removeEventListener: (
+    type: "message",
+    listener: (e: { data: unknown }) => void,
+  ) => void;
+  start?: () => void;
+}
+
+// Generate a clientId that's statistically unique across all proxies
+// the worker is likely to see in one session. `Math.random()` over the
+// 53-bit safe-integer range is fine — birthday collisions are far below
+// any realistic client count.
+function makeClientId(): number {
+  return Math.floor(Math.random() * Number.MAX_SAFE_INTEGER);
+}
+
 export class CtopoClient {
   readonly meta: ContainerMeta;
   readonly sections: ReadonlyArray<SectionEntry>;
   readonly transform: ContainerMeta["transform"];
 
-  private readonly worker: Worker;
-  // Strict ownership flag: when true the proxy created the worker and
-  // calls .terminate() on close; when false the caller passed a
-  // shared worker via `OpenContainerOptions.worker` and is
-  // responsible for its lifetime.
-  private readonly ownsWorker: boolean;
+  // The underlying message channel. May be a Worker (spawn path) or a
+  // MessagePort (attach path). The worker self-terminates when its
+  // last client closes — we don't need to track ownership here.
+  private readonly port: PortLike;
+  // Unique per-instance identifier. Stamped on every request so the
+  // worker can route to the right `CtopoCore` and the proxy can
+  // ignore responses meant for other clients sharing the same port.
+  private readonly clientId: number;
   private readonly pending = new Map<number, PendingCall>();
   private nextId = 0;
   // `closing` blocks new calls from `call()` while still letting the
@@ -97,12 +140,12 @@ export class CtopoClient {
   private closed = false;
 
   private constructor(args: {
-    worker: Worker;
-    ownsWorker: boolean;
+    port: PortLike;
+    clientId: number;
     snapshot: OpenSnapshot;
   }) {
-    this.worker = args.worker;
-    this.ownsWorker = args.ownsWorker;
+    this.port = args.port;
+    this.clientId = args.clientId;
     this.meta = args.snapshot.meta;
     this.sections = args.snapshot.sections;
     this.transform = args.snapshot.transform;
@@ -114,17 +157,28 @@ export class CtopoClient {
     url: string,
     opts: OpenContainerOptions = {},
   ): Promise<CtopoClient> {
-    const worker =
-      opts.worker ??
-      new Worker(
+    // Resolve the underlying port. Precedence: caller-supplied port >
+    // caller-supplied worker > spawn a fresh worker from `workerUrl`.
+    let port: PortLike;
+    if (opts.port !== undefined) {
+      port = opts.port as unknown as PortLike;
+      // MessagePort needs an explicit start() before it'll deliver
+      // messages; calling it on an already-started port is a no-op.
+      port.start?.();
+    } else if (opts.worker !== undefined) {
+      port = opts.worker as unknown as PortLike;
+    } else {
+      const workerUrl =
         opts.workerUrl !== undefined
           ? typeof opts.workerUrl === "string"
             ? opts.workerUrl
             : opts.workerUrl.href
-          : new URL("./worker.js", import.meta.url).href,
-        { type: "module" },
-      );
-    const ownsWorker = opts.worker === undefined;
+          : new URL("./worker.js", import.meta.url).href;
+      port = (await spawnWorker(workerUrl)) as unknown as PortLike;
+    }
+
+    const clientId = makeClientId();
+    const openId = 1;
 
     // Strip proxy-only options before posting to the worker.
     const wireOpts: WireOpenContainerOptions = {
@@ -144,50 +198,50 @@ export class CtopoClient {
 
     // Open is its own RPC — we need the meta/sections snapshot back
     // before the proxy can be constructed, so we run a one-shot
-    // listener bound to the open request id rather than installing
-    // the steady-state dispatcher first. Steady-state hookup happens
-    // after open resolves.
-    const openId = 1;
-    const transfer: ArrayBufferLike[] =
-      fetcher.kind === "buffer" ? [fetcher.bytes.buffer] : [];
+    // listener bound to (clientId, openId) rather than installing the
+    // steady-state dispatcher first. Steady-state hookup happens after
+    // open resolves.
+    const transfer: Transferable[] =
+      fetcher.kind === "buffer" ? [fetcher.bytes.buffer as Transferable] : [];
     const req: WorkerRequest = {
+      clientId,
       id: openId,
       method: "open",
       args: { fetcher, url, opts: wireOpts },
     };
 
     const snapshot = await new Promise<OpenSnapshot>((resolve, reject) => {
-      const onMessage = (e: { data: WorkerResponse }): void => {
-        const r = e.data;
-        if (r.id !== openId) return;
-        worker.removeEventListener("message", onMessage);
+      const onMessage = (e: { data: unknown }): void => {
+        const r = e.data as WorkerResponse;
+        if (r.clientId !== clientId || r.id !== openId) return;
+        port.removeEventListener("message", onMessage);
         if (r.ok) {
           resolve(r.result as OpenSnapshot);
         } else {
           reject(new Error(r.error.message));
         }
       };
-      worker.addEventListener("message", onMessage);
+      port.addEventListener("message", onMessage);
       if (opts.signal !== undefined) {
         if (opts.signal.aborted) {
-          worker.removeEventListener("message", onMessage);
+          port.removeEventListener("message", onMessage);
           reject(new DOMException("Aborted", "AbortError"));
           return;
         }
         opts.signal.addEventListener(
           "abort",
           () => {
-            worker.removeEventListener("message", onMessage);
-            worker.postMessage({ id: openId, abort: true });
+            port.removeEventListener("message", onMessage);
+            port.postMessage({ clientId, id: openId, abort: true });
             reject(new DOMException("Aborted", "AbortError"));
           },
           { once: true },
         );
       }
-      worker.postMessage(req, transfer);
+      port.postMessage(req, transfer);
     });
 
-    const proxy = new CtopoClient({ worker, ownsWorker, snapshot });
+    const proxy = new CtopoClient({ port, clientId, snapshot });
     proxy.installMessageHandler();
     return proxy;
   }
@@ -195,8 +249,16 @@ export class CtopoClient {
   // --- RPC plumbing ---
 
   private installMessageHandler(): void {
-    this.worker.addEventListener("message", (e: { data: WorkerResponse }) => {
-      const r = e.data;
+    this.port.addEventListener("message", (e: { data: unknown }) => {
+      const r = e.data as WorkerResponse;
+      // When two CtopoClient instances share one underlying Worker
+      // (e.g. both opened with the same `opts.worker`) their
+      // `nextId`s overlap; the clientId check keeps each proxy from
+      // resolving the other's pending entries. Port-attached clients
+      // are naturally isolated (each port has its own message
+      // queue), but the check is cheap and protects the worker-shared
+      // case too.
+      if (r.clientId !== this.clientId) return;
       const pending = this.pending.get(r.id);
       if (pending === undefined) return; // already aborted / mismatched id
       this.pending.delete(r.id);
@@ -215,7 +277,7 @@ export class CtopoClient {
     method: WorkerRequest["method"],
     args: unknown,
     signal: AbortSignal | undefined,
-    transfer: ArrayBufferLike[] = [],
+    transfer: Transferable[] = [],
   ): Promise<T> {
     // The close RPC needs to fire even while `closing` is true; every
     // other method is rejected once close has begun.
@@ -236,13 +298,16 @@ export class CtopoClient {
       if (signal !== undefined) {
         pending.onAbort = (): void => {
           this.pending.delete(id);
-          this.worker.postMessage({ id, abort: true });
+          this.port.postMessage({ clientId: this.clientId, id, abort: true });
           reject(new DOMException("Aborted", "AbortError"));
         };
         signal.addEventListener("abort", pending.onAbort, { once: true });
       }
       this.pending.set(id, pending);
-      this.worker.postMessage({ id, method, args }, transfer);
+      this.port.postMessage(
+        { clientId: this.clientId, id, method, args },
+        transfer,
+      );
     });
   }
 
@@ -342,6 +407,29 @@ export class CtopoClient {
     return this.call<WireFlatNeighbors>("neighborsFlat", { layer }, signal);
   }
 
+  // --- Cross-thread sharing ---
+
+  // Returns a `MessagePort` that another thread can pass to
+  // `openContainer(url, { port })` to talk to the same underlying
+  // worker. Posts the worker-side port via the existing connection as
+  // a control message; the worker hooks it and routes its requests
+  // through the same dispatcher. When the other thread opens against
+  // the same URL, the worker reuses one `CtopoCore` so the byte-range
+  // cache is shared.
+  attachPort(): MessagePort {
+    if (this.closed || this.closing) {
+      throw new Error("ctopo: client is closed");
+    }
+    const channel = new MessageChannel();
+    // The worker-side port is embedded in the message AND added to
+    // the transfer list — `event.ports` isn't populated under
+    // Node's `worker_threads` shim, so receivers read the port out
+    // of the cloned data.
+    const ctrl: WorkerAddPort = { kind: "addPort", port: channel.port2 };
+    this.port.postMessage(ctrl, [channel.port2]);
+    return channel.port1;
+  }
+
   // --- Lifecycle ---
 
   async close(): Promise<void> {
@@ -355,9 +443,9 @@ export class CtopoClient {
       // either way.
     } finally {
       this.closed = true;
-      // The worker terminates itself after replying to "close"; the
-      // proxy still .terminate()s defensively.
-      if (this.ownsWorker) this.worker.terminate();
+      // The worker self-terminates after its last client closes —
+      // calling `worker.terminate()` here would kill any port-attached
+      // clients on other threads.
       const stale = this.pending;
       this.pending.clear();
       const err = new Error("ctopo: client closed");

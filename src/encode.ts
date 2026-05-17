@@ -84,7 +84,8 @@ import {
   blockCompressArcOffsets,
   DEFAULT_ARC_COORD_BLOCK_BYTES,
 } from "./encode-compress";
-import { runWithConcurrency, stderrLog, memSnapshot } from "./core/util";
+import { runWithConcurrency } from "./core/util";
+import { stderrLog, memSnapshot } from "./core/util-node";
 
 // --- Types ---
 

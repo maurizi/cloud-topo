@@ -6,7 +6,6 @@ import { dirname, resolve as resolvePath } from "path";
 import { fileURLToPath } from "url";
 
 import { describe, expect, it, beforeAll } from "vitest";
-import Worker from "web-worker";
 
 import { type Topology } from "topojson-specification";
 
@@ -237,8 +236,73 @@ describeIfBuilt("ctopo worker-backed proxy", () => {
     expect(after.coordinates.length).toBe(1);
     await client.close();
   });
+
+  it("attachPort shares one worker across two clients", async () => {
+    // Open the originating client, then attach a second client through
+    // a transferred MessagePort. Both clients drive the same worker;
+    // their request streams stay isolated. `openProxy` transfers the
+    // first client's bytes buffer, so the second open passes a dummy
+    // empty buffer — URL dedup means the worker never reads it.
+    const buf = await encodeContainer(twoBlockTopology());
+    const a = await openProxy(buf);
+    const port = a.attachPort();
+    const b = await CtopoClient.open("buffer://test", {
+      port,
+      fetcher: { kind: "buffer", bytes: new Uint8Array(0) },
+    });
+    try {
+      // Both clients see the same meta — they're talking to the same
+      // CtopoCore inside the worker.
+      expect(a.meta.numArcs).toBe(b.meta.numArcs);
+
+      // Fire interleaved calls; each promise must resolve to its own
+      // caller's result with no cross-talk.
+      const [aMerge, bMerge, aProp, bProp] = await Promise.all([
+        merge(a, [{ layer: "block", indices: [0] }]),
+        merge(b, [{ layer: "block", indices: [1] }]),
+        a.property("block/population"),
+        b.property("block/population"),
+      ]);
+      // Single-block merges produce a single-polygon MultiPolygon
+      // with 4 distinct corners. The two selections target different
+      // blocks so their outer-ring corner sets must differ.
+      const aVerts = new Set(
+        aMerge.coordinates[0][0].slice(0, -1).map((p) => `${p[0]},${p[1]}`),
+      );
+      const bVerts = new Set(
+        bMerge.coordinates[0][0].slice(0, -1).map((p) => `${p[0]},${p[1]}`),
+      );
+      expect(aVerts.size).toBe(4);
+      expect(bVerts.size).toBe(4);
+      expect(aVerts).not.toEqual(bVerts);
+
+      // Both property buffers come from the same section bytes.
+      const aBytes = aProp as Uint8Array | Uint16Array | Uint32Array;
+      const bBytes = bProp as Uint8Array | Uint16Array | Uint32Array;
+      expect(Array.from(aBytes)).toEqual(Array.from(bBytes));
+    } finally {
+      await b.close();
+      await a.close();
+    }
+  });
+
+  it("closing one of two clients leaves the other working", async () => {
+    // Refcount check — the worker shouldn't tear down the CtopoCore
+    // while another client is still holding a reference to it.
+    const buf = await encodeContainer(twoBlockTopology());
+    const a = await openProxy(buf);
+    const port = a.attachPort();
+    const b = await CtopoClient.open("buffer://test", {
+      port,
+      fetcher: { kind: "buffer", bytes: new Uint8Array(0) },
+    });
+    await a.close();
+    // b should still be able to issue requests — the worker's
+    // CtopoCore is alive thanks to b's refcount.
+    const result = await merge(b, [{ layer: "block", indices: [0, 1] }]);
+    expect(result.type).toBe("MultiPolygon");
+    expect(result.coordinates.length).toBe(1);
+    await b.close();
+  });
 });
 
-void Worker; // suppress unused-import lint; Worker is consumed inside
-// CtopoClient.open. Imported here so the dependency is declared at
-// the test-file layer rather than implicitly through the proxy.

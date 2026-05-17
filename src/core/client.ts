@@ -382,6 +382,15 @@ export class CtopoCore {
     string,
     Promise<LayerGeometry>
   >();
+  // Per-layer index of multi_poly_breaks, keyed by geom id. Built
+  // lazily on first merge that touches the layer; reused across
+  // every merge after that. Without the cache, expandLayerPolygons
+  // rebuilt this map (one Map.set per multi_poly_breaks entry) on
+  // every merge call — a 220 ms tax on the national CD merge.
+  private readonly breaksByGeomCache = new Map<
+    string,
+    Map<number, number[]>
+  >();
   // Decompressed group bytes keyed by `${physicalOffset}:${physicalLength}`.
   // Members of the same compression group share one decompress here,
   // so e.g. fetching every base-layer property after a group is
@@ -814,6 +823,25 @@ export class CtopoCore {
     })();
     this.layerGeometryCache.set(layer, promise);
     return promise;
+  }
+
+  breaksByGeom(layer: string, csr: LayerGeometry): Map<number, number[]> {
+    let cached = this.breaksByGeomCache.get(layer);
+    if (cached !== undefined) return cached;
+    cached = new Map<number, number[]>();
+    const breaks = csr.multiPolyBreaks;
+    for (let i = 0; i < breaks.length; i += 2) {
+      const g = breaks[i];
+      const r = breaks[i + 1];
+      let list = cached.get(g);
+      if (list === undefined) {
+        list = [];
+        cached.set(g, list);
+      }
+      list.push(r);
+    }
+    this.breaksByGeomCache.set(layer, cached);
+    return cached;
   }
 
   // --- Arc coord fetcher (used by merge.ts) ---
@@ -1305,7 +1333,7 @@ export class CtopoCore {
         loadZstdWasmDecode(entry),
       ]);
       const t0 = performance.now();
-      const out = decode(compressed, uncSize, dict);
+      const out = await decode(compressed, uncSize, dict);
       this.statDecompressMs += performance.now() - t0;
       this.statDecompressBytes += out.byteLength;
       return out;
@@ -1411,7 +1439,7 @@ export class CtopoCore {
         loadZstdWasmDecode(entry),
       ]);
       const t0 = performance.now();
-      const out = decode(compressed, uncSize, dict);
+      const out = await decode(compressed, uncSize, dict);
       this.statDecompressMs += performance.now() - t0;
       this.statDecompressBytes += out.byteLength;
       // Undo first-order delta encoding in place — running prefix sum
@@ -1565,7 +1593,7 @@ export class CtopoCore {
         loadZstdWasmDecode(entry),
       ]);
       const t0 = performance.now();
-      const raw = decode(compressed, uncSize, dict);
+      const raw = await decode(compressed, uncSize, dict);
       this.statDecompressMs += performance.now() - t0;
       this.statDecompressBytes += raw.byteLength;
       // Walk the varint stream and accumulate. Output is Int32Array

@@ -19,7 +19,7 @@ import { spawnSync } from "child_process";
 import { tmpdir } from "os";
 import { join } from "path";
 
-import { stderrLog, memSnapshot } from "./core/util";
+import { stderrLog, memSnapshot } from "./core/util-node";
 import { VARINT_MAX_BYTES, writeVarintZigzag } from "./core/format";
 
 // --- Types ---

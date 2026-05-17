@@ -11,6 +11,12 @@ export default defineConfig({
     // alone — Vite/webpack/Rollup pick up the URL pattern and bundle
     // the chunk as a worker module.
     worker: "src/worker.ts",
+    // Sub-worker spawned by the merge worker on first decompress. The
+    // merge worker resolves it via `new URL("./zstd-worker.js",
+    // import.meta.url)` from inside `zstd-decoder-client.ts`; emitted
+    // here as a top-level entry so that URL resolves to a real file
+    // sitting next to the chunk that imports it.
+    "zstd-worker": "src/core/zstd-worker.ts",
   },
   format: ["esm"],
   dts: true,

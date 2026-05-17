@@ -745,25 +745,15 @@ function expandLayerPolygons(
   csr: LayerGeometry,
   geomIndices: Iterable<number>,
 ): FlatPolygons {
-  // Index the sparse multi_poly_breaks table by geom for O(1) lookup
-  // per geom we visit. Empty in the typical single-Polygon-only case.
-  // We touch the whole table once; attribute its full byteLength to
+  // O(1) lookup per geom we visit. Index built once per layer on
+  // the client (`breaksByGeom`); empty Map in the typical single-
+  // Polygon-only case. We attribute the whole table's byteLength to
   // the useful-bytes tally for this layer.
   client.tallyUseful(
     `${layer}/multi_poly_breaks`,
     csr.multiPolyBreaks.byteLength,
   );
-  const breaksByGeom = new Map<number, number[]>();
-  for (let i = 0; i < csr.multiPolyBreaks.length; i += 2) {
-    const g = csr.multiPolyBreaks[i];
-    const r = csr.multiPolyBreaks[i + 1];
-    let list = breaksByGeom.get(g);
-    if (list === undefined) {
-      list = [];
-      breaksByGeom.set(g, list);
-    }
-    list.push(r);
-  }
+  const breaksByGeom = client.breaksByGeom(layer, csr);
 
   // Pass 1: count. Walks selected geoms to tally:
   //   - poly count after multi_poly_breaks splits
