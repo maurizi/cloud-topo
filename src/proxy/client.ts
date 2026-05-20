@@ -68,14 +68,9 @@ export interface OpenContainerOptions extends WireOpenContainerOptions {
   // and transferred across a `postMessage` boundary). When set, the
   // proxy talks to the worker over this port instead of spawning one.
   // Lets a second thread attach to an already-running cloud-topo
-  // worker; if the underlying container URL matches, the worker
-  // dedupes the core so byte-range caches are shared.
+  // worker; if both clients open the same URL, the worker dedupes the
+  // core so byte-range caches are shared.
   readonly port?: MessagePort;
-  // FetcherSpec — how the worker should obtain container bytes.
-  // Defaults to `{ kind: "http", url }` using the URL passed to
-  // `open(url, opts)`. Use `{ kind: "buffer", bytes }` for in-memory
-  // containers (the worker reads the bytes directly — no HTTP).
-  readonly fetcher?: FetcherSpec;
 }
 
 // --- Public CtopoClient ---
@@ -93,19 +88,29 @@ interface PendingCall {
   onAbort?: () => void;
 }
 
-// Minimal shape shared by `Worker` and `MessagePort` — the proxy only
-// needs `postMessage` + `addEventListener("message", …)` + `start?()`.
-// MessagePort requires `start()`; Worker doesn't.
+// Minimal shape shared by `Worker` and `MessagePort` — the proxy needs
+// `postMessage` + `addEventListener("message", …)` + `start?()`, plus
+// best-effort `"error"`/`"exit"` so a dying spawned worker can fail
+// in-flight calls instead of hanging them forever. MessagePort requires
+// `start()`; Worker doesn't. The error/exit events only fire for the
+// spawn/Worker paths — registering them on a plain MessagePort is a
+// harmless no-op (it never emits them).
 interface PortLike {
   postMessage: (msg: unknown, transfer?: ReadonlyArray<Transferable>) => void;
-  addEventListener: (
-    type: "message",
-    listener: (e: { data: unknown }) => void,
-  ) => void;
-  removeEventListener: (
-    type: "message",
-    listener: (e: { data: unknown }) => void,
-  ) => void;
+  addEventListener: {
+    (type: "message", listener: (e: { data: unknown }) => void): void;
+    (
+      type: "error" | "exit",
+      listener: (e: { data?: unknown; message?: string }) => void,
+    ): void;
+  };
+  removeEventListener: {
+    (type: "message", listener: (e: { data: unknown }) => void): void;
+    (
+      type: "error" | "exit",
+      listener: (e: { data?: unknown; message?: string }) => void,
+    ): void;
+  };
   start?: () => void;
 }
 
@@ -132,6 +137,15 @@ export class CtopoClient {
   private readonly clientId: number;
   private readonly pending = new Map<number, PendingCall>();
   private nextId = 0;
+  // Bound port listeners, retained so `close()` can detach them. The
+  // spawned-worker path self-terminates so detaching is moot there, but
+  // when a single Worker is shared across clients (`opts.worker`) a
+  // closed client must unhook its listeners or it leaks one set per
+  // close onto the still-live Worker (and its message handler keeps
+  // firing for every other client's replies).
+  private onMessageListener?: (e: { data: unknown }) => void;
+  private onErrorListener?: (e: { message?: string }) => void;
+  private onExitListener?: (e: { data?: unknown }) => void;
   // `closing` blocks new calls from `call()` while still letting the
   // close RPC itself fire. `closed` flips once the worker has acked
   // the close (or the round-trip failed) and is used to short-circuit
@@ -153,8 +167,15 @@ export class CtopoClient {
 
   // --- Factory ---
 
+  // `source` selects how the worker obtains the container bytes:
+  //   - string  → HTTP Range fetches against that URL. The URL also
+  //     keys the worker's core dedup, so two clients opening the same
+  //     URL (e.g. via `attachPort`) share one cache.
+  //   - Uint8Array → the bytes are handed to the worker directly (no
+  //     HTTP). The buffer is transferred at open, so the caller's view
+  //     is detached afterward. Each such open gets its own core.
   static async open(
-    url: string,
+    source: string | Uint8Array,
     opts: OpenContainerOptions = {},
   ): Promise<CtopoClient> {
     // Resolve the underlying port. Precedence: caller-supplied port >
@@ -195,7 +216,14 @@ export class CtopoClient {
       multiRangeEnabled: opts.multiRangeEnabled,
       pool: opts.pool,
     };
-    const fetcher: FetcherSpec = opts.fetcher ?? { kind: "http", url };
+    // String source → HTTP fetcher keyed on the URL (the URL doubles
+    // as the worker's core-dedup key). Bytes source → buffer fetcher
+    // with a per-client synthetic URL so each open gets its own core.
+    const fetcher: FetcherSpec =
+      typeof source === "string"
+        ? { kind: "http", url: source }
+        : { kind: "buffer", bytes: source };
+    const url = typeof source === "string" ? source : `buffer://${clientId}`;
 
     // Open is its own RPC — we need the meta/sections snapshot back
     // before the proxy can be constructed, so we run a one-shot
@@ -250,7 +278,7 @@ export class CtopoClient {
   // --- RPC plumbing ---
 
   private installMessageHandler(): void {
-    this.port.addEventListener("message", (e: { data: unknown }) => {
+    this.onMessageListener = (e: { data: unknown }): void => {
       const r = e.data as WorkerResponse;
       // When two CtopoClient instances share one underlying Worker
       // (e.g. both opened with the same `opts.worker`) their
@@ -271,7 +299,63 @@ export class CtopoClient {
       } else {
         pending.reject(new Error(r.error.message));
       }
-    });
+    };
+    this.port.addEventListener("message", this.onMessageListener);
+
+    // A spawned worker that crashes (OOM on a large merge, an uncaught
+    // async rejection outside the dispatched call) would otherwise leave
+    // every in-flight call's promise unsettled forever. Fail them loudly
+    // instead. Only the spawn/Worker paths emit these; a shared
+    // MessagePort never does, so this is a no-op there.
+    this.onErrorListener = (e: { message?: string }): void => {
+      const detail = e.message ?? "unknown";
+      this.failAll(new Error(`ctopo: worker error: ${detail}`));
+    };
+    this.port.addEventListener("error", this.onErrorListener);
+    this.onExitListener = (e: { data?: unknown }): void => {
+      const code = (e as { data?: number }).data;
+      if (code !== 0) {
+        this.failAll(
+          new Error(`ctopo: worker exited with code ${code ?? "unknown"}`),
+        );
+      }
+    };
+    this.port.addEventListener("exit", this.onExitListener);
+  }
+
+  // Detach the steady-state port listeners. Critical for the shared-
+  // Worker case (`opts.worker`) where the Worker outlives this client;
+  // a no-op for the spawn path (worker self-terminates) and harmless
+  // for a MessagePort (it never emitted error/exit anyway).
+  private removePortListeners(): void {
+    if (this.onMessageListener !== undefined) {
+      this.port.removeEventListener("message", this.onMessageListener);
+      this.onMessageListener = undefined;
+    }
+    if (this.onErrorListener !== undefined) {
+      this.port.removeEventListener("error", this.onErrorListener);
+      this.onErrorListener = undefined;
+    }
+    if (this.onExitListener !== undefined) {
+      this.port.removeEventListener("exit", this.onExitListener);
+      this.onExitListener = undefined;
+    }
+  }
+
+  // Reject every in-flight call with `err` and mark the client unusable.
+  // Used when the worker dies — there will be no further replies, so the
+  // pending promises must be settled here or they hang.
+  private failAll(err: Error): void {
+    if (this.closed) return;
+    this.closed = true;
+    this.removePortListeners();
+    for (const pending of this.pending.values()) {
+      if (pending.onAbort !== undefined && pending.signal !== undefined) {
+        pending.signal.removeEventListener("abort", pending.onAbort);
+      }
+      pending.reject(err);
+    }
+    this.pending.clear();
   }
 
   private call<T>(
@@ -359,8 +443,11 @@ export class CtopoClient {
     return this.call("fetchArcEndpoints", { ids: Array.from(ids) }, signal);
   }
 
+  // Derived from the open-time snapshot — same as the other sync-known
+  // facts (meta/sections/transform). No RPC: the core method reads the
+  // same META field (`arcEndpointsBlocks`), which is already in `meta`.
   hasArcEndpointsSection(): Promise<boolean> {
-    return this.call("hasArcEndpointsSection", {}, undefined);
+    return Promise.resolve(this.meta.arcEndpointsBlocks !== undefined);
   }
 
   getStats(): Promise<CtopoClientStats> {
@@ -444,6 +531,7 @@ export class CtopoClient {
       // either way.
     } finally {
       this.closed = true;
+      this.removePortListeners();
       // The worker self-terminates after its last client closes —
       // calling `worker.terminate()` here would kill any port-attached
       // clients on other threads.
@@ -456,10 +544,10 @@ export class CtopoClient {
 }
 
 export async function openContainer(
-  url: string,
+  source: string | Uint8Array,
   opts?: OpenContainerOptions,
 ): Promise<CtopoClient> {
-  return CtopoClient.open(url, opts);
+  return CtopoClient.open(source, opts);
 }
 
 // --- Helpers ---

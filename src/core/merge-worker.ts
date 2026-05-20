@@ -48,7 +48,8 @@ import {
   type StitchScratch,
   type TransformDef,
 } from "./merge";
-import { getWorkerHost, type WorkerHost } from "./worker-host";
+import { getWorkerHost, toWireError, type WorkerHost } from "./worker-host";
+import { breaksFromCsr } from "./merge-prep";
 import type { LayerGeometry } from "./types";
 import type {
   ComputePostReplyError,
@@ -125,18 +126,7 @@ class PrepShim {
   breaksByGeom(layer: string, csr: LayerGeometry): Map<number, number[]> {
     let cached = this.breaksByGeomCache.get(layer);
     if (cached !== undefined) return cached;
-    cached = new Map<number, number[]>();
-    const breaks = csr.multiPolyBreaks;
-    for (let i = 0; i < breaks.length; i += 2) {
-      const g = breaks[i];
-      const r = breaks[i + 1];
-      let list = cached.get(g);
-      if (list === undefined) {
-        list = [];
-        cached.set(g, list);
-      }
-      list.push(r);
-    }
+    cached = breaksFromCsr(csr);
     this.breaksByGeomCache.set(layer, cached);
     return cached;
   }
@@ -158,6 +148,21 @@ interface PrepIntermediates {
 }
 
 const stash = new Map<number, PrepIntermediates>();
+
+// Ids the coordinator discarded (abort / coordinator-side error)
+// before this worker stashed their prep result. A discard message can
+// race ahead of the prep result it cancels — prep awaits CPU work, so
+// a queued discard runs during that await — so we remember the id and
+// skip the upcoming stash instead. Holds only the few ids whose
+// discard out-raced their stash.
+const discarded = new Set<number>();
+
+// Ids whose prep is currently awaiting CPU work (between the prepMerge
+// message and its reply). A discard is only meaningful while prep is in
+// this window; one that arrives after post already consumed the stash
+// must NOT be recorded in `discarded`, or the id would leak there
+// forever (no later prep will ever clear it).
+const inFlightPrep = new Set<number>();
 
 // Persistent shim + scratch across merges. The WeakMap-keyed scratch
 // inside merge.ts (Int32ArrayPool, ArcGenIndex, StitchScratch) stays
@@ -185,15 +190,25 @@ async function handlePrep(
     indices: s.indices,
   }));
 
+  inFlightPrep.add(req.id);
   const { groupExteriorArcs, uniqueArcIds } =
     await prepareMergeGroupsForPipeline(core, inputs, undefined);
+  inFlightPrep.delete(req.id);
 
-  stash.set(req.id, {
-    variant: req.variant,
-    transform: req.transform,
-    isQuantized: req.isQuantized,
-    groupExteriorArcs,
-  });
+  // Discarded while prep was running — drop the result, no reply.
+  if (discarded.delete(req.id)) return;
+
+  // Empty merge: the coordinator synthesizes the empty result without
+  // a post phase, so stashing would leak. Still reply so its prep
+  // await resolves.
+  if (uniqueArcIds.length > 0) {
+    stash.set(req.id, {
+      variant: req.variant,
+      transform: req.transform,
+      isQuantized: req.isQuantized,
+      groupExteriorArcs,
+    });
+  }
 
   const reply: ComputePrepReplyOk = {
     kind: "prepResult",
@@ -206,8 +221,10 @@ async function handlePrep(
 function buildEndpointLookupForPost(
   req: ComputePostRequest,
   isQuantized: boolean,
-  variant: "arcs" | "coords",
-): { endpoints: EndpointLookup<unknown>; arcBytes?: ReadonlyMap<number, Uint8Array> } {
+): {
+  endpoints: EndpointLookup<unknown>;
+  arcBytes?: ReadonlyMap<number, Uint8Array>;
+} {
   if (req.endpoints !== undefined) {
     const map = new Map<number, Int32Array>();
     for (let i = 0; i < req.endpoints.ids.length; i++) {
@@ -253,7 +270,6 @@ function handlePost(host: WorkerHost, req: ComputePostRequest): void {
   const { endpoints, arcBytes } = buildEndpointLookupForPost(
     req,
     prep.isQuantized,
-    prep.variant,
   );
   const ctx = {
     transform: prep.transform,
@@ -263,15 +279,7 @@ function handlePost(host: WorkerHost, req: ComputePostRequest): void {
 
   if (prep.variant === "arcs") {
     const result = stitchBatchArcs(ctx, prep.groupExteriorArcs, postScratch);
-    const flat = assembleArcsResult([
-      {
-        groupIndices: Array.from(
-          { length: prep.groupExteriorArcs.length },
-          (_, i) => i,
-        ),
-        result,
-      },
-    ]);
+    const flat = assembleArcsResult(result);
     const reply: ComputePostReplyOk = {
       kind: "postResult",
       id: req.id,
@@ -291,15 +299,7 @@ function handlePost(host: WorkerHost, req: ComputePostRequest): void {
   }
   // coords
   const result = stitchBatchCoords(ctx, prep.groupExteriorArcs, postScratch);
-  const flat = assembleCoordsResult([
-    {
-      groupIndices: Array.from(
-        { length: prep.groupExteriorArcs.length },
-        (_, i) => i,
-      ),
-      result,
-    },
-  ]);
+  const flat = assembleCoordsResult(result);
   const reply: ComputePostReplyOk = {
     kind: "postResult",
     id: req.id,
@@ -327,14 +327,28 @@ void getWorkerHost().then((host) => {
         host.close();
         return;
       }
+      case "discardMerge": {
+        // Drop the stash if prep already ran. Otherwise, only mark the
+        // id to skip its upcoming stash if prep is genuinely still in
+        // flight — a discard that arrives after post already consumed
+        // the stash matches neither and is a no-op (recording it would
+        // leak the id in `discarded` permanently).
+        if (!stash.delete(req.id) && inFlightPrep.has(req.id)) {
+          discarded.add(req.id);
+        }
+        return;
+      }
       case "prepMerge": {
         handlePrep(host, req).catch((err: unknown) => {
-          const message = err instanceof Error ? err.message : String(err);
-          const name = err instanceof Error ? err.name : "Error";
+          // Prep threw before its own cleanup ran: clear both the
+          // in-flight marker and any discard that raced in while prep
+          // was running, otherwise the id leaks in these sets forever.
+          inFlightPrep.delete(req.id);
+          discarded.delete(req.id);
           const errReply: ComputePrepReplyError = {
             kind: "prepError",
             id: req.id,
-            error: { name, message },
+            error: toWireError(err),
           };
           host.postMessage(errReply);
         });
@@ -344,12 +358,10 @@ void getWorkerHost().then((host) => {
         try {
           handlePost(host, req);
         } catch (err) {
-          const message = err instanceof Error ? err.message : String(err);
-          const name = err instanceof Error ? err.name : "Error";
           const errReply: ComputePostReplyError = {
             kind: "postError",
             id: req.id,
-            error: { name, message },
+            error: toWireError(err),
           };
           host.postMessage(errReply);
         }

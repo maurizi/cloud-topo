@@ -36,14 +36,13 @@ import {
   type FlatMultiPolygonArcs,
 } from "./merge";
 import { spawnWorker, type WorkerHandle } from "./worker-host";
+import { copyView } from "./util";
 import type { CtopoCore } from "./client";
 import type { LayerGeometry, LayerSelection } from "./types";
 import type {
-  ComputePostReplyError,
+  ComputeDiscardRequest,
   ComputePostReplyOk,
   ComputePostRequest,
-  ComputePrepReplyError,
-  ComputePrepReplyOk,
   ComputePrepRequest,
   ComputeReply,
   ComputeShutdownRequest,
@@ -53,6 +52,11 @@ import type {
 
 function resolveComputeWorkerUrl(): string {
   return new URL("./merge-worker.js", import.meta.url).href;
+}
+
+function abortError(signal: AbortSignal): Error {
+  const reason: unknown = signal.reason;
+  return reason instanceof Error ? reason : new Error("aborted");
 }
 
 // Defer the bulk-fetch flush to the next "check" phase boundary
@@ -89,11 +93,7 @@ interface BulkBatchEntry<T> {
 }
 
 interface BulkBatchState<T> {
-  // Driving core/signal — first caller's wins (the bench has one
-  // core per coordinator so this is fine; multi-client coordinators
-  // would queue separate batches per core if needed).
   readonly core: CtopoCore;
-  readonly signal: AbortSignal | undefined;
   readonly entries: BulkBatchEntry<T>[];
 }
 
@@ -125,13 +125,24 @@ export class MergePool {
   private closed = false;
   private spawnPromise: Promise<void> | null = null;
 
-  // Per-layer cached CsrSpec — same SAB-shared layer CSR reused
-  // across all merges on the same layer. Stored as Promise<CsrSpec>
-  // so concurrent first-call merges share one in-flight copy. (435
-  // concurrent merges in the bench previously re-copied 163 MiB
-  // each — 70 GB of memcpy total — because the sync `get(...)`
-  // returned undefined for every caller before the first resolved.)
-  private readonly csrCache = new Map<string, Promise<CsrSpec>>();
+  // Per-core, per-layer cached CsrSpec — same SAB-shared layer CSR
+  // reused across all merges on the same layer. Stored as
+  // Promise<CsrSpec> so concurrent first-call merges share one
+  // in-flight copy. (435 concurrent merges in the bench previously
+  // re-copied 163 MiB each — 70 GB of memcpy total — because the sync
+  // `get(...)` returned undefined for every caller before the first
+  // resolved.)
+  //
+  // Keyed by core (not by layer name alone): the pool is a process-wide
+  // singleton shared across every client/container, so two containers
+  // that both have a layer named e.g. "blocks" must NOT share a CSR —
+  // their arc ids index different containers. The inner map is dropped
+  // by `evictCore` when a core is torn down so its (potentially tens of
+  // MiB) CSR SharedArrayBuffers don't live for the whole process.
+  private readonly csrCache = new Map<
+    CtopoCore,
+    Map<string, Promise<CsrSpec>>
+  >();
 
   // Coordinator-side bulk fetch accumulator. Prep replies stream in
   // as separate `message` events (one task each), so a per-merge
@@ -142,8 +153,19 @@ export class MergePool {
   // by default — captures everything from the current poll
   // iteration) and issue ONE `core.fetchArcs` with the union. Each
   // merge's await resolves with its own slice of the result.
-  private bulkBytesBatch: BulkBatchState<Uint8Array> | null = null;
-  private bulkEndpointsBatch: BulkBatchState<Int32Array> | null = null;
+  //
+  // Keyed by core: the pool is a process-wide singleton shared across
+  // every client/container, so two clients merging in the same poll
+  // iteration must not be unioned into one fetch — their arc ids index
+  // different containers. One batch (and one fetchArcs) per core.
+  private readonly bulkBytesBatches = new Map<
+    CtopoCore,
+    BulkBatchState<Uint8Array>
+  >();
+  private readonly bulkEndpointsBatches = new Map<
+    CtopoCore,
+    BulkBatchState<Int32Array>
+  >();
 
   constructor(opts: MergePoolOptions) {
     if (!Number.isInteger(opts.size) || opts.size < 1) {
@@ -162,7 +184,12 @@ export class MergePool {
     if (this.size === 1 || this.closed) {
       return mergeArcsFlat(core, inputs, signal);
     }
-    return (await this.run("arcs", core, inputs, signal)) as FlatMultiPolygonArcs;
+    return (await this.run(
+      "arcs",
+      core,
+      inputs,
+      signal,
+    )) as FlatMultiPolygonArcs;
   }
 
   async runCoords(
@@ -182,6 +209,7 @@ export class MergePool {
     inputs: ReadonlyArray<LayerSelection>,
     signal: AbortSignal | undefined,
   ): Promise<FlatMultiPolygon | FlatMultiPolygonArcs> {
+    if (signal?.aborted) throw abortError(signal);
     await this.ensureSpawned();
     if (this.closed) throw new Error("ctopo: MergePool is closed");
 
@@ -191,14 +219,19 @@ export class MergePool {
       readonly indices: ReadonlyArray<number>;
     }> = [];
     const csrSpecPromises: Promise<CsrSpec>[] = [];
+    let layerCache = this.csrCache.get(core);
+    if (layerCache === undefined) {
+      layerCache = new Map<string, Promise<CsrSpec>>();
+      this.csrCache.set(core, layerCache);
+    }
     for (const input of inputs) {
-      let specP = this.csrCache.get(input.layer);
+      let specP = layerCache.get(input.layer);
       if (specP === undefined) {
         specP = (async (): Promise<CsrSpec> => {
           const csr = await core.layerGeometry(input.layer, signal);
           return sabCsrSpecFrom(csr);
         })();
-        this.csrCache.set(input.layer, specP);
+        layerCache.set(input.layer, specP);
       }
       csrSpecPromises.push(specP);
       wireInputs.push({
@@ -223,107 +256,168 @@ export class MergePool {
     const slot = this.slots[slotIdx];
     slot.inflight++;
 
-    // Phase 1: prep.
-    const uniqueArcIds = await new Promise<ReadonlyArray<number>>(
-      (resolve, reject) => {
-        this.pending.set(id, {
-          variant,
-          core,
-          signal,
-          slotIdx,
-          resolveFinal: () => {
-            // Replaced below when post is dispatched.
-          },
-          rejectFinal: () => {
-            // Replaced below.
-          },
-          resolvePrep: resolve,
-          rejectPrep: reject,
-        });
-        const req: ComputePrepRequest = {
-          kind: "prepMerge",
-          id,
-          variant,
-          inputs: wireInputs,
-          csrs: csrSpecs,
-          numArcs: core.meta.numArcs,
-          transform: core.transform,
-          isQuantized: core.transform !== null,
-          hasArcEndpointsSection: core.hasArcEndpointsSection(),
-        };
-        slot.handle.postMessage(req);
-      },
-    );
-
-    if (uniqueArcIds.length === 0) {
-      // Empty merge — synthesize an empty result without involving
-      // the post phase or any fetch.
-      slot.inflight = Math.max(0, slot.inflight - 1);
-      this.pending.delete(id);
-      return emptyFlat(variant);
-    }
-
-    // Phase 2: bulk fetch on the coordinator. Multiple concurrent
-    // merges hitting this point during the same poll iteration are
-    // batched into ONE core.fetchArcs call so the section coalescer
-    // sees them as a single drain (matching the inline path's
-    // single multi-thousand-range microtask flush).
-    let postRequest: ComputePostRequest;
-    if (useEndpointsSection) {
-      const endpointsMap = await this.bulkFetchEndpoints(
-        core,
-        uniqueArcIds,
+    // From here on, an abort must both reject this call promptly and
+    // tell the worker to drop its stash (prep may already have run).
+    try {
+      // Phase 1: prep.
+      const uniqueArcIds = await this.withAbort(
         signal,
+        new Promise<ReadonlyArray<number>>((resolve, reject) => {
+          this.pending.set(id, {
+            variant,
+            core,
+            signal,
+            slotIdx,
+            resolveFinal: () => {
+              // Replaced below when post is dispatched.
+            },
+            rejectFinal: () => {
+              // Replaced below.
+            },
+            resolvePrep: resolve,
+            rejectPrep: reject,
+          });
+          const req: ComputePrepRequest = {
+            kind: "prepMerge",
+            id,
+            variant,
+            inputs: wireInputs,
+            csrs: csrSpecs,
+            numArcs: core.meta.numArcs,
+            transform: core.transform,
+            isQuantized: core.transform !== null,
+            hasArcEndpointsSection: core.hasArcEndpointsSection(),
+          };
+          slot.handle.postMessage(req);
+        }),
       );
-      const ids: number[] = [];
-      const views: ViewSpec[] = [];
-      for (const idVal of uniqueArcIds) {
-        const v = endpointsMap.get(idVal);
-        if (v === undefined) {
-          throw new Error(
-            `ctopo: fetchArcEndpoints returned no value for arc ${idVal}`,
-          );
-        }
-        ids.push(idVal);
-        views.push(toViewSpec(v));
-      }
-      postRequest = {
-        kind: "postMerge",
-        id,
-        endpoints: { ids, views },
-      };
-    } else {
-      const arcBytesMap = await this.bulkFetchBytes(core, uniqueArcIds, signal);
-      const ids: number[] = [];
-      const views: ViewSpec[] = [];
-      for (const idVal of uniqueArcIds) {
-        const v = arcBytesMap.get(idVal);
-        if (v === undefined) {
-          throw new Error(`ctopo: fetchArcs returned no bytes for arc ${idVal}`);
-        }
-        ids.push(idVal);
-        views.push(toViewSpec(v));
-      }
-      postRequest = {
-        kind: "postMerge",
-        id,
-        arcBytes: { ids, views },
-      };
-    }
 
-    // Phase 3: post — must go to the same slot.
-    return new Promise<FlatMultiPolygon | FlatMultiPolygonArcs>(
-      (resolve, reject) => {
-        const entry = this.pending.get(id);
-        if (entry === undefined) {
-          reject(new Error("ctopo: lost track of pending merge"));
-          return;
+      if (uniqueArcIds.length === 0) {
+        // Empty merge — synthesize an empty result without involving
+        // the post phase or any fetch.
+        slot.inflight = Math.max(0, slot.inflight - 1);
+        this.pending.delete(id);
+        return emptyFlat(variant);
+      }
+
+      // Phase 2: bulk fetch on the coordinator. Multiple concurrent
+      // merges hitting this point during the same poll iteration are
+      // batched into ONE core.fetchArcs call so the section coalescer
+      // sees them as a single drain (matching the inline path's
+      // single multi-thousand-range microtask flush).
+      let postRequest: ComputePostRequest;
+      if (useEndpointsSection) {
+        const endpointsMap = await this.withAbort(
+          signal,
+          this.bulkFetchEndpoints(core, uniqueArcIds),
+        );
+        const ids: number[] = [];
+        const views: ViewSpec[] = [];
+        for (const idVal of uniqueArcIds) {
+          const v = endpointsMap.get(idVal);
+          if (v === undefined) {
+            throw new Error(
+              `ctopo: fetchArcEndpoints returned no value for arc ${idVal}`,
+            );
+          }
+          ids.push(idVal);
+          views.push(toViewSpec(v));
         }
-        entry.resolveFinal = resolve;
-        entry.rejectFinal = reject;
-        slot.handle.postMessage(postRequest);
-      },
+        postRequest = {
+          kind: "postMerge",
+          id,
+          endpoints: { ids, views },
+        };
+      } else {
+        const arcBytesMap = await this.withAbort(
+          signal,
+          this.bulkFetchBytes(core, uniqueArcIds),
+        );
+        const ids: number[] = [];
+        const views: ViewSpec[] = [];
+        for (const idVal of uniqueArcIds) {
+          const v = arcBytesMap.get(idVal);
+          if (v === undefined) {
+            throw new Error(
+              `ctopo: fetchArcs returned no bytes for arc ${idVal}`,
+            );
+          }
+          ids.push(idVal);
+          views.push(toViewSpec(v));
+        }
+        postRequest = {
+          kind: "postMerge",
+          id,
+          arcBytes: { ids, views },
+        };
+      }
+
+      // Phase 3: post — must go to the same slot.
+      return await this.withAbort(
+        signal,
+        new Promise<FlatMultiPolygon | FlatMultiPolygonArcs>(
+          (resolve, reject) => {
+            const entry = this.pending.get(id);
+            if (entry === undefined) {
+              reject(new Error("ctopo: lost track of pending merge"));
+              return;
+            }
+            entry.resolveFinal = resolve;
+            entry.rejectFinal = reject;
+            slot.handle.postMessage(postRequest);
+          },
+        ),
+      );
+    } catch (err) {
+      this.discardMerge(id, slotIdx);
+      throw err;
+    }
+  }
+
+  // Drop this merge's coordinator state and tell its worker to discard
+  // any stashed prep intermediates. Only messages the worker when the
+  // merge was still pending here: a worker-originated error (prep/
+  // postError) already cleaned its own stash and removed the pending
+  // entry via handleReply, so there is nothing left to discard. The
+  // remaining callers are aborts and coordinator-side throws, where
+  // prep may have stashed but post never ran.
+  private discardMerge(id: number, slotIdx: number): void {
+    const wasPending = this.pending.delete(id);
+    if (!wasPending) return;
+    this.slots[slotIdx].inflight = Math.max(
+      0,
+      this.slots[slotIdx].inflight - 1,
     );
+    const slot = this.slots[slotIdx];
+    if (slot === undefined) return;
+    const discard: ComputeDiscardRequest = { kind: "discardMerge", id };
+    try {
+      slot.handle.postMessage(discard);
+    } catch {
+      // Worker already gone (closed/terminated) — nothing to drop.
+    }
+  }
+
+  // Race a phase promise against the caller's abort signal. On abort
+  // the returned promise rejects immediately with the signal's reason;
+  // the underlying worker work may still complete and is cleaned up by
+  // the caller's `discardMerge`.
+  private withAbort<T>(
+    signal: AbortSignal | undefined,
+    p: Promise<T>,
+  ): Promise<T> {
+    if (signal === undefined) return p;
+    if (signal.aborted) return Promise.reject(abortError(signal));
+    let onAbort!: () => void;
+    const aborted = new Promise<never>((_, reject) => {
+      onAbort = (): void => {
+        reject(abortError(signal));
+      };
+      signal.addEventListener("abort", onAbort, { once: true });
+    });
+    return Promise.race([p, aborted]).finally(() => {
+      signal.removeEventListener("abort", onAbort);
+    });
   }
 
   // Batch concurrent fetchArcs requests across all in-flight merges.
@@ -336,44 +430,51 @@ export class MergePool {
   private bulkFetchBytes(
     core: CtopoCore,
     ids: ReadonlyArray<number>,
-    signal: AbortSignal | undefined,
   ): Promise<Map<number, Uint8Array>> {
     return new Promise<Map<number, Uint8Array>>((resolve, reject) => {
-      if (this.bulkBytesBatch === null) {
-        this.bulkBytesBatch = { core, signal, entries: [] };
-        scheduleBulkFlush(() => this.flushBulkBytes());
+      let batch = this.bulkBytesBatches.get(core);
+      if (batch === undefined) {
+        batch = { core, entries: [] };
+        this.bulkBytesBatches.set(core, batch);
+        scheduleBulkFlush(() => {
+          void this.flushBulkBytes(core);
+        });
       }
-      this.bulkBytesBatch.entries.push({ ids, resolve, reject });
+      batch.entries.push({ ids, resolve, reject });
     });
   }
 
   private bulkFetchEndpoints(
     core: CtopoCore,
     ids: ReadonlyArray<number>,
-    signal: AbortSignal | undefined,
   ): Promise<Map<number, Int32Array>> {
     return new Promise<Map<number, Int32Array>>((resolve, reject) => {
-      if (this.bulkEndpointsBatch === null) {
-        this.bulkEndpointsBatch = { core, signal, entries: [] };
-        scheduleBulkFlush(() => this.flushBulkEndpoints());
+      let batch = this.bulkEndpointsBatches.get(core);
+      if (batch === undefined) {
+        batch = { core, entries: [] };
+        this.bulkEndpointsBatches.set(core, batch);
+        scheduleBulkFlush(() => {
+          void this.flushBulkEndpoints(core);
+        });
       }
-      this.bulkEndpointsBatch.entries.push({ ids, resolve, reject });
+      batch.entries.push({ ids, resolve, reject });
     });
   }
 
-  private async flushBulkBytes(): Promise<void> {
-    const batch = this.bulkBytesBatch;
-    if (batch === null) return;
-    this.bulkBytesBatch = null;
+  private async flushBulkBytes(core: CtopoCore): Promise<void> {
+    const batch = this.bulkBytesBatches.get(core);
+    if (batch === undefined) return;
+    this.bulkBytesBatches.delete(core);
     const union = new Set<number>();
     for (const e of batch.entries) {
       for (const id of e.ids) union.add(id);
     }
     try {
-      const map = await batch.core.fetchArcs(
-        Array.from(union),
-        batch.signal,
-      );
+      // No signal: this fetch unions arc ids from multiple callers
+      // that may carry different signals. Results are cached, so a
+      // caller aborting rejects its own merge (via the per-merge
+      // abort race) without cancelling the shared fetch.
+      const map = await batch.core.fetchArcs(Array.from(union), undefined);
       // Slice per-caller. The Map is shared (no per-caller copy);
       // each caller filters out just the ids it asked for.
       for (const entry of batch.entries) {
@@ -389,10 +490,10 @@ export class MergePool {
     }
   }
 
-  private async flushBulkEndpoints(): Promise<void> {
-    const batch = this.bulkEndpointsBatch;
-    if (batch === null) return;
-    this.bulkEndpointsBatch = null;
+  private async flushBulkEndpoints(core: CtopoCore): Promise<void> {
+    const batch = this.bulkEndpointsBatches.get(core);
+    if (batch === undefined) return;
+    this.bulkEndpointsBatches.delete(core);
     const union = new Set<number>();
     for (const e of batch.entries) {
       for (const id of e.ids) union.add(id);
@@ -400,7 +501,7 @@ export class MergePool {
     try {
       const map = await batch.core.fetchArcEndpoints(
         Array.from(union),
-        batch.signal,
+        undefined,
       );
       for (const entry of batch.entries) {
         const slice = new Map<number, Int32Array>();
@@ -413,6 +514,15 @@ export class MergePool {
     } catch (err) {
       for (const entry of batch.entries) entry.reject(err);
     }
+  }
+
+  // Drop a torn-down core's cached layer CSRs so their SharedArrayBuffer
+  // copies (tens of MiB for a national layer) don't outlive the core.
+  // Called by the coordinator when a core's last client closes.
+  evictCore(core: CtopoCore): void {
+    this.csrCache.delete(core);
+    this.bulkBytesBatches.delete(core);
+    this.bulkEndpointsBatches.delete(core);
   }
 
   // Least-loaded by inflight. Tie-break to lowest index.
@@ -458,9 +568,53 @@ export class MergePool {
         }
         this.handleReply(slotIdx, data);
       });
+      // Post-spawn worker death (OOM on a large merge, an uncaught
+      // async rejection in the worker) yields no further replies, so
+      // every in-flight merge bound to a slot would hang. Fail them and
+      // mark the pool closed — subsequent merges fall back to the inline
+      // coordinator path (see the `this.closed` guard in `run`).
+      handle.addEventListener("error", (e) => {
+        this.failAll(
+          new Error(`ctopo: merge-worker error: ${e.message ?? "unknown"}`),
+        );
+      });
+      handle.addEventListener("exit", (e) => {
+        const code = (e as { data?: number }).data;
+        if (code !== 0) {
+          this.failAll(
+            new Error(
+              `ctopo: merge-worker exited with code ${code ?? "unknown"}`,
+            ),
+          );
+        }
+      });
       this.slots.push({ handle, inflight: 0, ready });
     }
     await Promise.all(this.slots.map((s) => s.ready));
+  }
+
+  // Reject every in-flight merge (whichever phase is awaiting) and mark
+  // the pool closed. Mirrors close()'s rejection, minus the graceful
+  // worker shutdown — there's a dead worker, so there's nothing to ack.
+  private failAll(err: Error): void {
+    if (this.closed) return;
+    this.closed = true;
+    for (const p of this.pending.values()) {
+      p.rejectPrep(err);
+      p.rejectFinal(err);
+    }
+    this.pending.clear();
+  }
+
+  // A terminal reply (prep failed, or post resolved/failed) frees the
+  // slot and drops the pending entry. prepResult is NOT terminal — the
+  // merge stays in-flight through its post phase.
+  private settle(slotIdx: number, id: number): void {
+    this.slots[slotIdx].inflight = Math.max(
+      0,
+      this.slots[slotIdx].inflight - 1,
+    );
+    this.pending.delete(id);
   }
 
   private handleReply(slotIdx: number, data: ComputeReply): void {
@@ -476,11 +630,7 @@ export class MergePool {
     if (data.kind === "prepError") {
       const entry = this.pending.get(data.id);
       if (entry !== undefined) {
-        this.slots[slotIdx].inflight = Math.max(
-          0,
-          this.slots[slotIdx].inflight - 1,
-        );
-        this.pending.delete(data.id);
+        this.settle(slotIdx, data.id);
         entry.rejectPrep(new Error(data.error.message));
       }
       return;
@@ -488,11 +638,7 @@ export class MergePool {
     if (data.kind === "postResult") {
       const entry = this.pending.get(data.id);
       if (entry !== undefined) {
-        this.slots[slotIdx].inflight = Math.max(
-          0,
-          this.slots[slotIdx].inflight - 1,
-        );
-        this.pending.delete(data.id);
+        this.settle(slotIdx, data.id);
         try {
           const flat = reconstructFlat(data);
           entry.resolveFinal(flat);
@@ -505,11 +651,7 @@ export class MergePool {
     if (data.kind === "postError") {
       const entry = this.pending.get(data.id);
       if (entry !== undefined) {
-        this.slots[slotIdx].inflight = Math.max(
-          0,
-          this.slots[slotIdx].inflight - 1,
-        );
-        this.pending.delete(data.id);
+        this.settle(slotIdx, data.id);
         entry.rejectFinal(new Error(data.error.message));
       }
       return;
@@ -533,6 +675,7 @@ export class MergePool {
       p.rejectFinal(err);
     }
     this.pending.clear();
+    this.csrCache.clear();
     const shutdown: ComputeShutdownRequest = { kind: "shutdown" };
     for (const slot of this.slots) {
       try {
@@ -558,27 +701,22 @@ function toViewSpec(view: ArrayBufferView): ViewSpec {
   };
 }
 
-function viewSpecToSab(view: ArrayBufferView): ViewSpec {
-  const buf = view.buffer;
-  if (
-    typeof SharedArrayBuffer !== "undefined" &&
-    buf instanceof SharedArrayBuffer
-  ) {
-    return toViewSpec(view);
-  }
-  const sab = new SharedArrayBuffer(view.byteLength);
-  new Uint8Array(sab).set(
-    new Uint8Array(buf as ArrayBuffer, view.byteOffset, view.byteLength),
-  );
+function toSabViewSpec(view: ArrayBufferView): ViewSpec {
+  // The pool only runs when SharedArrayBuffer is usable (see
+  // worker.ts effectivePoolSize), so the constructor here is safe.
+  // Reuse the view in place when it's already SAB-backed; otherwise
+  // copy into a fresh SAB so it can cross to the compute workers.
+  if (view.buffer instanceof SharedArrayBuffer) return toViewSpec(view);
+  const sab = copyView(view, true);
   return { buffer: sab, byteOffset: 0, byteLength: view.byteLength };
 }
 
 function sabCsrSpecFrom(csr: LayerGeometry): CsrSpec {
   return {
-    polyOffsets: viewSpecToSab(csr.polyOffsets),
-    ringOffsets: viewSpecToSab(csr.ringOffsets),
-    arcRefs: viewSpecToSab(csr.arcRefs),
-    multiPolyBreaks: viewSpecToSab(csr.multiPolyBreaks),
+    polyOffsets: toSabViewSpec(csr.polyOffsets),
+    ringOffsets: toSabViewSpec(csr.ringOffsets),
+    arcRefs: toSabViewSpec(csr.arcRefs),
+    multiPolyBreaks: toSabViewSpec(csr.multiPolyBreaks),
   };
 }
 

@@ -70,6 +70,63 @@ function twoBlockTopology(): Topology {
   };
 }
 
+// Quantized twin of twoBlockTopology: identical absolute geometry (two
+// unit squares sharing the vertical divider arc 1), but with a
+// `transform` so the encoder takes the delta-varint arc path AND emits
+// the dedicated arc_endpoints section (default for quantized inputs).
+// Arc coordinates are TopoJSON delta-encoded: first point absolute in
+// quantization units, the rest deltas. The transform is identity so the
+// decoded floats equal the absolute integer coords — letting these
+// tests assert the exact same vertex sets as the un-quantized versions
+// while exercising makeNumericEndpointLookup* + the quantized
+// decodeRingFlat scale/translate walk end to end.
+function quantizedTwoBlockTopology(): Topology {
+  return {
+    type: "Topology",
+    arcs: [
+      [
+        [0, 0],
+        [1, 0],
+      ], // 0 — bottom of L: abs (0,0) then Δ(1,0) → (1,0)
+      [
+        [1, 0],
+        [0, 1],
+      ], // 1 — shared divider: abs (1,0) then Δ(0,1) → (1,1)
+      [
+        [1, 1],
+        [-1, 0],
+      ], // 2 — top of L: abs (1,1) then Δ(-1,0) → (0,1)
+      [
+        [0, 1],
+        [0, -1],
+      ], // 3 — left of L: abs (0,1) then Δ(0,-1) → (0,0)
+      [
+        [1, 0],
+        [1, 0],
+      ], // 4 — bottom of R: abs (1,0) then Δ(1,0) → (2,0)
+      [
+        [2, 0],
+        [0, 1],
+      ], // 5 — right of R: abs (2,0) then Δ(0,1) → (2,1)
+      [
+        [2, 1],
+        [-1, 0],
+      ], // 6 — top of R: abs (2,1) then Δ(-1,0) → (1,1)
+    ],
+    bbox: [0, 0, 2, 1],
+    transform: { scale: [1, 1], translate: [0, 0] },
+    objects: {
+      block: {
+        type: "GeometryCollection",
+        geometries: [
+          { type: "Polygon", arcs: [[0, 1, 2, 3]], properties: { id: "L" } },
+          { type: "Polygon", arcs: [[4, 5, 6, ~1]], properties: { id: "R" } },
+        ],
+      },
+    },
+  };
+}
+
 describe("ctopo merge primitives", () => {
   it("neighbors returns each block's adjacent blocks via shared arcs", async () => {
     const buf = await encodeContainer(twoBlockTopology());
@@ -109,6 +166,47 @@ describe("ctopo merge primitives", () => {
     // Closed.
     expect(ring[0]).toEqual(ring[ring.length - 1]);
     // Vertices are exactly the corners of the merged 2×1 rectangle.
+    const sorted = ring
+      .slice(0, -1)
+      .map((p) => `${p[0]},${p[1]}`)
+      .sort();
+    expect(sorted).toEqual(["0,0", "0,1", "1,0", "1,1", "2,0", "2,1"].sort());
+  });
+
+  it("mergeArcs on a quantized container cancels the shared arc (arc_endpoints path)", async () => {
+    const buf = await encodeContainer(quantizedTwoBlockTopology());
+    const client = await CtopoCore.openWith(makeBufferFetcher(buf));
+    // Quantized inputs emit the dedicated arc_endpoints section by
+    // default — this is the production-default path the un-quantized
+    // fixtures never reach.
+    expect(client.hasArcEndpointsSection()).toBe(true);
+
+    // Encoder-assigned arc ids depend on the spatial sort, so assert
+    // structure rather than specific ids. Single block: one ring of its
+    // 4 boundary arcs.
+    const single = await mergeArcs(client, [{ layer: "block", indices: [0] }]);
+    expect(single.arcs.flat(2).length).toBe(4);
+
+    // Both blocks: the shared divider (and its reverse) cancel, leaving
+    // the 6 outer arcs — not 4 + 4 = 8.
+    const both = await mergeArcs(client, [{ layer: "block", indices: [0, 1] }]);
+    const remaining = both.arcs.flat(2).map((s) => (s >= 0 ? s : ~s));
+    expect(remaining.length).toBe(6);
+    expect(new Set(remaining).size).toBe(6);
+  });
+
+  it("merge on a quantized container decodes the outer ring with correct coords", async () => {
+    const buf = await encodeContainer(quantizedTwoBlockTopology());
+    const client = await CtopoCore.openWith(makeBufferFetcher(buf));
+    const result = await merge(client, [{ layer: "block", indices: [0, 1] }]);
+
+    expect(result.type).toBe("MultiPolygon");
+    expect(result.coordinates.length).toBe(1);
+    const ring = result.coordinates[0][0];
+    expect(ring[0]).toEqual(ring[ring.length - 1]); // closed
+    // Identity transform → decoded floats equal the absolute integer
+    // coords: exactly the corners of the merged 2×1 rectangle. A bug in
+    // the quantized scale/translate varint walk would shift these.
     const sorted = ring
       .slice(0, -1)
       .map((p) => `${p[0]},${p[1]}`)

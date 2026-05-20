@@ -47,16 +47,25 @@
 
 import { spawnWorker, type WorkerHandle } from "./worker-host";
 import { loadZstdWasmBytes } from "./zstd-wasm";
+import { copyView } from "./util";
 
 // Worker file URL resolver — bundled dist/ keeps the worker as a
 // sibling of this module; src/-loaded test runs fall through to the
 // pretest-built dist/.
 async function resolveZstdWorkerUrl(): Promise<string> {
   const sibling = new URL("./zstd-worker.js", import.meta.url);
+  // Browser / bundler: the worker is emitted next to this chunk.
   if (sibling.protocol !== "file:") return sibling.href;
   const fs = await import("node:fs");
   if (fs.existsSync(sibling)) return sibling.href;
-  return new URL("../../dist/zstd-worker.js", import.meta.url).href;
+  // Running from the TS source tree (vitest loads src/core/*.ts): the
+  // pretest-built worker lives in the repo's dist/. Guard on /src/ so
+  // we never rewrite a real dist/ sibling into a bogus dist/dist/ path
+  // for an installed package.
+  if (sibling.pathname.includes("/src/")) {
+    return new URL("../../dist/zstd-worker.js", import.meta.url).href;
+  }
+  return sibling.href;
 }
 
 // Memoize the wasm-bytes load — every sub-worker gets the same
@@ -133,18 +142,19 @@ function defaultPoolSize(): number {
     const n = parseInt(env, 10);
     if (Number.isFinite(n) && n >= 1) return n;
   }
-  return DEFAULT_POOL_SIZE;
-}
-
-// Allocate a fresh ArrayBuffer carrying a copy of `src`. Uses
-// `set()` rather than `Uint8Array.prototype.slice()` because Node's
-// Buffer overrides slice to return a view (deprecated but still
-// active) — slicing a Buffer and transferring the result's `.buffer`
-// would detach the source.
-function copyToFreshBuffer(src: Uint8Array): ArrayBuffer {
-  const out = new ArrayBuffer(src.byteLength);
-  new Uint8Array(out).set(src);
-  return out;
+  // Clamp to the core count. This client is a singleton *per merge
+  // worker*, so with a merge pool of M workers the process already runs
+  // ~M zstd sub-workers per slot; defaulting to 2 each on a low-core box
+  // oversubscribes the CPU. hardwareConcurrency is available in browsers
+  // and Node ≥ 21.
+  const hc =
+    typeof navigator !== "undefined" &&
+    typeof navigator.hardwareConcurrency === "number"
+      ? navigator.hardwareConcurrency
+      : undefined;
+  return hc !== undefined && hc >= 1
+    ? Math.max(1, Math.min(DEFAULT_POOL_SIZE, hc))
+    : DEFAULT_POOL_SIZE;
 }
 
 class ZstdDecoderClient {
@@ -165,10 +175,7 @@ class ZstdDecoderClient {
   // Subsequent dict-aware decompresses can route to ANY worker
   // because every worker holds its own CtopoDecompressor for that
   // dictId.
-  private readonly dictRegistered = new WeakMap<
-    Uint8Array,
-    Promise<number>
-  >();
+  private readonly dictRegistered = new WeakMap<Uint8Array, Promise<number>>();
   private nextDictId = 1;
 
   // The output Uint8Array views we return reference SAB-backed wasm
@@ -186,7 +193,7 @@ class ZstdDecoderClient {
 
   constructor(poolSize?: number) {
     this.poolSize = poolSize ?? defaultPoolSize();
-    this.pool = new Array(this.poolSize).fill(null);
+    this.pool = Array.from({ length: this.poolSize }, () => null);
     this.freeRegistry = new FinalizationRegistry((token) => {
       const slot = this.pool[token.slot];
       if (slot === null) return; // worker already gone
@@ -307,7 +314,7 @@ class ZstdDecoderClient {
       }
     });
     handle.addEventListener("error", (e) => {
-      const detail = (e as { message?: string }).message ?? String(e);
+      const detail = (e as { message?: string }).message ?? "unknown";
       this.failAll(new Error(`ctopo: zstd sub-worker error: ${detail}`));
     });
     handle.addEventListener("exit", (e) => {
@@ -336,7 +343,10 @@ class ZstdDecoderClient {
 
   // Pool is fully spawned by the time this returns. Picks the worker
   // with the fewest inflight jobs.
-  private async pickLeastLoaded(): Promise<{ state: WorkerState; slot: number }> {
+  private async pickLeastLoaded(): Promise<{
+    state: WorkerState;
+    slot: number;
+  }> {
     await this.warmAll();
     if (this.terminalError !== null) throw this.terminalError;
     let bestSlot = 0;
@@ -389,7 +399,7 @@ class ZstdDecoderClient {
       const workers = this.pool as WorkerState[];
       await Promise.all(
         workers.map((worker) => {
-          const copy = copyToFreshBuffer(dict);
+          const copy = copyView(dict);
           const id = worker.nextMsgId++;
           return this.sendAck(
             worker,
@@ -428,7 +438,7 @@ class ZstdDecoderClient {
     // ArrayBuffer (`bytes.slice()` would alias the original when
     // `bytes` is a Node Buffer — Buffer overrides slice to return a
     // view, not a copy).
-    const copy = copyToFreshBuffer(bytes);
+    const copy = copyView(bytes);
     const id = state.nextMsgId++;
     return this.sendDecompress(
       state,

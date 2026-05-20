@@ -26,9 +26,13 @@
  * tracks (mergeId → slotIdx).
  *
  * Shared-memory model: ViewSpec carries an ArrayBufferLike + byte-
- * Offset + byteLength. When the buffer is SAB-backed (the usual case
- * after the zstd-into-shared-memory rewrite) cross-thread send is
- * essentially free.
+ * Offset + byteLength. The layer CSR specs are coerced to SAB-backed
+ * buffers (see `toSabViewSpec` in merge-pool) so they cross to the
+ * compute worker with no copy and are shared read-only across merges.
+ * The per-merge postMerge payloads (arc bytes / endpoints) go through
+ * plain `toViewSpec` and are NOT coerced — they originate from
+ * core.fetchArcs / fetchArcEndpoints and may be normal ArrayBuffers,
+ * in which case structured clone copies them on send.
  */
 
 import type { TransformDef } from "./merge";
@@ -113,6 +117,16 @@ export interface ComputePostReplyError {
   readonly error: { readonly name: string; readonly message: string };
 }
 
+// Drop a stashed prep result without running post. Sent when a
+// merge is aborted after prep but before (or during) post, so the
+// worker doesn't hold `groupExteriorArcs` for the lifetime of the
+// pool. Carries no reply. If the worker hasn't stashed yet (prep
+// still in flight), it records the id and skips the upcoming stash.
+export interface ComputeDiscardRequest {
+  readonly kind: "discardMerge";
+  readonly id: number;
+}
+
 export interface ComputeShutdownRequest {
   readonly kind: "shutdown";
 }
@@ -124,6 +138,7 @@ export interface ComputeReadyReply {
 export type ComputeRequest =
   | ComputePrepRequest
   | ComputePostRequest
+  | ComputeDiscardRequest
   | ComputeShutdownRequest;
 
 export type ComputeReply =

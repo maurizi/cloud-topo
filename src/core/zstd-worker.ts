@@ -25,7 +25,7 @@ import init, {
   CtopoDecompressor,
   decompress_no_dict_into,
 } from "./zstd-wasm/ctopo_zstd_decoder.js";
-import { getWorkerHost } from "./worker-host";
+import { getWorkerHost, toWireError, type WorkerHost } from "./worker-host";
 
 // Wire types for incoming messages.
 interface RegisterDictMsg {
@@ -76,11 +76,13 @@ type IncomingMsg =
 
 // Filled in by handleInit.
 let wasmModule: WebAssembly.Module | undefined;
-let wasm: {
-  memory: WebAssembly.Memory;
-  __wbindgen_export: (size: number, align: number) => number; // malloc
-  __wbindgen_export2: (ptr: number, size: number, align: number) => void; // free
-} | undefined;
+let wasm:
+  | {
+      memory: WebAssembly.Memory;
+      __wbindgen_export: (size: number, align: number) => number; // malloc
+      __wbindgen_export2: (ptr: number, size: number, align: number) => void; // free
+    }
+  | undefined;
 
 const dictDecoders = new Map<number, CtopoDecompressor>();
 
@@ -90,7 +92,10 @@ async function handleInit(msg: InitMsg): Promise<void> {
   // Using a precompiled `WebAssembly.Module` here avoids re-parsing
   // the wasm bytes; the shared memory is the one from the merge
   // worker so every sub-worker maps to the same SAB.
-  wasm = (await init({ module_or_path: wasmModule, memory: msg.memory })) as never;
+  wasm = await init({
+    module_or_path: wasmModule,
+    memory: msg.memory,
+  });
 }
 
 function getWasm(): NonNullable<typeof wasm> {
@@ -100,10 +105,7 @@ function getWasm(): NonNullable<typeof wasm> {
   return wasm;
 }
 
-async function handle(
-  host: import("./worker-host").WorkerHost,
-  msg: IncomingMsg,
-): Promise<void> {
+async function handle(host: WorkerHost, msg: IncomingMsg): Promise<void> {
   if (msg.type === "close") {
     host.close();
     return;
@@ -134,16 +136,26 @@ async function handle(
   // message back.
   const dst_ptr = w.__wbindgen_export(msg.capacity, 1);
   let byteLength: number;
-  if (msg.dictId !== undefined) {
-    const dec = dictDecoders.get(msg.dictId);
-    if (dec === undefined) {
-      throw new Error(
-        `ctopo-zstd-worker: unknown dictId ${msg.dictId} (register-dict was never received or arrived after decompress)`,
-      );
+  try {
+    if (msg.dictId !== undefined) {
+      const dec = dictDecoders.get(msg.dictId);
+      if (dec === undefined) {
+        throw new Error(
+          `ctopo-zstd-worker: unknown dictId ${msg.dictId} (register-dict was never received or arrived after decompress)`,
+        );
+      }
+      byteLength = dec.decompress_into(compressed, dst_ptr, msg.capacity);
+    } else {
+      byteLength = decompress_no_dict_into(compressed, dst_ptr, msg.capacity);
     }
-    byteLength = dec.decompress_into(compressed, dst_ptr, msg.capacity);
-  } else {
-    byteLength = decompress_no_dict_into(compressed, dst_ptr, msg.capacity);
+  } catch (err) {
+    // Free the output allocation before the error propagates — on the
+    // success path the caller frees it via a `free` message, but a
+    // throw here means no reply (and thus no free) is ever sent, so
+    // without this each failed decode leaks `capacity` bytes of the
+    // shared wasm memory until the sub-worker dies.
+    w.__wbindgen_export2(dst_ptr, msg.capacity, 1);
+    throw err;
   }
   host.postMessage({
     id: msg.id,
@@ -163,10 +175,7 @@ void getWorkerHost().then((host) => {
     const msg = data as IncomingMsg;
     const id = (msg as { id?: number }).id ?? 0;
     handle(host, msg).catch((err: unknown) => {
-      const message = err instanceof Error ? err.message : String(err);
-      const name = err instanceof Error ? err.name : "Error";
-      host.postMessage({ id, ok: false, error: { name, message } });
+      host.postMessage({ id, ok: false, error: toWireError(err) });
     });
   });
 });
-

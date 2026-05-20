@@ -13,7 +13,7 @@
 import { type MultiPolygon } from "geojson";
 
 import { type MultiPolygonArcs } from "../core/merge";
-import { type ContainerMeta, type LayerSelection } from "../core/types";
+import { type LayerSelection } from "../core/types";
 
 import { type CtopoClient } from "./client";
 import {
@@ -23,6 +23,9 @@ import {
 } from "./rebuild";
 
 export { type MultiPolygonArcs } from "../core/merge";
+// transform / untransform are pure point-mappers shared with the core
+// layer — re-export the single copy from ./core/util.
+export { transform, untransform } from "../core/util";
 
 export async function merge(
   client: CtopoClient,
@@ -55,26 +58,4 @@ export function bbox(
   client: CtopoClient,
 ): readonly [number, number, number, number] {
   return client.meta.bbox;
-}
-
-type TransformDef = ContainerMeta["transform"];
-
-export function transform(
-  t: TransformDef,
-): (point: readonly [number, number]) => [number, number] {
-  if (t === null) return (p) => [p[0], p[1]];
-  return (p) => [
-    p[0] * t.scale[0] + t.translate[0],
-    p[1] * t.scale[1] + t.translate[1],
-  ];
-}
-
-export function untransform(
-  t: TransformDef,
-): (point: readonly [number, number]) => [number, number] {
-  if (t === null) return (p) => [p[0], p[1]];
-  return (p) => [
-    (p[0] - t.translate[0]) / t.scale[0],
-    (p[1] - t.translate[1]) / t.scale[1],
-  ];
 }

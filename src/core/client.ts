@@ -53,7 +53,31 @@ import {
   loadZstdWasmDecode,
   preloadZstdWasmIfNeeded,
 } from "./decompress";
-import { runWithConcurrency } from "./util";
+import { runWithConcurrency, sabUsable } from "./util";
+import { breaksFromCsr } from "./merge-prep";
+import {
+  DEFAULT_ARC_COORDS_PREFETCH,
+  DEFAULT_BACK_PREFETCH,
+  DEFAULT_BYTE_RANGE_CACHE,
+  DEFAULT_COALESCE_GAP,
+  DEFAULT_FRONT_PREFETCH,
+  DEFAULT_GAP_BY_FAMILY,
+  DEFAULT_MAX_CHUNK,
+  DEFAULT_MAX_PARALLEL_RANGES,
+  DEFAULT_MAX_RANGES_PER_REQUEST,
+  EMPTY_BYTES,
+  EMPTY_INT32,
+  findArcCoordBlock,
+  mergePriority,
+  stitchChunks,
+  throwIfAborted,
+  viewU32WithDelta,
+  type CachedByteRange,
+  type ChunkTask,
+  type InFlightRange,
+  type LogicalRange,
+  type PendingSectionFetch,
+} from "./client-internal";
 
 // --- Types ---
 
@@ -208,121 +232,6 @@ export interface OpenContainerOptions {
   readonly multiRangeEnabled?: boolean;
 }
 
-interface PendingSectionFetch {
-  readonly family: string;
-  readonly start: number;
-  readonly end: number;
-  readonly priority: FetchPriority;
-  readonly signal?: AbortSignal;
-  readonly resolve: (bytes: Uint8Array) => void;
-  readonly reject: (err: unknown) => void;
-}
-
-interface LogicalRange {
-  readonly family: string;
-  readonly start: number;
-  end: number;
-  readonly items: PendingSectionFetch[];
-  // Highest-urgency priority among constituent items — coalesced
-  // chunks inherit it so a small high-priority fetch upgrades any
-  // bulk fetches it gets fused with.
-  priority: FetchPriority;
-  // Filled in as chunks complete. Length = number of chunks.
-  chunkBytes: Uint8Array[];
-  error: unknown;
-}
-
-interface ChunkTask {
-  readonly logical: LogicalRange;
-  readonly index: number;
-  readonly start: number;
-  readonly end: number;
-}
-
-interface CachedByteRange {
-  readonly start: number;
-  readonly end: number;
-  readonly bytes: Uint8Array;
-}
-
-interface InFlightRange {
-  readonly start: number;
-  readonly end: number;
-  readonly promise: Promise<Uint8Array>;
-}
-
-// --- Constants ---
-
-// Default front-prefetch is OFF — callers explicitly opt in based on
-// their front-loaded set size. Open path still works without it: the
-// suffix-range footer GET delivers META, and lazy section fetches
-// take the round trip when first needed.
-const DEFAULT_FRONT_PREFETCH = 0;
-// Suffix-range footer GET. 256 KiB is generous for any realistic
-// section table + META JSON; the reader validates the trailing length
-// marker and errors if the footer overflows, so over-budgeting is
-// safe.
-const DEFAULT_BACK_PREFETCH = 256 * 1024;
-const DEFAULT_COALESCE_GAP = 64 * 1024;
-// Arcs default — see doc on OpenContainerOptions.coalesceGapByFamily.
-// 0 = merge truly-adjacent ranges only, never jump a gap. Combined
-// with multi-range packing (DEFAULT_MAX_RANGES_PER_REQUEST = 64) the
-// blocks a sparse merge actually needs ride together in a handful of
-// `multipart/byteranges` requests at zero gap-content overhead. The
-// previous 8 KiB default pulled ~6–7 MiB of unwanted block content
-// per merge; measured on national CDs: ~−6.6 MiB downloaded /
-// −2–3% wall-clock at every latency vs the 8 KiB default. Wider
-// gaps (1 MiB, the long-ago default) collapsed nearly every arcs
-// fetch into one giant range that pulled all of arc_coords.
-const DEFAULT_ARCS_COALESCE_GAP = 0;
-// Offsets default. Used by per-partition fetches in the
-// partitioned-arc_offsets path. Partitions are 100s of bytes each, so
-// a generous gap bridges huge numbers of unfetched partitions and
-// erases the savings; the simulation in
-// bench-out/national/*.offsets-partition-sim.csv showed 4 KiB as the
-// sweet spot for hierarchical-hilbert on national CDs (~4.86 MiB
-// fetched / 11 reqs vs ~13.6 MiB fetched at 64 KiB).
-const DEFAULT_OFFSETS_COALESCE_GAP = 4 * 1024;
-// Endpoints default — partitions are tiny (4-16 B per arc, hundreds
-// to a few thousand bytes per partition compressed). Mirror the
-// offsets gap so sparse merges coalesce nearby endpoint fetches
-// without dragging in huge swaths of arcs we didn't ask for. Tunable
-// per-call via OpenContainerOptions.coalesceGapByFamily.endpoints.
-const DEFAULT_ENDPOINTS_COALESCE_GAP = 4 * 1024;
-const DEFAULT_GAP_BY_FAMILY: Readonly<Record<string, number>> = {
-  arcs: DEFAULT_ARCS_COALESCE_GAP,
-  offsets: DEFAULT_OFFSETS_COALESCE_GAP,
-  endpoints: DEFAULT_ENDPOINTS_COALESCE_GAP,
-};
-// 4 MiB physical chunk cap. See doc on OpenContainerOptions.maxChunkBytes.
-const DEFAULT_MAX_CHUNK = 4 * 1024 * 1024;
-// 8 parallel chunks. HTTP/2 lets us multiplex these on one connection,
-// so going above 6 is fine; we cap to keep flight bytes bounded
-// (8 × 4 MiB = 32 MiB max in-flight).
-const DEFAULT_MAX_PARALLEL_RANGES = 8;
-// Sized to comfortably hold the open-time front prefetch (typically
-// a few MiB) alongside one full pass of property/strings/arc_coords
-// fetches during boundary compute, without evicting front-prefetched
-// structural sections (arc_offsets, CSR triples) before they're
-// re-read by stitching.
-const DEFAULT_BYTE_RANGE_CACHE = 128 * 1024 * 1024;
-// Multi-range request defaults.
-const DEFAULT_MAX_RANGES_PER_REQUEST = 64;
-// Open-time prefetch size for arc_coords. Block-compressed arc_coords
-// is read through the byte-range cache; warming the section's prefix
-// lets the first N blocks' compressed bytes serve from memory. The
-// encoder front-loads top-layer boundary arcs (outer perimeter +
-// parent-layer interior boundaries) by virtue of the visit-order
-// assignment, so 512 KiB comfortably covers those for typical
-// topologies; the rest is fetched on demand by the merge.
-const DEFAULT_ARC_COORDS_PREFETCH = 512 * 1024;
-
-// Sentinel placeholder used to mark an arc id as "claimed" in the
-// fetchArcs result map before its real bytes arrive — keeps the
-// dedupe loop synchronous without storing a second tracking set.
-const EMPTY_BYTES = new Uint8Array(0);
-const EMPTY_INT32 = new Int32Array(0);
-
 // --- Public API ---
 
 export async function openContainer(
@@ -394,10 +303,7 @@ export class CtopoCore {
   // every merge after that. Without the cache, expandLayerPolygons
   // rebuilt this map (one Map.set per multi_poly_breaks entry) on
   // every merge call — a 220 ms tax on the national CD merge.
-  private readonly breaksByGeomCache = new Map<
-    string,
-    Map<number, number[]>
-  >();
+  private readonly breaksByGeomCache = new Map<string, Map<number, number[]>>();
   // Per-layer arc_refs block table (the u32 quads
   // [firstGeomId, compOff, compLen, uncLen]). Fetched lazily on first
   // partitioned-layer geometry load, reused thereafter.
@@ -599,6 +505,19 @@ export class CtopoCore {
       }
       this.arcEndpointsPartitionsBase = partitions.offset;
     }
+
+    // Force-warm the zstd wasm sub-worker pool. arc_coords is always
+    // block-compressed (arcCoordsBlocks is mandatory) and every
+    // per-block / per-partition decode routes through the wasm pool
+    // for dict support — even on runtimes with native
+    // DecompressionStream("zstd"), which has no dict parameter. The
+    // unconditional preload in openWith only warms when native zstd is
+    // absent, so without this a native-zstd runtime would pay the
+    // full pool cold-start (spawn sub-workers + compile wasm)
+    // synchronously on the first arc decode, on the merge critical
+    // path. warm() is idempotent, so this is a no-op when openWith
+    // already warmed it.
+    preloadZstdWasmIfNeeded(true);
   }
 
   // --- Factory ---
@@ -878,18 +797,7 @@ export class CtopoCore {
   breaksByGeom(layer: string, csr: LayerGeometry): Map<number, number[]> {
     let cached = this.breaksByGeomCache.get(layer);
     if (cached !== undefined) return cached;
-    cached = new Map<number, number[]>();
-    const breaks = csr.multiPolyBreaks;
-    for (let i = 0; i < breaks.length; i += 2) {
-      const g = breaks[i];
-      const r = breaks[i + 1];
-      let list = cached.get(g);
-      if (list === undefined) {
-        list = [];
-        cached.set(g, list);
-      }
-      list.push(r);
-    }
+    cached = breaksFromCsr(csr);
     this.breaksByGeomCache.set(layer, cached);
     return cached;
   }
@@ -1522,7 +1430,14 @@ export class CtopoCore {
     );
     let total = 0;
     for (const b of partBytes) total += b.byteLength;
-    const out = new Uint8Array(total);
+    // Concatenate into a SharedArrayBuffer when one is available so the
+    // assembled arc_refs CSR is born shareable: the merge pool's
+    // toSabViewSpec then forwards it to compute workers with no further
+    // copy (otherwise it re-copies this whole — up to tens of MiB —
+    // buffer into a fresh SAB at the worker boundary). The concat copy
+    // itself is unavoidable: each partition decodes into its own region
+    // of the zstd sub-worker's wasm memory.
+    const out = new Uint8Array(allocConcatBuffer(total));
     let off = 0;
     for (const b of partBytes) {
       out.set(b, off);
@@ -1881,18 +1796,23 @@ export class CtopoCore {
       let y = 0;
       cur.off = 0;
       const end = bytes.byteLength;
-      let pIdx = 0;
-      while (cur.off < end) {
+      // We must walk the whole cumulative-delta stream to recover the
+      // last point (no random access into a varint stream), but we only
+      // record the first and last. Read the first point outside the loop
+      // so the hot loop carries no per-point "is this the first?" branch.
+      if (end > 0) {
         readVarintZigzagInto(bytes, cur);
-        const dx = cur.value;
+        x += cur.value;
         readVarintZigzagInto(bytes, cur);
-        x += dx;
         y += cur.value;
-        if (pIdx === 0) {
-          endpoints[0] = x;
-          endpoints[1] = y;
+        endpoints[0] = x;
+        endpoints[1] = y;
+        while (cur.off < end) {
+          readVarintZigzagInto(bytes, cur);
+          x += cur.value;
+          readVarintZigzagInto(bytes, cur);
+          y += cur.value;
         }
-        pIdx++;
       }
       endpoints[2] = x;
       endpoints[3] = y;
@@ -1920,25 +1840,6 @@ export class CtopoCore {
     const start = section.offset;
     const end = Math.min(start + bytes, start + section.length);
     if (end <= start) return;
-    this.enqueueSectionFetch(family, start, end, priority).catch(() => {
-      // Silent — prefetch failures don't fail open or surface.
-    });
-  }
-
-  // Issue a Range fetch for [start, end) through the standard
-  // pipeline — chunks at maxChunkBytes and fires up to
-  // maxParallelRanges physical GETs in parallel; bytes land in the
-  // byte-range cache automatically. Used by the open path to
-  // prefetch front-loaded sections without serializing on a single
-  // big GET (which throttles on a single HTTP/2 stream).
-  // Fire-and-forget — exceptions are swallowed (a failed prefetch
-  // surfaces on the first dependent section fetch instead).
-  prefetchRange(
-    family: string,
-    start: number,
-    end: number,
-    priority: FetchPriority = "auto",
-  ): void {
     this.enqueueSectionFetch(family, start, end, priority).catch(() => {
       // Silent — prefetch failures don't fail open or surface.
     });
@@ -2072,19 +1973,6 @@ export class CtopoCore {
     this.pendingSectionFetches = [];
     this.flushScheduled = false;
     if (pending.length === 0) return;
-
-    // DEBUG: log every drain so we can see how the inline path vs
-    // the pool path differ in batching shape.
-    if (
-      typeof process !== "undefined" &&
-      process.env?.CTOPO_COALESCE_DEBUG === "1"
-    ) {
-      const byFam: Record<string, number> = {};
-      for (const p of pending) byFam[p.family] = (byFam[p.family] ?? 0) + 1;
-      process.stderr.write(
-        `[coalesce] drain n=${pending.length} families=${JSON.stringify(byFam)}\n`,
-      );
-    }
 
     // Bucket pending fetches by family. We only ever bridge gaps
     // *within* a family — across families (e.g. property X and
@@ -2536,73 +2424,17 @@ export class CtopoCore {
 
 // --- Module-level helpers ---
 
+// Allocate a buffer to concatenate decompressed partitions into. Prefers
+// a SharedArrayBuffer so the result can cross to compute workers without
+// a second copy; falls back to a plain ArrayBuffer where SAB can't cross
+// the worker boundary (a browser without cross-origin isolation), since
+// the merge there runs in-process and never needs to share it.
+function allocConcatBuffer(byteLength: number): ArrayBufferLike {
+  return sabUsable()
+    ? new SharedArrayBuffer(byteLength)
+    : new ArrayBuffer(byteLength);
+}
+
 // Check a caller-supplied AbortSignal and throw if already aborted.
 // Used at the entry of every public method so pre-aborted signals
 // reject immediately without touching the cache or fetch pipeline.
-function throwIfAborted(signal?: AbortSignal): void {
-  if (signal?.aborted) {
-    throw signal.reason ?? new Error("aborted");
-  }
-}
-
-// Pick the more-urgent priority of two values. high > auto > low.
-function mergePriority(a: FetchPriority, b: FetchPriority): FetchPriority {
-  if (a === "high" || b === "high") return "high";
-  if (a === "auto" || b === "auto") return "auto";
-  return "low";
-}
-
-function stitchChunks(
-  start: number,
-  end: number,
-  chunkBytes: Uint8Array[],
-): Uint8Array {
-  const out = new Uint8Array(end - start);
-  let cursor = 0;
-  for (const c of chunkBytes) {
-    out.set(c, cursor);
-    cursor += c.byteLength;
-  }
-  return out;
-}
-
-// Binary search the block table for the block containing a given
-// logical (uncompressed) byte offset. Block table is u32 triples
-// [uncEnd, compOff, compLen]; uncEnd is monotonically increasing and
-// exclusive, so we want the smallest i such that uncEnd[i] > offset.
-function findArcCoordBlock(blocks: Uint32Array, logicalOffset: number): number {
-  const blockCount = blocks.length / 3;
-  let lo = 0;
-  let hi = blockCount - 1;
-  while (lo < hi) {
-    const mid = (lo + hi) >>> 1;
-    if (blocks[mid * 3] <= logicalOffset) lo = mid + 1;
-    else hi = mid;
-  }
-  return lo;
-}
-
-// Wrap section bytes as a Uint32Array, undoing first-order delta
-// encoding when the section was emitted that way. Non-delta path
-// shares the underlying buffer (zero copy); delta path runs a
-// running prefix sum into a fresh buffer with u32 wraparound that
-// mirrors the encoder side. Roughly a few ms one-time cost per
-// million entries on a multi-MiB arc_offsets.
-function viewU32WithDelta(bytes: Uint8Array, delta: boolean): Uint32Array {
-  if (!delta)
-    return new Uint32Array(
-      bytes.buffer,
-      bytes.byteOffset,
-      bytes.byteLength / 4,
-    );
-  const src = new Uint32Array(
-    bytes.buffer,
-    bytes.byteOffset,
-    bytes.byteLength / 4,
-  );
-  const dst = new Uint32Array(src.length);
-  if (src.length === 0) return dst;
-  dst[0] = src[0];
-  for (let i = 1; i < src.length; i++) dst[i] = (dst[i - 1] + src[i]) >>> 0;
-  return dst;
-}

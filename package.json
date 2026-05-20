@@ -43,9 +43,11 @@
   "scripts": {
     "build": "tsup",
     "build:wasm": "node scripts/build-wasm.mjs",
-    "pretest": "tsup",
+    "build:fixtures": "node scripts/build-test-fixtures.mjs",
+    "pretest": "tsup && node scripts/build-test-fixtures.mjs",
     "test": "vitest run",
     "test:watch": "vitest",
+    "test:coverage": "vitest run --coverage",
     "typecheck": "tsc --noEmit",
     "lint": "eslint 'src/**/*.ts'",
     "prepublishOnly": "npm run build"
@@ -55,6 +57,7 @@
     "@types/geojson": "^7946.0.16",
     "@types/node": "^22.0.0",
     "@types/topojson-specification": "^1.0.1",
+    "@vitest/coverage-v8": "^4.1.6",
     "eslint": "^9.28.0",
     "eslint-config-prettier": "^10.1.0",
     "eslint-plugin-prettier": "^5.5.0",

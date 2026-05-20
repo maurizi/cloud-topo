@@ -24,7 +24,11 @@
 import { CtopoCore, type OpenContainerOptions } from "./core/client";
 import { closeZstdDecoderClient } from "./core/zstd-decoder-client";
 import { reconstructFetcher } from "./core/fetcher";
-import { getWorkerHost, type WorkerHost } from "./core/worker-host";
+import {
+  getWorkerHost,
+  toWireError,
+  type WorkerHost,
+} from "./core/worker-host";
 import {
   mergeArcsFlat,
   mergeFlat,
@@ -34,6 +38,7 @@ import {
   type FlatNeighbors,
 } from "./core/merge";
 import { MergePool } from "./core/merge-pool";
+import { copyView, sabUsable } from "./core/util";
 import { type LayerSelection } from "./core/types";
 import type {
   WireFlatMultiPolygon,
@@ -71,6 +76,32 @@ interface CoreEntry {
   // the singleton; later clients with different sizes share the
   // existing pool.
   poolSize: number | null;
+}
+
+// Warn once per worker when we drop to the no-SharedArrayBuffer
+// fallback, so a misconfigured (non-cross-origin-isolated) deployment
+// is diagnosable without spamming every merge.
+let warnedNoSab = false;
+function warnNoSabOnce(): void {
+  if (warnedNoSab) return;
+  warnedNoSab = true;
+  // eslint-disable-next-line no-console
+  console.warn(
+    "ctopo: SharedArrayBuffer is unavailable (page is not cross-origin " +
+      "isolated), so cloud-topo is running its single-threaded fallback: " +
+      "zstd decodes in-process and merges run unparallelized. Serve with " +
+      "COOP: same-origin + COEP: require-corp headers to enable the fast " +
+      "path. See the README 'Cross-origin isolation' section.",
+  );
+}
+
+// Clamp a requested pool size to what the runtime supports. The merge
+// pool ships CSR geometry to compute workers via SharedArrayBuffer; if
+// SAB can't cross the worker boundary, force the in-process merge path
+// (size 1) instead and warn.
+function effectivePoolSize(requested: number | null): number | null {
+  if (requested === null || requested <= 1 || sabUsable()) return requested;
+  return 1;
 }
 
 // One pool per coordinator. Lazily created on first merge call from
@@ -122,25 +153,6 @@ function toLayerSelection(
 interface Reply {
   result: unknown;
   transfer: ReadonlyArray<ArrayBufferLike>;
-}
-
-function copyBuffer(view: ArrayBufferView): ArrayBufferLike {
-  // Slice the live bytes into a fresh, transferable ArrayBuffer.
-  // Used for the cached-section returns (property / strings /
-  // layerGeometry) so the worker keeps its cache and the proxy gets
-  // an independent copy it can transfer (and ultimately wrap as a
-  // typed array on the main thread without coupling lifetimes).
-  //
-  // Source may be SAB-backed (zstd decompressed straight into the
-  // sub-worker's shared wasm memory): `SharedArrayBuffer.slice()`
-  // returns another SAB, which the transferList rejects AND would
-  // leak shared writes back to the worker. Copy into a fresh,
-  // private ArrayBuffer to preserve the isolation contract.
-  const out = new ArrayBuffer(view.byteLength);
-  new Uint8Array(out).set(
-    new Uint8Array(view.buffer, view.byteOffset, view.byteLength),
-  );
-  return out;
 }
 
 function flatMultiPolygonReply(flat: FlatMultiPolygon): Reply {
@@ -200,15 +212,17 @@ async function dispatch(
           `ctopo: worker received \`open\` twice for client ${msg.clientId}`,
         );
       }
+      if (!sabUsable()) warnNoSabOnce();
       let entry = byUrl.get(msg.args.url);
       if (entry === undefined) {
         const fetcher = reconstructFetcher(msg.args.fetcher);
         const opts: OpenContainerOptions = { ...msg.args.opts, signal };
         const core = await CtopoCore.openWith(fetcher, opts);
-        const poolSize =
+        const requestedPoolSize =
           msg.args.opts.pool === null || msg.args.opts.pool === undefined
             ? null
             : msg.args.opts.pool.size;
+        const poolSize = effectivePoolSize(requestedPoolSize);
         entry = { core, url: msg.args.url, refcount: 0, poolSize };
         byUrl.set(msg.args.url, entry);
       }
@@ -233,14 +247,17 @@ async function dispatch(
         throw new Error(`ctopo: unknown property section "${msg.args.name}"`);
       }
       const result: WirePropertyResult = {
-        buffer: copyBuffer(view),
+        buffer: copyView(view),
         dtype: section.dtype,
       };
       return { result, transfer: [result.buffer] };
     }
     case "strings": {
-      const strings = await getCore(msg.clientId).strings(msg.args.name, signal);
-      const result: WireStringsResult = { buffer: copyBuffer(strings.bytes) };
+      const strings = await getCore(msg.clientId).strings(
+        msg.args.name,
+        signal,
+      );
+      const result: WireStringsResult = { buffer: copyView(strings.bytes) };
       return { result, transfer: [result.buffer] };
     }
     case "layerGeometry": {
@@ -249,10 +266,10 @@ async function dispatch(
         signal,
       );
       const result: WireLayerGeometryResult = {
-        polyOffsets: copyBuffer(csr.polyOffsets),
-        ringOffsets: copyBuffer(csr.ringOffsets),
-        arcRefs: copyBuffer(csr.arcRefs),
-        multiPolyBreaks: copyBuffer(csr.multiPolyBreaks),
+        polyOffsets: copyView(csr.polyOffsets),
+        ringOffsets: copyView(csr.ringOffsets),
+        arcRefs: copyView(csr.arcRefs),
+        multiPolyBreaks: copyView(csr.multiPolyBreaks),
       };
       return {
         result,
@@ -302,7 +319,10 @@ async function dispatch(
       // Maps cross via structured clone — Uint8Array clones are O(N)
       // on byteLength but this method is rarely on the hot path
       // (advanced API).
-      const result = await getCore(msg.clientId).fetchArcs(msg.args.ids, signal);
+      const result = await getCore(msg.clientId).fetchArcs(
+        msg.args.ids,
+        signal,
+      );
       return { result, transfer: [] };
     }
     case "fetchArcEndpoints": {
@@ -333,6 +353,9 @@ async function dispatch(
         if (entry.refcount <= 0) {
           entry.core.close();
           byUrl.delete(entry.url);
+          // Drop this core's cached layer CSRs from the shared pool so
+          // its SharedArrayBuffers are released with the core.
+          mergePool?.evictCore(entry.core);
         }
       }
       // If this is the last client, flush the CPU profile (if any)
@@ -369,7 +392,11 @@ async function dispatch(
   }
 }
 
-function handleMessage(host: WorkerHost, data: unknown, source: PortLike): void {
+function handleMessage(
+  host: WorkerHost,
+  data: unknown,
+  source: PortLike,
+): void {
   const maybeAbort = data as Partial<WorkerAbort>;
   if (maybeAbort.abort === true && typeof maybeAbort.clientId === "number") {
     const key = inflightKey(maybeAbort.clientId, maybeAbort.id as number);
@@ -418,13 +445,11 @@ function handleMessage(host: WorkerHost, data: unknown, source: PortLike): void 
     },
     (err: unknown) => {
       inflight.delete(key);
-      const message = err instanceof Error ? err.message : String(err);
-      const name = err instanceof Error ? err.name : "Error";
       const reply: WorkerResponse = {
         clientId: req.clientId,
         id: req.id,
         ok: false,
-        error: { name, message },
+        error: toWireError(err),
       };
       source.postMessage(reply);
     },
@@ -459,7 +484,10 @@ void getWorkerHost().then((host) => {
   // transfer)` against the host (which has the same shape).
   const hostAsPort: PortLike = {
     postMessage: (msg, transfer) =>
-      host.postMessage(msg, transfer as ReadonlyArray<ArrayBufferLike> | undefined),
+      host.postMessage(
+        msg,
+        transfer as ReadonlyArray<ArrayBufferLike> | undefined,
+      ),
   };
   host.onMessage((data) => {
     if ((data as WorkerAddPort).kind === "addPort") {

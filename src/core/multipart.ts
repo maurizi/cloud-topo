@@ -111,6 +111,15 @@ function parseSinglePart(part: Uint8Array): ByteRangePart | null {
   const bodyStart = headerEnd + 4;
   const bytes = part.subarray(bodyStart);
 
+  // The payload must match the byte count its own Content-Range
+  // declares; a mismatch means a truncated/garbled part that would
+  // otherwise feed a short buffer to a section reader.
+  if (bytes.byteLength !== end - start) {
+    throw new Error(
+      `ctopo: multipart part body is ${bytes.byteLength} bytes but Content-Range declares ${end - start}`,
+    );
+  }
+
   return { start, end, bytes };
 }
 

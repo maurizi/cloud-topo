@@ -19,6 +19,14 @@ export interface WorkerHost {
   readonly close: () => void;
 }
 
+// Normalize a thrown value to the { name, message } shape every worker
+// wire protocol uses for its error replies.
+export function toWireError(err: unknown): { name: string; message: string } {
+  return err instanceof Error
+    ? { name: err.name, message: err.message }
+    : { name: "Error", message: String(err) };
+}
+
 interface BrowserSelf {
   onmessage: ((e: { data: unknown }) => void) | null;
   postMessage: (
@@ -92,10 +100,7 @@ interface BrowserWorkerCtor {
 }
 
 interface NodeWorker {
-  postMessage: (
-    msg: unknown,
-    transfer?: ReadonlyArray<ArrayBuffer>,
-  ) => void;
+  postMessage: (msg: unknown, transfer?: ReadonlyArray<ArrayBuffer>) => void;
   on: (
     event: "message" | "error" | "exit",
     listener: (arg: unknown) => void,
@@ -125,12 +130,13 @@ export async function spawnWorker(url: string | URL): Promise<WorkerHandle> {
     Worker: NodeWorkerThreadsCtor;
   };
   const w = new wt.Worker(typeof url === "string" ? new URL(url) : url);
-  // Browser-API adapter. We track listeners so removeEventListener
-  // can find the underlying `on`/`off` callback to unhook.
-  const listeners = new Map<
-    (e: { data?: unknown; message?: string }) => void,
-    (arg: unknown) => void
-  >();
+  // Browser-API adapter. We track listeners so removeEventListener can
+  // find the underlying `on`/`off` callback to unhook. One bucket per
+  // event type (keyed by listener within), so the same function
+  // registered for two kinds — e.g. one handler on both "error" and
+  // "exit" — unhooks the right wrapper instead of clobbering the other.
+  type Listener = (e: { data?: unknown; message?: string }) => void;
+  const byType = new Map<string, Map<Listener, (arg: unknown) => void>>();
   return {
     postMessage: (msg, transfer) => w.postMessage(msg, transfer),
     addEventListener: (type, listener) => {
@@ -138,23 +144,27 @@ export async function spawnWorker(url: string | URL): Promise<WorkerHandle> {
         if (type === "message") {
           listener({ data: arg });
         } else if (type === "error") {
-          const message =
-            arg instanceof Error ? arg.message : String(arg);
+          const message = arg instanceof Error ? arg.message : String(arg);
           listener({ message });
         } else {
           // exit — Node delivers the exit code as the arg
           listener({ data: arg });
         }
       };
-      listeners.set(listener, wrapped);
+      let bucket = byType.get(type);
+      if (bucket === undefined) {
+        bucket = new Map();
+        byType.set(type, bucket);
+      }
+      bucket.set(listener, wrapped);
       w.on(type, wrapped);
     },
     removeEventListener: (type, listener) => {
-      const wrapped = listeners.get(listener);
-      if (wrapped !== undefined) {
-        w.off(type, wrapped);
-        listeners.delete(listener);
-      }
+      const bucket = byType.get(type);
+      const wrapped = bucket?.get(listener);
+      if (bucket === undefined || wrapped === undefined) return;
+      w.off(type, wrapped);
+      bucket.delete(listener);
     },
     terminate: () => w.terminate(),
   };

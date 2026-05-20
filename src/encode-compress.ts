@@ -788,7 +788,8 @@ export async function blockCompressArcRefs(
   );
   const poolSize = Math.min(BLOCK_COMPRESS_CONCURRENCY, blockCount);
   const streams = new Array<ZstdFrameStream>(poolSize);
-  for (let s = 0; s < poolSize; s++) streams[s] = makeZstdFrameStream(undefined);
+  for (let s = 0; s < poolSize; s++)
+    streams[s] = makeZstdFrameStream(undefined);
   let cursor = 0;
   const worker = async (s: ZstdFrameStream): Promise<void> => {
     while (cursor < blockCount) {

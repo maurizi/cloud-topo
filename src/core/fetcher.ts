@@ -145,18 +145,36 @@ export function makeRangeFetcher(
 export function makeBufferFetcher(buf: Uint8Array): RangeFetcher {
   return {
     range: (start, end) => {
-      const clampedEnd = Math.min(end, buf.byteLength);
-      return Promise.resolve(buf.subarray(start, clampedEnd));
+      // Honor the RangeFetcher contract: exactly end - start bytes.
+      // Silently clamping an over-long range to EOF would hand a short
+      // buffer to section readers and mask offset-math bugs.
+      if (start < 0 || end > buf.byteLength) {
+        return Promise.reject(
+          new Error(
+            `ctopo: range [${start}, ${end}) out of bounds for buffer length ${buf.byteLength}`,
+          ),
+        );
+      }
+      return Promise.resolve(buf.subarray(start, end));
     },
     suffix: (length) => {
       const clamped = Math.min(length, buf.byteLength);
       return Promise.resolve(buf.subarray(buf.byteLength - clamped));
     },
     multiRange: (ranges) => {
+      for (const r of ranges) {
+        if (r.start < 0 || r.end > buf.byteLength) {
+          return Promise.reject(
+            new Error(
+              `ctopo: range [${r.start}, ${r.end}) out of bounds for buffer length ${buf.byteLength}`,
+            ),
+          );
+        }
+      }
       const parts = ranges.map((r) => ({
         start: r.start,
         end: r.end,
-        bytes: buf.subarray(r.start, Math.min(r.end, buf.byteLength)),
+        bytes: buf.subarray(r.start, r.end),
       }));
       return Promise.resolve({ kind: "parts" as const, parts });
     },
@@ -219,6 +237,14 @@ export function makeHttpFetcher(url: string): RangeFetcher {
       }
     }
     const buf = await response.arrayBuffer();
+    // Catch short bodies even when the server omitted Content-Range (the
+    // header check above only fires when it's present). A truncated 206
+    // would otherwise feed a short buffer to section readers undetected.
+    if (expectedLength !== undefined && buf.byteLength !== expectedLength) {
+      throw new Error(
+        `ctopo: server returned ${buf.byteLength} bytes for ${rangeHeader}, expected ${expectedLength}`,
+      );
+    }
     perfLog(
       `[ctopo] #${id} GET ${label} done in ${(performance.now() - t0).toFixed(0)}ms (${buf.byteLength}B)`,
     );
@@ -303,6 +329,11 @@ export function makeHttpFetcher(url: string): RangeFetcher {
       }
       const start = Number(match[1]);
       const end = Number(match[2]) + 1;
+      if (buf.byteLength !== end - start) {
+        throw new Error(
+          `ctopo: 206 body is ${buf.byteLength} bytes but Content-Range ${contentRange} declares ${end - start}`,
+        );
+      }
       return {
         kind: "parts" as const,
         parts: [{ start, end, bytes: buf }],

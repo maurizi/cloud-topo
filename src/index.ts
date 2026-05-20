@@ -37,12 +37,6 @@ export {
   viewSection,
 } from "./core/reader";
 
-// FetcherSpec replaces the function-based RangeFetcher slot on the
-// public surface. The internal `RangeFetcher` interface is no longer
-// exported — function-shaped fetchers can't cross the worker boundary,
-// so the only way to feed bytes to the worker is via a spec.
-export type { FetcherSpec } from "./core/fetcher";
-
 // Worker-backed client + open helper.
 export {
   CtopoClient,

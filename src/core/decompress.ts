@@ -24,6 +24,26 @@
 import { type SectionEntry } from "./types";
 import { perfLog } from "./fetcher";
 import { getZstdDecoderClient } from "./zstd-decoder-client";
+import { plainZstd } from "./zstd-wasm/plain-decoder";
+import { sabUsable } from "./util";
+
+// The wasm zstd decoder needs a `warm()` + `decompress(bytes, capacity,
+// dict?)` pair. The shared-memory sub-worker path gives the best
+// throughput but needs a cross-origin-isolated page; where SAB can't
+// cross the worker boundary we fall back to decoding in-process with
+// the plain (non-shared) wasm build. `sabUsable()` picks once.
+interface WasmZstdDecoder {
+  warm(): Promise<void>;
+  decompress(
+    bytes: Uint8Array,
+    capacity: number,
+    dict?: Uint8Array,
+  ): Promise<Uint8Array>;
+}
+
+function zstdDecoder(): WasmZstdDecoder {
+  return sabUsable() ? getZstdDecoderClient() : plainZstd;
+}
 
 // --- Types ---
 
@@ -116,18 +136,18 @@ export async function decompressSection(
 // when the runtime lacks native zstd. Idempotent.
 export function preloadZstdWasmIfNeeded(forceLoad: boolean = false): void {
   if (!forceLoad && zstdNativeOk()) return;
-  void getZstdDecoderClient().warm();
+  void zstdDecoder().warm();
 }
 
 export async function loadZstdWasmDecode(
   entry: SectionEntry,
 ): Promise<WasmZstdDecode> {
-  const client = getZstdDecoderClient();
+  const client = zstdDecoder();
   try {
     await client.warm();
   } catch (err) {
     throw new Error(
-      `ctopo: section "${entry.name}" needs zstd decompression but the wasm sub-worker could not be spawned (${
+      `ctopo: section "${entry.name}" needs zstd decompression but the wasm decoder could not be initialized (${
         (err as Error).message
       })`,
     );

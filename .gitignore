@@ -1,11 +1,18 @@
 node_modules/
 dist/
+coverage/
 *.tgz
 
+# Test fixtures encoded from committed *.topojson.gz by `npm run
+# build:fixtures` (pretest). Regenerated on every test run.
+src/__tests__/fixtures/*.ctopo
+
 # Rust subproject build artifacts. The wasm + JS glue in
-# src/zstd-wasm/ is checked in so consumers don't need a Rust
+# src/core/zstd-wasm/ is checked in so consumers don't need a Rust
 # toolchain; regenerate via `npm run build:wasm` when crate source
 # changes.
 crates/*/target/
 crates/*/pkg/
+crates/*/pkg-shared/
+crates/*/pkg-plain/
 crates/*/Cargo.lock
