@@ -24,12 +24,46 @@ const here = dirname(fileURLToPath(import.meta.url));
 const repoRoot = dirname(here);
 const crateDir = join(repoRoot, "crates", "zstd-decoder");
 const pkgDir = join(crateDir, "pkg");
-const outDir = join(repoRoot, "src", "zstd-wasm");
+const outDir = join(repoRoot, "src", "core", "zstd-wasm");
 
+// Atomics + bulk-memory + mutable-globals are required for the
+// shared-memory wasm path: the worker's linear memory becomes a
+// SharedArrayBuffer that the main thread can also view, so decoded
+// bytes don't have to round-trip through a JS-heap copy. Building
+// with shared memory requires nightly Rust + `-Z build-std` because
+// the stable libstd isn't built with atomics enabled.
+// `+atomics,+bulk-memory,+mutable-globals` flags the rustc backend to
+// emit shared-memory wasm. `--shared-memory --import-memory` tell
+// wasm-ld to declare the memory as shared AND import it from the
+// host — this lets the main thread create one Memory({shared: true})
+// and pass the same instance to every zstd sub-worker. `--max-memory`
+// is mandatory whenever shared memory is on (the wasm threads
+// proposal requires bounded memory). 4 GiB caps it at the wasm32
+// address space; the OS demand-pages, so this isn't physical RAM.
 const env = {
   ...process.env,
   CC: process.env.CC ?? "clang",
   AR: process.env.AR ?? "llvm-ar",
+  RUSTFLAGS:
+    (process.env.RUSTFLAGS ? process.env.RUSTFLAGS + " " : "") +
+    "-C target-feature=+atomics,+bulk-memory,+mutable-globals " +
+    // Shared memory + imported memory: the host (the merge worker)
+    // creates one Memory({shared: true}) and passes it to every zstd
+    // sub-worker so they all instantiate against the same wasm
+    // linear memory. Caller-side Uint8Array views over the shared
+    // SAB see the worker's writes without any cross-thread copy.
+    // wasm-bindgen's threading pass requires `mem.import.is_some()`.
+    "-C link-arg=--shared-memory " +
+    "-C link-arg=--import-memory " +
+    "-C link-arg=--max-memory=4294967296 " +
+    // wasm-ld doesn't auto-export `__heap_base` / TLS bootstrap
+    // symbols when shared-memory is on; wasm-bindgen's threading
+    // pass needs them, so opt in explicitly.
+    "-C link-arg=--export=__heap_base " +
+    "-C link-arg=--export=__tls_base " +
+    "-C link-arg=--export=__tls_size " +
+    "-C link-arg=--export=__tls_align " +
+    "-C link-arg=--export=__wasm_init_tls",
 };
 
 function run(cmd, args, opts = {}) {
@@ -59,7 +93,23 @@ function findWasmOpt() {
   );
 }
 
-run("wasm-pack", ["build", "--release", "--target", "web"], { cwd: crateDir });
+// Nightly Rust + build-std so std is rebuilt with atomics enabled.
+// `+nightly` is a rustup proxy; cargo / wasm-pack invocations inside
+// `cargo +nightly ...` thread the toolchain through correctly. Use a
+// CARGO_BUILD_STD flag pair passed via env so wasm-pack doesn't need
+// to forward `-Z` args (it's picky about that).
+run(
+  "wasm-pack",
+  ["build", "--release", "--target", "web"],
+  {
+    cwd: crateDir,
+    env: {
+      ...env,
+      RUSTUP_TOOLCHAIN: "nightly",
+      CARGO_UNSTABLE_BUILD_STD: "std,panic_abort",
+    },
+  },
+);
 
 const rawWasm = join(pkgDir, "ctopo_zstd_decoder_bg.wasm");
 const optWasm = join(pkgDir, "ctopo_zstd_decoder_bg.opt.wasm");
@@ -68,6 +118,9 @@ run(wasmOpt, [
   "--enable-bulk-memory",
   "--enable-mutable-globals",
   "--enable-sign-ext",
+  // Required when input wasm declares shared memory + atomics
+  // (the +atomics target feature pulls in the threads proposal).
+  "--enable-threads",
   "-Oz",
   rawWasm,
   "-o",

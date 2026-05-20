@@ -2073,6 +2073,19 @@ export class CtopoCore {
     this.flushScheduled = false;
     if (pending.length === 0) return;
 
+    // DEBUG: log every drain so we can see how the inline path vs
+    // the pool path differ in batching shape.
+    if (
+      typeof process !== "undefined" &&
+      process.env?.CTOPO_COALESCE_DEBUG === "1"
+    ) {
+      const byFam: Record<string, number> = {};
+      for (const p of pending) byFam[p.family] = (byFam[p.family] ?? 0) + 1;
+      process.stderr.write(
+        `[coalesce] drain n=${pending.length} families=${JSON.stringify(byFam)}\n`,
+      );
+    }
+
     // Bucket pending fetches by family. We only ever bridge gaps
     // *within* a family — across families (e.g. property X and
     // unrelated layer Y), even back-to-back items never share bytes.

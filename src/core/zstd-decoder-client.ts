@@ -5,6 +5,25 @@
  * Client API for the zstd sub-worker pool. Lives in the merge worker;
  * the sub-worker entry is `zstd-worker.ts`.
  *
+ * Shared-memory output path: the recompiled zstd wasm declares a
+ * shared linear memory (built with `+atomics --shared-memory
+ * --import-memory`). The merge worker creates one
+ * `WebAssembly.Memory({shared:true})` PER sub-worker at init and
+ * keeps a reference to its `.buffer` (a SharedArrayBuffer). For each
+ * decompress the sub-worker mallocs the output inside that shared
+ * memory and replies with `{ptr, byteLength}` — the merge worker
+ * wraps a `Uint8Array(sab, ptr, byteLength)` view directly without
+ * any cross-thread memcpy. The view stays valid until the merge
+ * worker posts a `free` message back releasing the wasm allocation.
+ *
+ * Why per-sub-worker memory rather than one Memory shared across
+ * all sub-workers: zstd's allocator (dlmalloc) isn't lock-free.
+ * Sharing one memory would force every sub-worker through one
+ * malloc lock, contending exactly during the parallel work we're
+ * trying to do. With one memory per sub-worker each one mallocs
+ * independently; the merge worker just remembers which SAB each
+ * pointer belongs to.
+ *
  * Lazy pool — sub-workers come up on first decompress need (matches
  * the previous module-level `wasmZstdReady` semantics: zstd cost is
  * paid only when something is actually compressed). Pool size from
@@ -27,6 +46,7 @@
  */
 
 import { spawnWorker, type WorkerHandle } from "./worker-host";
+import { loadZstdWasmBytes } from "./zstd-wasm";
 
 // Worker file URL resolver — bundled dist/ keeps the worker as a
 // sibling of this module; src/-loaded test runs fall through to the
@@ -39,10 +59,29 @@ async function resolveZstdWorkerUrl(): Promise<string> {
   return new URL("../../dist/zstd-worker.js", import.meta.url).href;
 }
 
-interface ReplyOk {
+// Memoize the wasm-bytes load — every sub-worker gets the same
+// bytes, no need to re-fetch.
+let wasmBytesPromise: Promise<ArrayBuffer> | undefined;
+function loadWasmBytes(): Promise<ArrayBuffer> {
+  if (wasmBytesPromise === undefined) wasmBytesPromise = loadZstdWasmBytes();
+  return wasmBytesPromise;
+}
+
+interface SpawnReadyMsg {
+  readonly kind: "spawn-ready";
+}
+
+interface DecompressReplyOk {
   readonly id: number;
   readonly ok: true;
-  readonly bytes?: ArrayBuffer;
+  readonly ptr: number;
+  readonly byteLength: number;
+  readonly capacity: number;
+}
+
+interface AckReplyOk {
+  readonly id: number;
+  readonly ok: true;
 }
 
 interface ReplyErr {
@@ -51,18 +90,36 @@ interface ReplyErr {
   readonly error: { readonly name: string; readonly message: string };
 }
 
-type Reply = ReplyOk | ReplyErr;
+type Reply = DecompressReplyOk | AckReplyOk | ReplyErr | SpawnReadyMsg;
 
-interface PendingCall {
-  readonly resolve: (bytes: Uint8Array | undefined) => void;
+interface PendingDecompress {
+  readonly kind: "decompress";
+  readonly resolve: (bytes: Uint8Array) => void;
+  readonly reject: (err: Error) => void;
+  readonly slot: number;
+}
+
+interface PendingAck {
+  readonly kind: "ack";
+  readonly resolve: () => void;
   readonly reject: (err: Error) => void;
 }
+
+type Pending = PendingDecompress | PendingAck;
 
 interface WorkerState {
   readonly handle: WorkerHandle;
   inflight: number;
   nextMsgId: number;
-  readonly pending: Map<number, PendingCall>;
+  readonly pending: Map<number, Pending>;
+  // The shared wasm memory. We hold the WebAssembly.Memory and
+  // re-read `.buffer` on each reply because Node may swap the
+  // underlying SAB instance when wasm grows the memory; a cached
+  // reference would point at the old (smaller) buffer and miss any
+  // pointer past the original `initial` pages.
+  memory?: WebAssembly.Memory;
+  // Resolved once the worker has finished its init handshake.
+  readonly ready: Promise<void>;
 }
 
 const DEFAULT_POOL_SIZE = 2;
@@ -114,9 +171,36 @@ class ZstdDecoderClient {
   >();
   private nextDictId = 1;
 
+  // The output Uint8Array views we return reference SAB-backed wasm
+  // memory and stay alive as long as the byteRangeCache holds them.
+  // Once the cache evicts an entry we want to release the wasm
+  // allocation — otherwise the wasm memory grows unbounded. The
+  // FinalizationRegistry fires when the GC has collected the view
+  // (so nothing references it anymore); we post a `free` to the
+  // sub-worker that owns the allocation.
+  private readonly freeRegistry: FinalizationRegistry<{
+    slot: number;
+    ptr: number;
+    capacity: number;
+  }>;
+
   constructor(poolSize?: number) {
     this.poolSize = poolSize ?? defaultPoolSize();
     this.pool = new Array(this.poolSize).fill(null);
+    this.freeRegistry = new FinalizationRegistry((token) => {
+      const slot = this.pool[token.slot];
+      if (slot === null) return; // worker already gone
+      try {
+        slot.handle.postMessage({
+          type: "free",
+          id: 0,
+          ptr: token.ptr,
+          capacity: token.capacity,
+        });
+      } catch {
+        // ignore — worker may have died
+      }
+    });
   }
 
   private failAll(err: Error): void {
@@ -135,22 +219,91 @@ class ZstdDecoderClient {
   private async spawnOne(slot: number): Promise<WorkerState> {
     const url = await resolveZstdWorkerUrl();
     const handle = await spawnWorker(url);
+    let resolveReady!: () => void;
+    let rejectReady!: (err: Error) => void;
+    const ready = new Promise<void>((resolve, reject) => {
+      resolveReady = resolve;
+      rejectReady = reject;
+    });
     const state: WorkerState = {
       handle,
       inflight: 0,
       nextMsgId: 1,
       pending: new Map(),
+      ready,
     };
     handle.addEventListener("message", (e) => {
       const r = e.data as Reply;
-      const p = state.pending.get(r.id);
+      if ("kind" in r && r.kind === "spawn-ready") {
+        // First message from the worker — send the init payload.
+        // The merge worker's shared wasm memory is created here so
+        // every sub-worker boot can be parallelized.
+        void (async (): Promise<void> => {
+          try {
+            const wasmBytes = await loadWasmBytes();
+            // Initial + maximum from the wasm-bindgen-generated JS
+            // (the same values the wasm module declares). Initial
+            // 18 pages = 1.1 MiB; we let it grow up to the cap.
+            // The max-memory link flag is 4 GiB / 65536 pages.
+            const memory = new WebAssembly.Memory({
+              initial: 18,
+              maximum: 65536,
+              shared: true,
+            });
+            state.memory = memory;
+            const id = state.nextMsgId++;
+            await this.sendAck(state, {
+              type: "init",
+              id,
+              memory,
+              wasmBytes,
+            });
+            resolveReady();
+          } catch (err) {
+            rejectReady(err instanceof Error ? err : new Error(String(err)));
+            this.failAll(err instanceof Error ? err : new Error(String(err)));
+          }
+        })();
+        return;
+      }
+      const reply = r as DecompressReplyOk | AckReplyOk | ReplyErr;
+      const p = state.pending.get(reply.id);
       if (p === undefined) return;
-      state.pending.delete(r.id);
+      state.pending.delete(reply.id);
       state.inflight--;
-      if (r.ok) {
-        p.resolve(r.bytes !== undefined ? new Uint8Array(r.bytes) : undefined);
+      if (!reply.ok) {
+        p.reject(new Error(reply.error.message));
+        return;
+      }
+      if (p.kind === "decompress") {
+        const ok = reply as DecompressReplyOk;
+        const memory = state.memory;
+        if (memory === undefined) {
+          p.reject(
+            new Error(
+              "ctopo: zstd worker replied with decompress result before init shared buffer",
+            ),
+          );
+          return;
+        }
+        // Re-read .buffer freshly — after wasm.grow() Node may swap
+        // the SAB instance, and a stale reference would miss the new
+        // pages. Each Uint8Array view is constructed over whichever
+        // buffer is current at reply time.
+        const sab = memory.buffer as unknown as SharedArrayBuffer;
+        const view = new Uint8Array(sab, ok.ptr, ok.byteLength);
+        // Register the view with the freeRegistry so the wasm
+        // allocation gets released when the caller's reference is
+        // collected. Capacity is used (not byteLength) because that's
+        // the size we malloc'd.
+        this.freeRegistry.register(
+          view,
+          { slot: p.slot, ptr: ok.ptr, capacity: ok.capacity },
+          view,
+        );
+        p.resolve(view);
       } else {
-        p.reject(new Error(r.error.message));
+        p.resolve();
       }
     });
     handle.addEventListener("error", (e) => {
@@ -172,15 +325,18 @@ class ZstdDecoderClient {
   private warmAll(): Promise<void> {
     if (this.terminalError !== null) return Promise.reject(this.terminalError);
     if (this.warmPromise !== null) return this.warmPromise;
-    this.warmPromise = Promise.all(
-      Array.from({ length: this.poolSize }, (_, i) => this.spawnOne(i)),
-    ).then(() => undefined);
+    this.warmPromise = (async (): Promise<void> => {
+      const states = await Promise.all(
+        Array.from({ length: this.poolSize }, (_, i) => this.spawnOne(i)),
+      );
+      await Promise.all(states.map((s) => s.ready));
+    })();
     return this.warmPromise;
   }
 
   // Pool is fully spawned by the time this returns. Picks the worker
   // with the fewest inflight jobs.
-  private async pickLeastLoaded(): Promise<WorkerState> {
+  private async pickLeastLoaded(): Promise<{ state: WorkerState; slot: number }> {
     await this.warmAll();
     if (this.terminalError !== null) throw this.terminalError;
     let bestSlot = 0;
@@ -192,16 +348,29 @@ class ZstdDecoderClient {
         bestSlot = i;
       }
     }
-    return this.pool[bestSlot]!;
+    return { state: this.pool[bestSlot]!, slot: bestSlot };
   }
 
-  private send(
+  private sendDecompress(
     target: WorkerState,
+    slot: number,
     msg: { type: string; id: number } & Record<string, unknown>,
     transfer: ArrayBuffer[],
-  ): Promise<Uint8Array | undefined> {
-    return new Promise<Uint8Array | undefined>((resolve, reject) => {
-      target.pending.set(msg.id, { resolve, reject });
+  ): Promise<Uint8Array> {
+    return new Promise<Uint8Array>((resolve, reject) => {
+      target.pending.set(msg.id, { kind: "decompress", resolve, reject, slot });
+      target.inflight++;
+      target.handle.postMessage(msg, transfer);
+    });
+  }
+
+  private sendAck(
+    target: WorkerState,
+    msg: { type: string; id: number } & Record<string, unknown>,
+    transfer: ArrayBuffer[] = [],
+  ): Promise<void> {
+    return new Promise<void>((resolve, reject) => {
+      target.pending.set(msg.id, { kind: "ack", resolve, reject });
       target.inflight++;
       target.handle.postMessage(msg, transfer);
     });
@@ -222,7 +391,7 @@ class ZstdDecoderClient {
         workers.map((worker) => {
           const copy = copyToFreshBuffer(dict);
           const id = worker.nextMsgId++;
-          return this.send(
+          return this.sendAck(
             worker,
             { type: "register-dict", id, dictId, dict: copy },
             [copy],
@@ -253,23 +422,20 @@ class ZstdDecoderClient {
     if (dict !== undefined) {
       dictId = await this.registerDict(dict);
     }
-    const target = await this.pickLeastLoaded();
+    const { state, slot } = await this.pickLeastLoaded();
     // `bytes` is typically a subarray of a larger section/group buffer
     // that the caller still needs intact. Copy into a fresh
     // ArrayBuffer (`bytes.slice()` would alias the original when
     // `bytes` is a Node Buffer — Buffer overrides slice to return a
     // view, not a copy).
     const copy = copyToFreshBuffer(bytes);
-    const id = target.nextMsgId++;
-    const out = await this.send(
-      target,
+    const id = state.nextMsgId++;
+    return this.sendDecompress(
+      state,
+      slot,
       { type: "decompress", id, bytes: copy, capacity, dictId },
       [copy],
     );
-    if (out === undefined) {
-      throw new Error("ctopo: zstd sub-worker returned no bytes");
-    }
-    return out;
   }
 
   close(): void {

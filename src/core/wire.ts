@@ -35,6 +35,11 @@ export interface WireOpenContainerOptions {
   readonly arcOffsetsPrefetch?: boolean;
   readonly maxRangesPerRequest?: number;
   readonly multiRangeEnabled?: boolean;
+  // Merge-phase worker pool. Compute workers run whole merges in
+  // parallel; the coordinator dispatches per-merge with SAB-backed
+  // CSR views (post zstd-into-shared-memory). `null` (or omitted) =
+  // no pool, run merges inline on the coordinator.
+  readonly pool?: { readonly size: number } | null;
 }
 
 // Per-property wire result. The worker hands the underlying

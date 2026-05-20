@@ -12,6 +12,7 @@ import type * as NodeFsPromises from "node:fs/promises";
 import init, {
   CtopoDecompressor,
   decompress_no_dict,
+  decompress_no_dict_into,
 } from "./ctopo_zstd_decoder.js";
 
 let ready: Promise<void> | undefined;
@@ -54,4 +55,18 @@ export function initZstdWasm(): Promise<void> {
   return ready;
 }
 
-export { CtopoDecompressor, decompress_no_dict };
+// Exposed for the merge worker's zstd-decoder-client: it wants the
+// raw wasm bytes so it can pass them to every spawned sub-worker
+// once (avoiding N concurrent fetches of the same asset).
+export async function loadZstdWasmBytes(): Promise<ArrayBuffer> {
+  if (wasmUrl.protocol === "file:") {
+    const bytes = await readNodeFile(wasmUrl);
+    const ab = new ArrayBuffer(bytes.byteLength);
+    new Uint8Array(ab).set(bytes);
+    return ab;
+  }
+  const res = await fetch(wasmUrl);
+  return res.arrayBuffer();
+}
+
+export { CtopoDecompressor, decompress_no_dict, decompress_no_dict_into };

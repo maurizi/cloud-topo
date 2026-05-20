@@ -96,10 +96,21 @@ function getPool(client: CtopoCore): Int32ArrayPool {
 // every time. Safe to share because stitchArcs is fully synchronous —
 // no merge can interleave another stitchArcs on the same client
 // between clear() and the end of the function.
-interface StitchScratch {
+export interface StitchScratch {
   fragmentByStart: Map<unknown, Fragment>;
   fragmentByEnd: Map<unknown, Fragment>;
   stitched: Set<number>;
+}
+
+// Allocate a fresh StitchScratch. Compute-worker callers maintain
+// their own instance for the worker's lifetime; the coordinator
+// pulls scratch from the per-client WeakMap (`getStitchScratch`).
+export function makeStitchScratch(): StitchScratch {
+  return {
+    fragmentByStart: new Map(),
+    fragmentByEnd: new Map(),
+    stitched: new Set(),
+  };
 }
 // Direct-indexed arc-id → CSR-row table for buildPolygonsByArc. One
 // Int32Array per client, sized to client.meta.numArcs, kept alive
@@ -134,11 +145,7 @@ const stitchScratchByClient = new WeakMap<CtopoCore, StitchScratch>();
 function getStitchScratch(client: CtopoCore): StitchScratch {
   let s = stitchScratchByClient.get(client);
   if (s === undefined) {
-    s = {
-      fragmentByStart: new Map(),
-      fragmentByEnd: new Map(),
-      stitched: new Set(),
-    };
+    s = makeStitchScratch();
     stitchScratchByClient.set(client, s);
   }
   return s;
@@ -164,7 +171,7 @@ export interface MultiPolygonArcs {
 // or `needCoords` is true (merge — has to decode rings), the call
 // fetches arc bytes too. When both are needed, the two fetches run
 // in parallel so wall-clock is bounded by the slower one.
-async function prepareMergeGroups(
+export async function prepareMergeGroups(
   client: CtopoCore,
   inputs: ReadonlyArray<LayerSelection>,
   needCoords: boolean,
@@ -239,15 +246,55 @@ async function prepareMergeGroups(
     return {
       groupExteriorArcs,
       arcBytes: new Map<number, Uint8Array>(),
-      endpoints: makeNumericEndpointLookup(eps, client),
+      endpoints: makeNumericEndpointLookup(eps),
     };
   }
 
   const arcBytes = await client.fetchArcs(ids, signal);
   const endpoints: EndpointLookup<unknown> = isQuantized
-    ? makeNumericEndpointLookupFromBytes(arcBytes, client)
-    : makeEndpointLookup(arcBytes, client);
+    ? makeNumericEndpointLookupFromBytes(arcBytes)
+    : makeEndpointLookup(arcBytes, isQuantized);
   return { groupExteriorArcs, arcBytes, endpoints };
+}
+
+// Prep-only variant: runs steps 1-4 (build polygons, CSR-to-arc map,
+// connectivity groups, exterior-arc collection) and stops there. The
+// caller is responsible for fetching arc bytes / endpoints for the
+// returned `uniqueArcIds` and then driving stitching. Used by the
+// MergePool's two-phase pipelined dispatch: compute workers run prep
+// in parallel (CSR-only, no I/O), surrender the boundary arc set to
+// the coordinator for one coalesced bulk fetch, then resume with the
+// post phase once their bytes are ready.
+export async function prepareMergeGroupsForPipeline(
+  client: CtopoCore,
+  inputs: ReadonlyArray<LayerSelection>,
+  signal: AbortSignal | undefined,
+): Promise<{
+  readonly groupExteriorArcs: number[][];
+  readonly uniqueArcIds: number[];
+}> {
+  const polygons = await buildInputPolygons(client, inputs, signal);
+  if (polygons.numPolygons === 0) {
+    return { groupExteriorArcs: [], uniqueArcIds: [] };
+  }
+  const polygonsByArc = buildPolygonsByArc(client, polygons);
+  const groups = groupPolygonsByConnectivity(polygons, polygonsByArc);
+  const allExteriorArcs: number[] = [];
+  const groupExteriorArcs: number[][] = groups.map((group) => {
+    const ext = exteriorArcsForGroup(group, polygons, polygonsByArc);
+    for (const a of ext) allExteriorArcs.push(a);
+    return ext;
+  });
+  const pool = getPool(client);
+  pool.release(polygons.signedArcIds);
+  pool.release(polygons.polyOffsets);
+  pool.release(polygonsByArc.rowByArc);
+  pool.release(polygonsByArc.offsets);
+  pool.release(polygonsByArc.polyIndices);
+  if (allExteriorArcs.length === 0) {
+    return { groupExteriorArcs: [], uniqueArcIds: [] };
+  }
+  return { groupExteriorArcs, uniqueArcIds: absArcIds(allExteriorArcs) };
 }
 
 function emptyPrepareResult(client: CtopoCore): {
@@ -259,7 +306,7 @@ function emptyPrepareResult(client: CtopoCore): {
   return {
     groupExteriorArcs: [],
     arcBytes,
-    endpoints: makeEndpointLookup(arcBytes, client),
+    endpoints: makeEndpointLookup(arcBytes, client.transform !== null),
   };
 }
 
@@ -312,7 +359,7 @@ export interface FlatNeighbors {
 // amortized cost linear; `finalize()` returns a tightly-sized slice
 // that owns its own ArrayBuffer (so the worker can postMessage with
 // transfer semantics without orphaning pooled storage).
-class Float64Growable {
+export class Float64Growable {
   buf: Float64Array;
   // Number of *floats* written so far (= 2 * point count).
   len: number;
@@ -358,6 +405,288 @@ class Float64Growable {
   }
 }
 
+// --- Batch primitives (per-merge unit of work, can run off-thread) ---
+
+// Context shared across all batches in one merge. Carries the
+// endpoint lookup, arc bytes (for decoded rings), and transform.
+// Compute workers reconstruct this from per-batch postMessage payloads;
+// the coordinator inline path builds it once per merge.
+export interface StitchBatchContext {
+  readonly transform: TransformDef;
+  readonly endpoints: EndpointLookup<unknown>;
+  // Required for the coords path (mergeFlat). Undefined for the arcs
+  // path (mergeArcsFlat) which never decodes ring coords.
+  readonly arcBytes: ReadonlyMap<number, Uint8Array> | undefined;
+}
+
+// Per-batch result for the arcs path (mergeArcsFlat).
+export interface StitchBatchArcsResult {
+  // Concatenated signed arc ids across all rings emitted by this batch.
+  readonly arcs: Int32Array;
+  // Per-ring start indices into `arcs`. Length = total rings in batch.
+  readonly ringStarts: Uint32Array;
+  readonly ringEnds: Uint32Array;
+  // numRingsPerGroup[g] = number of rings emitted by groups[g].
+  // Length = groups.length. Empty groups have count 0.
+  readonly numRingsPerGroup: Uint32Array;
+}
+
+// Per-batch result for the coords path (mergeFlat).
+export interface StitchBatchCoordsResult {
+  readonly coords: Float64Array;
+  // Per-ring point indices into `coords`. Length = total rings in batch.
+  readonly ringStarts: Uint32Array;
+  readonly ringEnds: Uint32Array;
+  readonly numRingsPerGroup: Uint32Array;
+}
+
+// Stitch a batch of groups into a flat arcs result. Pure: no `client`,
+// no I/O, no async. Scratch is cleared per group inside `stitchArcsPure`.
+// The result types are postMessage-transferable; ArrayBuffers move
+// zero-copy.
+export function stitchBatchArcs(
+  ctx: StitchBatchContext,
+  groups: ReadonlyArray<ReadonlyArray<number>>,
+  scratch: StitchScratch,
+): StitchBatchArcsResult {
+  const arcsOut: number[] = [];
+  const ringStarts: number[] = [];
+  const ringEnds: number[] = [];
+  const numRingsPerGroup = new Uint32Array(groups.length);
+  for (let g = 0; g < groups.length; g++) {
+    const ext = groups[g];
+    if (ext.length === 0) continue;
+    const rings = stitchArcsPure(scratch, ext, ctx.endpoints);
+    if (rings.length === 0) continue;
+    let count = 0;
+    for (const ring of rings) {
+      const start = arcsOut.length;
+      for (let k = 0; k < ring.length; k++) arcsOut.push(ring[k]);
+      ringStarts.push(start);
+      ringEnds.push(arcsOut.length);
+      count++;
+    }
+    numRingsPerGroup[g] = count;
+  }
+  return {
+    arcs: new Int32Array(arcsOut),
+    ringStarts: new Uint32Array(ringStarts),
+    ringEnds: new Uint32Array(ringEnds),
+    numRingsPerGroup,
+  };
+}
+
+// Stitch a batch of groups into a flat coords result. Pure: requires
+// ctx.arcBytes (throws if absent). Per-group rings are area-sorted
+// (largest first) to match the mergeFlat contract.
+export function stitchBatchCoords(
+  ctx: StitchBatchContext,
+  groups: ReadonlyArray<ReadonlyArray<number>>,
+  scratch: StitchScratch,
+): StitchBatchCoordsResult {
+  if (ctx.arcBytes === undefined) {
+    throw new Error("ctopo: stitchBatchCoords requires arcBytes in context");
+  }
+  const arcBytes = ctx.arcBytes;
+  const transform = ctx.transform;
+  const out = new Float64Growable(2048);
+  const ringStarts: number[] = [];
+  const ringEnds: number[] = [];
+  const numRingsPerGroup = new Uint32Array(groups.length);
+  for (let g = 0; g < groups.length; g++) {
+    const ext = groups[g];
+    if (ext.length === 0) continue;
+    const rings = stitchArcsPure(scratch, ext, ctx.endpoints);
+    interface RingInfo {
+      start: number;
+      end: number;
+      area: number;
+    }
+    const groupRings: RingInfo[] = [];
+    for (const ring of rings) {
+      const before = out.len;
+      const range = decodeRingFlat(ring, arcBytes, transform, out);
+      if (range.end - range.start < 4) {
+        out.len = before;
+        continue;
+      }
+      groupRings.push({
+        start: range.start,
+        end: range.end,
+        area: ringAreaFlat(out.buf, range.start, range.end),
+      });
+    }
+    if (groupRings.length === 0) continue;
+    if (groupRings.length > 1) {
+      groupRings.sort((a, b) => b.area - a.area);
+    }
+    for (const ri of groupRings) {
+      ringStarts.push(ri.start);
+      ringEnds.push(ri.end);
+    }
+    numRingsPerGroup[g] = groupRings.length;
+  }
+  return {
+    coords: out.finalize(),
+    ringStarts: new Uint32Array(ringStarts),
+    ringEnds: new Uint32Array(ringEnds),
+    numRingsPerGroup,
+  };
+}
+
+// Partition groups into roughly-equal-cost contiguous batches. The
+// contiguous constraint preserves group order across batches, which
+// makes the assemble step a simple concat — no per-group index
+// reshuffle. Cost heuristic: exteriorArcs.length per group (correlates
+// well with stitch + decode cost).
+//
+// Always returns exactly `batchCount` arrays; some may be empty when
+// there are fewer non-empty groups than requested batches. Returned
+// arrays carry group indices into the input `groupExteriorArcs`.
+export function partitionGroupsForPool(
+  groupExteriorArcs: ReadonlyArray<ReadonlyArray<number>>,
+  batchCount: number,
+): number[][] {
+  const n = groupExteriorArcs.length;
+  if (batchCount <= 1 || n <= 1) {
+    return [Array.from({ length: n }, (_, i) => i)];
+  }
+  let totalCost = 0;
+  for (const g of groupExteriorArcs) totalCost += g.length || 1;
+  const targetPerBatch = Math.max(1, Math.ceil(totalCost / batchCount));
+  const batches: number[][] = [];
+  for (let i = 0; i < batchCount; i++) batches.push([]);
+  let cur = 0;
+  let curCost = 0;
+  for (let i = 0; i < n; i++) {
+    batches[cur].push(i);
+    curCost += groupExteriorArcs[i].length || 1;
+    if (curCost >= targetPerBatch && cur < batchCount - 1) {
+      cur++;
+      curCost = 0;
+    }
+  }
+  return batches;
+}
+
+// Assemble per-batch arcs results back into a single FlatMultiPolygonArcs.
+// Batches must appear in original group-index order (partitionGroupsForPool
+// guarantees this). Each entry's `groupIndices` is parallel to the
+// `numRingsPerGroup` Uint32Array in its `result`.
+export function assembleArcsResult(
+  perBatch: ReadonlyArray<{
+    readonly groupIndices: ReadonlyArray<number>;
+    readonly result: StitchBatchArcsResult;
+  }>,
+): FlatMultiPolygonArcs {
+  // Pass 1: tally final sizes.
+  let totalArcs = 0;
+  let totalRings = 0;
+  let nonEmptyGroups = 0;
+  for (const { result } of perBatch) {
+    totalArcs += result.arcs.length;
+    totalRings += result.ringStarts.length;
+    for (let i = 0; i < result.numRingsPerGroup.length; i++) {
+      if (result.numRingsPerGroup[i] > 0) nonEmptyGroups++;
+    }
+  }
+  const arcs = new Int32Array(totalArcs);
+  const ringStarts = new Uint32Array(totalRings);
+  const ringEnds = new Uint32Array(totalRings);
+  const polyRingStarts = new Uint32Array(nonEmptyGroups + 1);
+
+  // Pass 2: copy. Each batch's local ring offsets shift by the running
+  // global arc cursor. polyRingStarts pushes one entry per non-empty
+  // group, matching the inline path's behavior (skip groups that
+  // emitted zero rings).
+  let arcCursor = 0;
+  let ringCursor = 0;
+  let polyCursor = 0;
+  for (const { result } of perBatch) {
+    arcs.set(result.arcs, arcCursor);
+    // Walk groups within batch IN ORDER; emit polyRingStarts entries
+    // at group boundaries.
+    let groupRingStartLocal = 0;
+    for (let g = 0; g < result.numRingsPerGroup.length; g++) {
+      const count = result.numRingsPerGroup[g];
+      if (count === 0) continue;
+      for (let r = 0; r < count; r++) {
+        const localIdx = groupRingStartLocal + r;
+        ringStarts[ringCursor] = result.ringStarts[localIdx] + arcCursor;
+        ringEnds[ringCursor] = result.ringEnds[localIdx] + arcCursor;
+        ringCursor++;
+      }
+      groupRingStartLocal += count;
+      polyCursor++;
+      polyRingStarts[polyCursor] = ringCursor;
+    }
+    arcCursor += result.arcs.length;
+  }
+  return {
+    type: "MultiPolygon",
+    arcs,
+    ringStarts,
+    ringEnds,
+    polyRingStarts,
+  };
+}
+
+// Assemble per-batch coords results back into a single FlatMultiPolygon.
+// Same ordering constraint as assembleArcsResult.
+export function assembleCoordsResult(
+  perBatch: ReadonlyArray<{
+    readonly groupIndices: ReadonlyArray<number>;
+    readonly result: StitchBatchCoordsResult;
+  }>,
+): FlatMultiPolygon {
+  // Pass 1: tally.
+  let totalCoordsFloats = 0;
+  let totalRings = 0;
+  let nonEmptyGroups = 0;
+  for (const { result } of perBatch) {
+    totalCoordsFloats += result.coords.length;
+    totalRings += result.ringStarts.length;
+    for (let i = 0; i < result.numRingsPerGroup.length; i++) {
+      if (result.numRingsPerGroup[i] > 0) nonEmptyGroups++;
+    }
+  }
+  const coords = new Float64Array(totalCoordsFloats);
+  const ringStarts = new Uint32Array(totalRings);
+  const ringEnds = new Uint32Array(totalRings);
+  const polyRingStarts = new Uint32Array(nonEmptyGroups + 1);
+
+  // Pass 2: copy with cursor-based offset rewriting. Ring offsets are
+  // point indices, not float indices, so shift by `pointCursor`.
+  let pointCursor = 0;
+  let ringCursor = 0;
+  let polyCursor = 0;
+  for (const { result } of perBatch) {
+    coords.set(result.coords, pointCursor * 2);
+    let groupRingStartLocal = 0;
+    for (let g = 0; g < result.numRingsPerGroup.length; g++) {
+      const count = result.numRingsPerGroup[g];
+      if (count === 0) continue;
+      for (let r = 0; r < count; r++) {
+        const localIdx = groupRingStartLocal + r;
+        ringStarts[ringCursor] = result.ringStarts[localIdx] + pointCursor;
+        ringEnds[ringCursor] = result.ringEnds[localIdx] + pointCursor;
+        ringCursor++;
+      }
+      groupRingStartLocal += count;
+      polyCursor++;
+      polyRingStarts[polyCursor] = ringCursor;
+    }
+    pointCursor += result.coords.length / 2;
+  }
+  return {
+    type: "MultiPolygon",
+    coords,
+    ringStarts,
+    ringEnds,
+    polyRingStarts,
+  };
+}
+
 // `mergeArcsFlat` — flat-typed-array form of mergeArcs. Returned arcs
 // follow the same stitch-order semantics (no area-based reordering;
 // see mergeArcs for the contract).
@@ -372,29 +701,22 @@ export async function mergeArcsFlat(
     false,
     signal,
   );
-  const arcsOut: number[] = [];
-  const ringStarts: number[] = [];
-  const ringEnds: number[] = [];
-  const polyRingStarts: number[] = [0];
-  for (const ext of groupExteriorArcs) {
-    if (ext.length === 0) continue;
-    const rings = stitchArcs(client, ext, endpoints);
-    if (rings.length === 0) continue;
-    for (const ring of rings) {
-      const start = arcsOut.length;
-      for (let k = 0; k < ring.length; k++) arcsOut.push(ring[k]);
-      ringStarts.push(start);
-      ringEnds.push(arcsOut.length);
-    }
-    polyRingStarts.push(ringStarts.length);
-  }
-  return {
-    type: "MultiPolygon",
-    arcs: new Int32Array(arcsOut),
-    ringStarts: new Uint32Array(ringStarts),
-    ringEnds: new Uint32Array(ringEnds),
-    polyRingStarts: new Uint32Array(polyRingStarts),
+  const ctx: StitchBatchContext = {
+    transform: client.transform,
+    endpoints,
+    arcBytes: undefined,
   };
+  const scratch = getStitchScratch(client);
+  const result = stitchBatchArcs(ctx, groupExteriorArcs, scratch);
+  return assembleArcsResult([
+    {
+      groupIndices: Array.from(
+        { length: groupExteriorArcs.length },
+        (_, i) => i,
+      ),
+      result,
+    },
+  ]);
 }
 
 // `mergeFlat` — flat-typed-array form of merge. Largest-area ring per
@@ -411,57 +733,22 @@ export async function mergeFlat(
     true,
     signal,
   );
-  // 2048 floats = 1024 points. Grows as needed.
-  const out = new Float64Growable(2048);
-  const ringStarts: number[] = [];
-  const ringEnds: number[] = [];
-  const polyRingStarts: number[] = [0];
-
-  for (const ext of groupExteriorArcs) {
-    if (ext.length === 0) continue;
-    const rings = stitchArcs(client, ext, endpoints);
-    // Per-group ring info — points already live in `out`, so sorting
-    // by area only reorders the (start, end) entries pushed below; no
-    // coord copy needed.
-    interface RingInfo {
-      start: number;
-      end: number;
-      area: number;
-    }
-    const groupRings: RingInfo[] = [];
-    for (const ring of rings) {
-      const before = out.len;
-      const range = decodeRingFlat(ring, arcBytes, client, out);
-      // Same <4-points filter as the legacy path. Rewind so the
-      // discarded ring's bytes don't bloat coords.
-      if (range.end - range.start < 4) {
-        out.len = before;
-        continue;
-      }
-      groupRings.push({
-        start: range.start,
-        end: range.end,
-        area: ringAreaFlat(out.buf, range.start, range.end),
-      });
-    }
-    if (groupRings.length === 0) continue;
-    if (groupRings.length > 1) {
-      groupRings.sort((a, b) => b.area - a.area);
-    }
-    for (let i = 0; i < groupRings.length; i++) {
-      ringStarts.push(groupRings[i].start);
-      ringEnds.push(groupRings[i].end);
-    }
-    polyRingStarts.push(ringStarts.length);
-  }
-
-  return {
-    type: "MultiPolygon",
-    coords: out.finalize(),
-    ringStarts: new Uint32Array(ringStarts),
-    ringEnds: new Uint32Array(ringEnds),
-    polyRingStarts: new Uint32Array(polyRingStarts),
+  const ctx: StitchBatchContext = {
+    transform: client.transform,
+    endpoints,
+    arcBytes,
   };
+  const scratch = getStitchScratch(client);
+  const result = stitchBatchCoords(ctx, groupExteriorArcs, scratch);
+  return assembleCoordsResult([
+    {
+      groupIndices: Array.from(
+        { length: groupExteriorArcs.length },
+        (_, i) => i,
+      ),
+      result,
+    },
+  ]);
 }
 
 // --- GeoJSON-shaped wrappers ---
@@ -620,7 +907,7 @@ export function bbox(
   return client.meta.bbox;
 }
 
-type TransformDef = {
+export type TransformDef = {
   readonly scale: readonly [number, number];
   readonly translate: readonly [number, number];
 } | null;
@@ -1039,7 +1326,7 @@ function absArcIds(signed: ReadonlyArray<number>): number[] {
 
 // --- Arc endpoint lookup (per-arc bytes from the fetcher) ---
 
-interface EndpointLookup<K> {
+export interface EndpointLookup<K> {
   start(signedArcId: number): K;
   end(signedArcId: number): K;
 }
@@ -1067,9 +1354,8 @@ function packCoord(x: number, y: number): number {
 // length-4 Int32Array views (see client.fetchArcEndpoints) — start at
 // [0..2), end at [2..4). Signed arc ids reverse direction: a negative
 // signed id ~i reads i's end as its "start" and vice versa.
-function makeNumericEndpointLookup(
+export function makeNumericEndpointLookup(
   endpoints: ReadonlyMap<number, Int32Array>,
-  client: CtopoCore,
 ): EndpointLookup<number> {
   function readForward(arcId: number): Int32Array {
     const v = endpoints.get(arcId);
@@ -1078,11 +1364,6 @@ function makeNumericEndpointLookup(
     }
     return v;
   }
-  // Useful-bytes tally: 4 i32 reads per arc lookup = 16 B (matches the
-  // client's per-arc tally for the section path; double-count is fine
-  // — the merge-side tally is for "what merge actually consumed", not
-  // wire bytes).
-  void client;
   return {
     start(signedArcId: number): number {
       if (signedArcId >= 0) {
@@ -1115,9 +1396,8 @@ function makeNumericEndpointLookup(
 // directions in the same call), so a per-call start/end cache has a
 // measured 0% hit rate (417,703 lookups, 0 hits on the national CD
 // merge). Adding the Maps was pure overhead — removed.
-function makeNumericEndpointLookupFromBytes(
+export function makeNumericEndpointLookupFromBytes(
   arcBytes: ReadonlyMap<number, Uint8Array>,
-  client: CtopoCore,
 ): EndpointLookup<number> {
   // One cursor reused across every start/end read in this lookup.
   // Sync hot path; no concurrency to worry about.
@@ -1145,7 +1425,6 @@ function makeNumericEndpointLookupFromBytes(
     }
     return packCoord(x, y);
   }
-  void client;
   return {
     start(signedArcId: number): number {
       return signedArcId >= 0
@@ -1160,11 +1439,10 @@ function makeNumericEndpointLookupFromBytes(
   };
 }
 
-function makeEndpointLookup(
+export function makeEndpointLookup(
   arcBytes: ReadonlyMap<number, Uint8Array>,
-  client: CtopoCore,
+  isQuantized: boolean,
 ): EndpointLookup<string> {
-  const isQuantized = client.transform !== null;
   const cur: VarintCursor = { value: 0, off: 0 };
 
   function readStart(arcId: number): [number, number] {
@@ -1242,12 +1520,16 @@ interface Fragment extends Array<number> {
 // the topojson-client/src/stitch.js algorithm, taking its endpoint
 // lookup from per-arc fetched bytes rather than a single in-memory
 // ArrayBuffer so individual arcs can be Range-fetched on demand.
-function stitchArcs<K>(
-  client: CtopoCore,
+//
+// Pure form: scratch is passed in explicitly. The coordinator pulls
+// scratch from its per-client WeakMap; compute workers maintain their
+// own per-worker instance. Scratch is cleared on entry, so the caller
+// only has to allocate it once and reuse.
+export function stitchArcsPure<K>(
+  scratch: StitchScratch,
   arcs: ReadonlyArray<number>,
   endpoints: EndpointLookup<K>,
 ): number[][] {
-  const scratch = getStitchScratch(client);
   scratch.fragmentByStart.clear();
   scratch.fragmentByEnd.clear();
   scratch.stitched.clear();
@@ -1349,13 +1631,13 @@ function stitchArcs<K>(
 //
 // The returned (start, end) is in *point indices* — multiply by 2 to
 // get float positions inside out.buf.
-function decodeRingFlat(
+export function decodeRingFlat(
   arcIds: ReadonlyArray<number>,
   arcBytes: ReadonlyMap<number, Uint8Array>,
-  client: CtopoCore,
+  transform: TransformDef,
   out: Float64Growable,
 ): { start: number; end: number } {
-  const t = client.transform;
+  const t = transform;
   const isQuantized = t !== null;
   const kx = isQuantized ? t.scale[0] : 0;
   const ky = isQuantized ? t.scale[1] : 0;
@@ -1423,7 +1705,7 @@ function decodeRingFlat(
 
 // --- ringAreaFlat (shoelace, on packed Float64) ---
 
-function ringAreaFlat(
+export function ringAreaFlat(
   coords: Float64Array,
   startPoint: number,
   endPoint: number,

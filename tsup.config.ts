@@ -17,6 +17,12 @@ export default defineConfig({
     // here as a top-level entry so that URL resolves to a real file
     // sitting next to the chunk that imports it.
     "zstd-worker": "src/core/zstd-worker.ts",
+    // Compute worker for the merge pool. The coordinator's
+    // `MergePool` spawns one of these per pool slot via
+    // `new URL("./merge-worker.js", import.meta.url)` from inside
+    // `merge-pool.ts`. Emitted as a top-level entry so the URL
+    // resolves to a real `dist/merge-worker.js`.
+    "merge-worker": "src/core/merge-worker.ts",
   },
   format: ["esm"],
   dts: true,

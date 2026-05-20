@@ -193,6 +193,7 @@ export class CtopoClient {
       arcOffsetsPrefetch: opts.arcOffsetsPrefetch,
       maxRangesPerRequest: opts.maxRangesPerRequest,
       multiRangeEnabled: opts.multiRangeEnabled,
+      pool: opts.pool,
     };
     const fetcher: FetcherSpec = opts.fetcher ?? { kind: "http", url };
 

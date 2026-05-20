@@ -33,6 +33,7 @@ import {
   type FlatMultiPolygonArcs,
   type FlatNeighbors,
 } from "./core/merge";
+import { MergePool } from "./core/merge-pool";
 import { type LayerSelection } from "./core/types";
 import type {
   WireFlatMultiPolygon,
@@ -65,6 +66,21 @@ interface CoreEntry {
   core: CtopoCore;
   url: string;
   refcount: number;
+  // Pool size carried over from this client's open. The first client
+  // to ask for a pool (size > 1) is the one that actually creates
+  // the singleton; later clients with different sizes share the
+  // existing pool.
+  poolSize: number | null;
+}
+
+// One pool per coordinator. Lazily created on first merge call from
+// a client that opened with `pool.size > 1`.
+let mergePool: MergePool | null = null;
+function getMergePool(size: number): MergePool {
+  if (mergePool === null) {
+    mergePool = new MergePool({ size });
+  }
+  return mergePool;
 }
 
 // Active clients, keyed by clientId. Multiple clients can point at the
@@ -114,7 +130,17 @@ function copyBuffer(view: ArrayBufferView): ArrayBufferLike {
   // layerGeometry) so the worker keeps its cache and the proxy gets
   // an independent copy it can transfer (and ultimately wrap as a
   // typed array on the main thread without coupling lifetimes).
-  return view.buffer.slice(view.byteOffset, view.byteOffset + view.byteLength);
+  //
+  // Source may be SAB-backed (zstd decompressed straight into the
+  // sub-worker's shared wasm memory): `SharedArrayBuffer.slice()`
+  // returns another SAB, which the transferList rejects AND would
+  // leak shared writes back to the worker. Copy into a fresh,
+  // private ArrayBuffer to preserve the isolation contract.
+  const out = new ArrayBuffer(view.byteLength);
+  new Uint8Array(out).set(
+    new Uint8Array(view.buffer, view.byteOffset, view.byteLength),
+  );
+  return out;
 }
 
 function flatMultiPolygonReply(flat: FlatMultiPolygon): Reply {
@@ -179,7 +205,11 @@ async function dispatch(
         const fetcher = reconstructFetcher(msg.args.fetcher);
         const opts: OpenContainerOptions = { ...msg.args.opts, signal };
         const core = await CtopoCore.openWith(fetcher, opts);
-        entry = { core, url: msg.args.url, refcount: 0 };
+        const poolSize =
+          msg.args.opts.pool === null || msg.args.opts.pool === undefined
+            ? null
+            : msg.args.opts.pool.size;
+        entry = { core, url: msg.args.url, refcount: 0, poolSize };
         byUrl.set(msg.args.url, entry);
       }
       entry.refcount++;
@@ -235,19 +265,29 @@ async function dispatch(
       };
     }
     case "mergeFlat": {
-      const flat = await mergeFlat(
-        getCore(msg.clientId),
-        toLayerSelection(msg.args.selections),
-        signal,
-      );
+      const entry = getEntry(msg.clientId);
+      const selections = toLayerSelection(msg.args.selections);
+      const flat: FlatMultiPolygon =
+        entry.poolSize !== null && entry.poolSize > 1
+          ? await getMergePool(entry.poolSize).runCoords(
+              entry.core,
+              selections,
+              signal,
+            )
+          : await mergeFlat(entry.core, selections, signal);
       return flatMultiPolygonReply(flat);
     }
     case "mergeArcsFlat": {
-      const flat = await mergeArcsFlat(
-        getCore(msg.clientId),
-        toLayerSelection(msg.args.selections),
-        signal,
-      );
+      const entry = getEntry(msg.clientId);
+      const selections = toLayerSelection(msg.args.selections);
+      const flat: FlatMultiPolygonArcs =
+        entry.poolSize !== null && entry.poolSize > 1
+          ? await getMergePool(entry.poolSize).runArcs(
+              entry.core,
+              selections,
+              signal,
+            )
+          : await mergeArcsFlat(entry.core, selections, signal);
       return flatMultiPolygonArcsReply(flat);
     }
     case "neighborsFlat": {
@@ -295,6 +335,28 @@ async function dispatch(
           byUrl.delete(entry.url);
         }
       }
+      // If this is the last client, flush the CPU profile (if any)
+      // before replying. The reply is what unblocks the proxy's
+      // `await client.close()`; doing it here means the bench can
+      // safely `process.exit(0)` after that resolves.
+      if (clients.size === 0) {
+        if (mergePool !== null) {
+          try {
+            await mergePool.close();
+          } catch {
+            // ignore
+          }
+          mergePool = null;
+        }
+        if (cpuProfStop !== null) {
+          try {
+            await cpuProfStop();
+          } catch {
+            // ignore — best-effort
+          }
+          cpuProfStop = null;
+        }
+      }
       return { result: null, transfer: [] };
     }
     default: {
@@ -339,7 +401,19 @@ function handleMessage(host: WorkerHost, data: unknown, source: PortLike): void 
       // holding thread's `new Worker(...)` can be GC'd.
       if (req.method === "close" && clients.size === 0) {
         closeZstdDecoderClient();
-        host.close();
+        // Flush the CPU profile (if active) BEFORE host.close(); the
+        // process exits inside host.close() so any pending stop() +
+        // file write must complete first.
+        void (async (): Promise<void> => {
+          if (cpuProfStop !== null) {
+            try {
+              await cpuProfStop();
+            } catch {
+              // ignore — best-effort
+            }
+          }
+          host.close();
+        })();
       }
     },
     (err: unknown) => {
@@ -356,6 +430,29 @@ function handleMessage(host: WorkerHost, data: unknown, source: PortLike): void 
     },
   );
 }
+
+// CPU profiling (env: CTOPO_WORKER_CPU_PROF=<path>). Starts a CPU
+// profile via the inspector API at worker boot and writes it to the
+// given path when the last client closes. Must run BEFORE host.close()
+// otherwise the worker process exits and the profile never lands.
+let cpuProfStop: (() => Promise<void>) | null = null;
+async function maybeStartCpuProfile(): Promise<void> {
+  if (typeof process === "undefined") return;
+  const path = process.env?.CTOPO_WORKER_CPU_PROF;
+  if (path === undefined || path === "") return;
+  const inspector = await import("node:inspector/promises");
+  const session = new inspector.Session();
+  session.connect();
+  await session.post("Profiler.enable");
+  await session.post("Profiler.start");
+  cpuProfStop = async (): Promise<void> => {
+    const { profile } = await session.post("Profiler.stop");
+    const fs = await import("node:fs/promises");
+    await fs.writeFile(path, JSON.stringify(profile));
+    session.disconnect();
+  };
+}
+void maybeStartCpuProfile();
 
 void getWorkerHost().then((host) => {
   // Adapter so `handleMessage` can call `source.postMessage(reply,
