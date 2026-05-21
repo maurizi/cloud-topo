@@ -16,7 +16,7 @@ cloud-topo (`.ctopo`) packs a quantized topology — arcs, per-layer geometry, a
 | **Property access**   | Parse entire file to read one column               | Column-oriented sections; fetch only the property you need                                    |
 | **Compression**       | gzip on the wire (server-side)                     | Per-section zstd (with shared dictionary for arc blocks) or Brotli; client-side decompression |
 
-[Benchmarking](https://github.com/maurizi/cloud-topo-bench) against all US census blocks, VTDs, counties and states; the `.topojson` file was 4.4gb and the equivalent `.ctopo` file 1.1gb. Running a `merge` operation to recover US congressional districts from their [block-equivalency files](https://www.census.gov/geographies/mapping-files/2025/dec/rdo/119-congressional-district-bef.html) took 70s and consumed ~240mb.
+[Benchmarking](https://github.com/maurizi/cloud-topo-bench) against all US census blocks, block groups, counties and states; the `.topojson` file was 4.8gb and the equivalent `.ctopo` file 1.2gb. Running a `merge` operation to recover US congressional districts from their [block-equivalency files](https://www.census.gov/geographies/mapping-files/2025/dec/rdo/119-congressional-district-bef.html) took 15s and consumed ~190mb.
 
 It's best for serving large topologies (thousands to millions of features) from static hosting or object storage (S3, GCS, R2) when you need selective operations — merging subsets, reading one property column — without downloading everything.
 

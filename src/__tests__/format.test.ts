@@ -406,6 +406,17 @@ describe("ctopo format", () => {
     );
   });
 
+  it("reads a v1-major header (older files stay readable)", async () => {
+    const buf = await encodeContainer(fixtureTopology());
+    const downgraded = Buffer.from(buf);
+    // Force the header major down to 1. The v2 reader must still accept
+    // it — new sections are optional, so a genuine v1 file (which simply
+    // omits them) parses through the same path.
+    downgraded.writeUInt32LE(0x01_00_00_00, 4);
+    expect(unpackVersion(downgraded.readUInt32LE(4)).major).toBe(1);
+    expect(() => parseContainer(downgraded)).not.toThrow();
+  });
+
   it("reorders arcs in visit order (global Hilbert across all layers)", async () => {
     // Two-layer fixture: 4 base units arranged in a 2×2 grid grouped
     // into 2 top-layer parents (left half + right half). Arcs:

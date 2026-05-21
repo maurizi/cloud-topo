@@ -45,6 +45,7 @@ import {
   SECTION_ENTRY_SIZE,
   SECTION_NAME_SIZE,
   VERSION,
+  VERSION_MAJOR,
   alignUp,
 } from "./core/format";
 import { parseContainer } from "./core/reader";
@@ -1332,7 +1333,10 @@ async function assembleContainer(input: AssembleInput): Promise<Buffer> {
 
   // Build META.
   const meta: ContainerMeta = {
-    version: 1,
+    // Tracks the binary header major (see core/format.ts). v2 META may
+    // carry arcOffsetsBlocks / arcEndpointsBlocks; both are optional and
+    // readers dispatch on their presence.
+    version: VERSION_MAJOR,
     numArcs,
     bytesPerPoint,
     transform,

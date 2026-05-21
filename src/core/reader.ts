@@ -16,6 +16,7 @@ import {
   FOOTER_TRAILER_SIZE,
   HEADER_SIZE,
   MAGIC,
+  MIN_READABLE_VERSION_MAJOR,
   OFFSET_FOOTER_META_LENGTH,
   OFFSET_FOOTER_SECTION_COUNT,
   OFFSET_MAGIC,
@@ -77,9 +78,12 @@ export function parseFrontHeader(bytes: Uint8Array): void {
   }
   const version = view.getUint32(OFFSET_VERSION, true);
   const v = unpackVersion(version);
-  if (v.major !== VERSION_MAJOR) {
+  // Accept any major this build knows how to read. Older majors stay
+  // readable (the v2 reader handles v1 files); a newer major than we
+  // write means a file from a future build we can't interpret.
+  if (v.major < MIN_READABLE_VERSION_MAJOR || v.major > VERSION_MAJOR) {
     throw new Error(
-      `ctopo: incompatible major version ${v.major} (this build understands ${VERSION_MAJOR})`,
+      `ctopo: incompatible major version ${v.major} (this build reads ${MIN_READABLE_VERSION_MAJOR}–${VERSION_MAJOR})`,
     );
   }
 }

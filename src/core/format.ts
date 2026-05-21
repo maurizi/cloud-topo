@@ -33,12 +33,24 @@ import type { DType } from "./types";
 // "CTPO" packed as little-endian u32. C=0x43 T=0x54 P=0x50 O=0x4F.
 export const MAGIC = 0x4f505443;
 
-// v1.0.0 — major in the high byte so a parser can hard-fail on byte 8.
-export const VERSION_MAJOR = 1;
+// v2.0.0 — major in the high byte so a parser can hard-fail on byte 8.
+// The v2 format adds the partitioned arc_offsets / arc_endpoints
+// sections; a v1 reader can't make sense of those, so v2 files carry
+// major 2 to make pre-v2 readers reject them cleanly rather than
+// silently misread. This build still *reads* v1 files (see
+// MIN_READABLE_VERSION_MAJOR) — the new sections are optional and the
+// reader falls back when they're absent.
+export const VERSION_MAJOR = 2;
 export const VERSION_MINOR = 0;
 export const VERSION_PATCH = 0;
 export const VERSION =
   (VERSION_MAJOR << 24) | (VERSION_MINOR << 16) | (VERSION_PATCH & 0xffff);
+
+// Oldest major this build can read. Files with a major in
+// [MIN_READABLE_VERSION_MAJOR, VERSION_MAJOR] are accepted; anything
+// outside that range is rejected by parseFrontHeader. Bump this only
+// when a format generation can no longer be read at all.
+export const MIN_READABLE_VERSION_MAJOR = 1;
 
 // Front header is fixed-size: magic (4) + version (4) + reserved (8) = 16 B.
 // Section table + META live in the footer — see the layout block above.
