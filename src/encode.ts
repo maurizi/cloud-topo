@@ -70,6 +70,10 @@ export {
   invertPermutation,
 } from "./encode-arcs";
 export type { LayerCsrForOrder, SpatialSort } from "./encode-arcs";
+// Inverse of encodeContainer — reconstructs a Topology from a container's
+// bytes. Lives on the same Node-only subpath so callers re-encoding a file
+// (`encodeContainer(decodeContainer(bytes))`) import both from "cloud-topo/encode".
+export { decodeContainer } from "./decode";
 import {
   buildLayerCSR,
   buildPropertySection,

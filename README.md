@@ -86,6 +86,22 @@ await rewriteContainer("input.ctopo", "output.ctopo", [
 
 Non-overridden sections pass through byte-for-byte; only the named properties are re-encoded and re-compressed.
 
+### Decoding a container back to TopoJSON
+
+`decodeContainer` is the inverse of `encodeContainer` — it reconstructs the full TopoJSON `Topology` (transform, bbox, arcs, and per-layer `GeometryCollection`s with properties) from a container's bytes:
+
+```ts
+import { readFileSync } from "fs";
+import { decodeContainer, encodeContainer } from "cloud-topo/encode";
+
+const topology = decodeContainer(readFileSync("input.ctopo"));
+
+// e.g. re-encode a container after editing it in TopoJSON form:
+const buf = await encodeContainer(topology);
+```
+
+Note that the encoder renumbers arc ids for spatial locality, so a decoded-then-re-encoded container is geometrically identical but not byte-identical to the original. Like the rest of this entrypoint it is Node-only.
+
 ## Browser setup
 
 `CtopoClient` runs its network, decompression, and merge work in a Web Worker, backed by a WASM zstd decoder. Two things to know for browser builds:
@@ -158,6 +174,7 @@ All values are little-endian. Opening a container is two parallel Range GETs: a 
 | Export                                                | Description                                                                                                               |
 |-------------------------------------------------------|---------------------------------------------------------------------------------------------------------------------------|
 | `encodeContainer(topology, opts?)`                    | TopoJSON → `.ctopo` Buffer                                                                                                |
+| `decodeContainer(bytes)`                              | `.ctopo` bytes → TopoJSON `Topology` (inverse of `encodeContainer`)                                                       |
 | `writeContainer(path, topology, opts?)`               | Encode and write to file                                                                                                  |
 | `rewriteContainer(inPath, outPath, overrides, opts?)` | Mutate named property sections in an existing container; `opts.frontLoadedSectionNames` adds extras to the front-load set |
 
