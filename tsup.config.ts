@@ -31,16 +31,26 @@ export default defineConfig({
   target: "es2022",
   splitting: true,
   treeshake: true,
-  // Copy the wasm asset alongside the bundled chunks. The runtime
-  // resolves it via `new URL("./ctopo_zstd_decoder_bg.wasm",
-  // import.meta.url)` — esbuild leaves that pattern alone, so the
-  // file just needs to land in dist/ next to the importing chunk.
-  // Browsers then stream-compile via fetch + instantiateStreaming;
-  // Node reads the bytes via fs (see src/zstd-wasm/index.ts).
+  // Copy the wasm assets alongside the bundled chunks. The runtime
+  // resolves them via `new URL("./<name>.wasm", import.meta.url)` —
+  // esbuild leaves that pattern alone, so the files just need to land
+  // in dist/ next to the importing chunk. Browsers then stream-compile
+  // via fetch + instantiateStreaming; Node reads the bytes via fs (see
+  // src/core/zstd-wasm/index.ts).
+  //
+  // BOTH variants must ship: the shared-memory build drives the SAB
+  // sub-worker path, and the "plain" build is the in-process fallback
+  // used whenever the page isn't cross-origin isolated (see
+  // core/zstd-wasm/plain-decoder.ts). Omitting the plain wasm leaves a
+  // consuming bundler's `new URL(...plain_bg.wasm)` pointing at a
+  // missing file, so it's never emitted and 404s at runtime on any
+  // non-COI page.
   onSuccess: async () => {
-    copyFileSync(
-      "src/core/zstd-wasm/ctopo_zstd_decoder_bg.wasm",
-      "dist/ctopo_zstd_decoder_bg.wasm",
-    );
+    for (const name of [
+      "ctopo_zstd_decoder_bg.wasm",
+      "ctopo_zstd_decoder_plain_bg.wasm",
+    ]) {
+      copyFileSync(`src/core/zstd-wasm/${name}`, `dist/${name}`);
+    }
   },
 });

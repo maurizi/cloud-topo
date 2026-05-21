@@ -50,8 +50,13 @@ import type {
   ViewSpec,
 } from "./merge-wire";
 
-function resolveComputeWorkerUrl(): string {
-  return new URL("./merge-worker.js", import.meta.url).href;
+// Variable (not an inline literal) so bundlers don't emit merge-worker.js
+// as a dead static asset; the literal lives in the `new Worker(new URL(…))`
+// thunk at the spawn site, which is what bundlers detect and bundle.
+const MERGE_WORKER_ENTRY = "./merge-worker.js";
+
+function resolveComputeWorkerUrl(): URL {
+  return new URL(MERGE_WORKER_ENTRY, import.meta.url);
 }
 
 function abortError(signal: AbortSignal): Error {
@@ -227,10 +232,23 @@ export class MergePool {
     for (const input of inputs) {
       let specP = layerCache.get(input.layer);
       if (specP === undefined) {
+        // The CSR spec is cached per (core, layer) and shared across all
+        // merges, so it must NOT be tied to one merge's abort signal —
+        // otherwise aborting the first merge rejects this promise and poisons
+        // the cache for every later merge on the layer. layerGeometry itself
+        // is cached on the core, so the fetch happens once regardless; a
+        // merge's own abort is enforced by withAbort on its prep/post phases.
         specP = (async (): Promise<CsrSpec> => {
-          const csr = await core.layerGeometry(input.layer, signal);
+          const csr = await core.layerGeometry(input.layer);
           return sabCsrSpecFrom(csr);
         })();
+        // Don't let a transient failure stick in the cache — evict so the
+        // next merge retries instead of inheriting the rejection.
+        specP.catch(() => {
+          if (layerCache.get(input.layer) === specP) {
+            layerCache.delete(input.layer);
+          }
+        });
         layerCache.set(input.layer, specP);
       }
       csrSpecPromises.push(specP);
@@ -545,10 +563,16 @@ export class MergePool {
   }
 
   private async spawn(): Promise<void> {
-    const url = resolveComputeWorkerUrl();
+    const nodeUrl = resolveComputeWorkerUrl();
     for (let i = 0; i < this.size; i++) {
       const slotIdx = i;
-      const handle = await spawnWorker(url);
+      const handle = await spawnWorker(
+        () =>
+          new Worker(new URL("./merge-worker.js", import.meta.url), {
+            type: "module",
+          }) as unknown as WorkerHandle,
+        nodeUrl,
+      );
       let resolveReady!: () => void;
       const ready = new Promise<void>((resolve, reject) => {
         resolveReady = resolve;

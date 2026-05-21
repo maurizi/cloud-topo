@@ -22,7 +22,7 @@
 
 import { type CtopoClientStats } from "../core/client";
 import { type FetcherSpec } from "../core/fetcher";
-import { spawnWorker } from "../core/worker-host";
+import { spawnWorker, type WorkerHandle } from "../core/worker-host";
 import {
   StringArray,
   type ContainerMeta,
@@ -122,6 +122,14 @@ function makeClientId(): number {
   return Math.floor(Math.random() * Number.MAX_SAFE_INTEGER);
 }
 
+// Worker entry filename for the `worker_threads` (Node) spawn path.
+// Deliberately a variable, not an inline literal: `new URL(<literal>,
+// import.meta.url)` is an asset reference bundlers eagerly emit, which
+// would re-introduce the orphaned dead-copy of worker.js. Indirecting
+// through this const keeps the file out of the bundler's asset graph
+// while still resolving correctly at Node runtime.
+const WORKER_ENTRY = "./worker.js";
+
 export class CtopoClient {
   readonly meta: ContainerMeta;
   readonly sections: ReadonlyArray<SectionEntry>;
@@ -188,14 +196,34 @@ export class CtopoClient {
       port.start?.();
     } else if (opts.worker !== undefined) {
       port = opts.worker as unknown as PortLike;
-    } else {
+    } else if (opts.workerUrl !== undefined) {
+      // Caller-supplied path (CDN / custom dev server). A runtime URL —
+      // not a static literal — so the browser branch spawns straight
+      // from it and bundlers leave it alone.
       const workerUrl =
-        opts.workerUrl !== undefined
-          ? typeof opts.workerUrl === "string"
-            ? opts.workerUrl
-            : opts.workerUrl.href
-          : new URL("./worker.js", import.meta.url).href;
-      port = (await spawnWorker(workerUrl)) as unknown as PortLike;
+        typeof opts.workerUrl === "string"
+          ? opts.workerUrl
+          : opts.workerUrl.href;
+      port = (await spawnWorker(
+        () =>
+          new Worker(workerUrl, { type: "module" }) as unknown as WorkerHandle,
+        workerUrl,
+      )) as unknown as PortLike;
+    } else {
+      // Default path. The literal `new Worker(new URL("./worker.js",
+      // import.meta.url), …)` is what lets a consuming bundler bundle
+      // the worker's whole module graph (its shared chunks, the merge/
+      // zstd sub-workers it spawns, and the decoder wasm). `nodeWorkerUrl`
+      // is built from a variable so the same bundler doesn't *also* emit
+      // worker.js as a dead static asset. See `spawnWorker`.
+      const nodeWorkerUrl = new URL(WORKER_ENTRY, import.meta.url);
+      port = (await spawnWorker(
+        () =>
+          new Worker(new URL("./worker.js", import.meta.url), {
+            type: "module",
+          }) as unknown as WorkerHandle,
+        nodeWorkerUrl,
+      )) as unknown as PortLike;
     }
 
     const clientId = makeClientId();

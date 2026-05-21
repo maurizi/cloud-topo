@@ -104,6 +104,17 @@ function effectivePoolSize(requested: number | null): number | null {
   return 1;
 }
 
+// Pool size when the caller doesn't specify one (`pool` undefined). Default to
+// parallelizing merges across available cores (capped — diminishing returns +
+// per-worker spawn/CSR-ship overhead past ~8). effectivePoolSize clamps this
+// back to inline when SAB isn't usable, so returning >1 here is safe; callers
+// who want to force the inline path pass `pool: null`.
+function defaultPoolSize(): number {
+  const hc = (globalThis as { navigator?: { hardwareConcurrency?: number } })
+    .navigator?.hardwareConcurrency;
+  return typeof hc === "number" && hc > 1 ? Math.min(hc, 8) : 4;
+}
+
 // One pool per coordinator. Lazily created on first merge call from
 // a client that opened with `pool.size > 1`.
 let mergePool: MergePool | null = null;
@@ -218,10 +229,15 @@ async function dispatch(
         const fetcher = reconstructFetcher(msg.args.fetcher);
         const opts: OpenContainerOptions = { ...msg.args.opts, signal };
         const core = await CtopoCore.openWith(fetcher, opts);
+        // Pool selection: unspecified → smart default (auto-pool under SAB);
+        // explicit null → inline; explicit { size } → that size. All clamped
+        // to inline by effectivePoolSize when SAB isn't usable.
         const requestedPoolSize =
-          msg.args.opts.pool === null || msg.args.opts.pool === undefined
-            ? null
-            : msg.args.opts.pool.size;
+          msg.args.opts.pool === undefined
+            ? defaultPoolSize()
+            : msg.args.opts.pool === null
+              ? 1
+              : msg.args.opts.pool.size;
         const poolSize = effectivePoolSize(requestedPoolSize);
         entry = { core, url: msg.args.url, refcount: 0, poolSize };
         byUrl.set(msg.args.url, entry);

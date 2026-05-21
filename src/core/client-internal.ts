@@ -8,6 +8,7 @@
  */
 
 import { type FetchPriority } from "./fetcher";
+import { retainDecodeSource } from "./reader";
 
 // --- Byte-range fetch/coalesce internal types ---
 
@@ -188,10 +189,13 @@ export function viewU32WithDelta(
   delta: boolean,
 ): Uint32Array {
   if (!delta)
-    return new Uint32Array(
-      bytes.buffer,
-      bytes.byteOffset,
-      bytes.byteLength / 4,
+    // View over the (possibly wasm-heap) decode source — pin the source so
+    // its FinalizationRegistry-driven free can't run while this view is live.
+    // See retainDecodeSource. (The delta branch below returns a fresh copy,
+    // which is independent of the source, so it needs no retain.)
+    return retainDecodeSource(
+      new Uint32Array(bytes.buffer, bytes.byteOffset, bytes.byteLength / 4),
+      bytes,
     );
   const src = new Uint32Array(
     bytes.buffer,

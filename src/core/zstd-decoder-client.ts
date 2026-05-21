@@ -49,11 +49,17 @@ import { spawnWorker, type WorkerHandle } from "./worker-host";
 import { loadZstdWasmBytes } from "./zstd-wasm";
 import { copyView } from "./util";
 
-// Worker file URL resolver — bundled dist/ keeps the worker as a
-// sibling of this module; src/-loaded test runs fall through to the
-// pretest-built dist/.
+// Node/`worker_threads` worker file URL resolver — bundled dist/ keeps
+// the worker as a sibling of this module; src/-loaded test runs fall
+// through to the pretest-built dist/. The browser/bundler path doesn't
+// come through here: it spawns via the literal `new Worker(new URL(…))`
+// thunk at the call site (the only form bundlers detect and bundle).
+// Entry paths are kept in variables so bundlers don't also emit
+// zstd-worker.js as a dead static asset.
+const ZSTD_WORKER_ENTRY = "./zstd-worker.js";
+const ZSTD_WORKER_ENTRY_FROM_SRC = "../../dist/zstd-worker.js";
 async function resolveZstdWorkerUrl(): Promise<string> {
-  const sibling = new URL("./zstd-worker.js", import.meta.url);
+  const sibling = new URL(ZSTD_WORKER_ENTRY, import.meta.url);
   // Browser / bundler: the worker is emitted next to this chunk.
   if (sibling.protocol !== "file:") return sibling.href;
   const fs = await import("node:fs");
@@ -63,7 +69,7 @@ async function resolveZstdWorkerUrl(): Promise<string> {
   // we never rewrite a real dist/ sibling into a bogus dist/dist/ path
   // for an installed package.
   if (sibling.pathname.includes("/src/")) {
-    return new URL("../../dist/zstd-worker.js", import.meta.url).href;
+    return new URL(ZSTD_WORKER_ENTRY_FROM_SRC, import.meta.url).href;
   }
   return sibling.href;
 }
@@ -224,8 +230,14 @@ class ZstdDecoderClient {
   }
 
   private async spawnOne(slot: number): Promise<WorkerState> {
-    const url = await resolveZstdWorkerUrl();
-    const handle = await spawnWorker(url);
+    const nodeUrl = await resolveZstdWorkerUrl();
+    const handle = await spawnWorker(
+      () =>
+        new Worker(new URL("./zstd-worker.js", import.meta.url), {
+          type: "module",
+        }) as unknown as WorkerHandle,
+      nodeUrl,
+    );
     let resolveReady!: () => void;
     let rejectReady!: (err: Error) => void;
     const ready = new Promise<void>((resolve, reject) => {

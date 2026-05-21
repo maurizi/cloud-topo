@@ -260,50 +260,67 @@ type TypedArray =
   | Uint32Array
   | Float64Array;
 
+// The SAB zstd decode returns a Uint8Array view into the decoder's wasm heap
+// and registers a FinalizationRegistry on THAT Uint8Array to free the wasm
+// allocation once it's collected (see zstd-decoder-client.ts). A derived
+// dtype view (Int32Array, Uint32Array, …) aliases the same buffer but does
+// NOT keep the source Uint8Array reachable — so a caller holding only the
+// derived view (e.g. cached layerGeometry.arcRefs) lets the source get GC'd,
+// the wasm region is freed, a later decode reuses it, and the still-live
+// derived view reads corrupted bytes (a silent use-after-free, only on the
+// SAB decode path). Pin the source to each derived view's lifetime via a
+// WeakMap so the free defers until the derived view itself is collected.
+// Harmless on the plain (copy) decode path, which has no registry.
+const decodeSourceRetainer = new WeakMap<ArrayBufferView, Uint8Array>();
+export function retainDecodeSource<T extends ArrayBufferView>(
+  view: T,
+  src: Uint8Array,
+): T {
+  decodeSourceRetainer.set(view, src);
+  return view;
+}
+
 function viewBytesAsDtype(
   sectionBytes: Uint8Array,
   dtype: SectionEntry["dtype"],
 ): TypedArray {
+  const { buffer, byteOffset, byteLength } = sectionBytes;
   switch (dtype) {
     case "i8":
-      return new Int8Array(
-        sectionBytes.buffer,
-        sectionBytes.byteOffset,
-        sectionBytes.byteLength,
+      return retainDecodeSource(
+        new Int8Array(buffer, byteOffset, byteLength),
+        sectionBytes,
       );
     case "u8":
     case "blob":
     case "strings":
+      // Returns the source Uint8Array itself — already keeps the wasm
+      // allocation alive, so no extra retain needed.
       return sectionBytes;
     case "i16":
-      return new Int16Array(
-        sectionBytes.buffer,
-        sectionBytes.byteOffset,
-        sectionBytes.byteLength / 2,
+      return retainDecodeSource(
+        new Int16Array(buffer, byteOffset, byteLength / 2),
+        sectionBytes,
       );
     case "u16":
-      return new Uint16Array(
-        sectionBytes.buffer,
-        sectionBytes.byteOffset,
-        sectionBytes.byteLength / 2,
+      return retainDecodeSource(
+        new Uint16Array(buffer, byteOffset, byteLength / 2),
+        sectionBytes,
       );
     case "i32":
-      return new Int32Array(
-        sectionBytes.buffer,
-        sectionBytes.byteOffset,
-        sectionBytes.byteLength / 4,
+      return retainDecodeSource(
+        new Int32Array(buffer, byteOffset, byteLength / 4),
+        sectionBytes,
       );
     case "u32":
-      return new Uint32Array(
-        sectionBytes.buffer,
-        sectionBytes.byteOffset,
-        sectionBytes.byteLength / 4,
+      return retainDecodeSource(
+        new Uint32Array(buffer, byteOffset, byteLength / 4),
+        sectionBytes,
       );
     case "f64":
-      return new Float64Array(
-        sectionBytes.buffer,
-        sectionBytes.byteOffset,
-        sectionBytes.byteLength / 8,
+      return retainDecodeSource(
+        new Float64Array(buffer, byteOffset, byteLength / 8),
+        sectionBytes,
       );
   }
 }

@@ -116,20 +116,39 @@ interface NodeWorkerThreadsCtor {
   new (url: string | URL): NodeWorker;
 }
 
-// Spawn a Worker from `url` (a `file://` or `http(s)://` URL string).
-// Returns a handle that exposes the browser Worker API even when the
-// underlying implementation is `node:worker_threads.Worker`.
-export async function spawnWorker(url: string | URL): Promise<WorkerHandle> {
-  const browserWorker = (
-    globalThis as unknown as { Worker?: BrowserWorkerCtor }
-  ).Worker;
-  if (browserWorker !== undefined) {
-    return new browserWorker(url, { type: "module" });
+// Spawn a Worker, returning a handle that exposes the browser Worker
+// API even when the underlying implementation is
+// `node:worker_threads.Worker`.
+//
+// `makeBrowserWorker` is invoked when `globalThis.Worker` exists. It
+// MUST be a thunk wrapping the literal
+// `new Worker(new URL("./<entry>.js", import.meta.url), { type: "module" })`
+// at its call site — bundlers (Vite/Rollup/webpack) only recognize a
+// worker (and bundle its module graph, including nested workers + wasm)
+// when that exact syntactic pattern is present. Passing a precomputed
+// URL through here instead defeats detection: the bundler copies the
+// one worker file as an opaque asset and never emits the chunks/sub-
+// workers/wasm it imports, so the worker 404s on load.
+//
+// `nodeUrl` is the file URL used only on the `worker_threads` path. Keep
+// it built from a *non-literal* (a variable), so the same bundlers don't
+// additionally emit the worker as a plain static asset.
+export async function spawnWorker(
+  makeBrowserWorker: () => WorkerHandle,
+  nodeUrl: string | URL,
+): Promise<WorkerHandle> {
+  const hasBrowserWorker =
+    (globalThis as unknown as { Worker?: BrowserWorkerCtor }).Worker !==
+    undefined;
+  if (hasBrowserWorker) {
+    return makeBrowserWorker();
   }
   const wt = (await import("node:worker_threads")) as unknown as {
     Worker: NodeWorkerThreadsCtor;
   };
-  const w = new wt.Worker(typeof url === "string" ? new URL(url) : url);
+  const w = new wt.Worker(
+    typeof nodeUrl === "string" ? new URL(nodeUrl) : nodeUrl,
+  );
   // Browser-API adapter. We track listeners so removeEventListener can
   // find the underlying `on`/`off` callback to unhook. One bucket per
   // event type (keyed by listener within), so the same function
