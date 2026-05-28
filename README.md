@@ -8,7 +8,7 @@ cloud-topo (`.ctopo`) packs a quantized topology — arcs, per-layer geometry, a
 
 It's best for serving large topologies (thousands to millions of features) from static hosting or object storage (S3, GCS, R2) when you need selective operations — merging subsets, reading one property column — without downloading everything.
 
-Hosting behind a CDN that supports **multi-range requests** (multiple byte ranges in one `Range` header, returned as `multipart/byteranges`) lets the client coalesce the disjoint reads a single merge needs into one round trip instead of a dozen. CloudFront supports this; bare S3/GCS/R2 don't. The client falls back to one request per chunk transparently — multi-range is an optimization, not a requirement.
+Hosting behind a CDN that supports **multi-range requests** (multiple byte ranges in one `Range` header, returned as `multipart/byteranges`) lets the client coalesce the disjoint reads a single merge needs into one round trip instead of a dozen. CloudFront supports this; bare S3/GCS/R2 don't. The client falls back to one request per chunk transparently if multi-range is not supported by the server.
 
 ## Installation
 
