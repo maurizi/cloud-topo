@@ -6,18 +6,6 @@ Cloud-optimized binary topology container with HTTP Range support and topojson-c
 
 cloud-topo (`.ctopo`) packs a quantized topology — arcs, per-layer geometry, and per-feature properties — into a single HTTP-Range-friendly binary container. It mirrors the [topojson-client](https://github.com/topojson/topojson-client) API (`merge`, `mergeArcs`, `neighbors`, `bbox`, `transform`) but fetches only the byte ranges each operation needs, so you can work with large topologies straight from object storage without downloading the whole file.
 
-## Why not just use TopoJSON?
-
-|                       | TopoJSON (JSON)                                    | cloud-topo (binary)                                                                           |
-|-----------------------|----------------------------------------------------|-----------------------------------------------------------------------------------------------|
-| **Wire size**         | JSON text; gzip helps but can't beat binary + zstd | Varint-encoded arcs + zstd-compressed sections; typically 30–60% smaller                      |
-| **Load strategy**     | Download entire file, parse all JSON               | Two small Range GETs open the container; subsequent sections fetched on demand                |
-| **Merge performance** | Parse full topology, walk every arc                | Binary arc stitching over pre-indexed CSR geometry; only fetches boundary arcs                |
-| **Property access**   | Parse entire file to read one column               | Column-oriented sections; fetch only the property you need                                    |
-| **Compression**       | gzip on the wire (server-side)                     | Per-section zstd (with shared dictionary for arc blocks) or Brotli; client-side decompression |
-
-[Benchmarking](https://github.com/maurizi/cloud-topo-bench) against all US census blocks, block groups, counties and states; the `.topojson` file was 4.8gb and the equivalent `.ctopo` file 1.2gb. Running a `merge` operation to recover US congressional districts from their [block-equivalency files](https://www.census.gov/geographies/mapping-files/2025/dec/rdo/119-congressional-district-bef.html) took 15s and consumed ~190mb.
-
 It's best for serving large topologies (thousands to millions of features) from static hosting or object storage (S3, GCS, R2) when you need selective operations — merging subsets, reading one property column — without downloading everything.
 
 Hosting behind a CDN that supports **multi-range requests** (multiple byte ranges in one `Range` header, returned as `multipart/byteranges`) lets the client coalesce the disjoint reads a single merge needs into one round trip instead of a dozen. CloudFront supports this; bare S3/GCS/R2 don't. The client falls back to one request per chunk transparently — multi-range is an optimization, not a requirement.
@@ -108,6 +96,18 @@ Note that the encoder renumbers arc ids for spatial locality, so a decoded-then-
 
 - **Bundling.** The worker and `.wasm` load as sibling assets via `new URL(…, import.meta.url)`. Vite, webpack 5, Rollup, esbuild, and Parcel handle this automatically. Loading raw from a CDN requires `worker.js`, the zstd worker chunks, and the `.wasm` files to sit alongside the entry (all shipped in `dist/`). Pass `workerUrl` to `open` to point elsewhere.
 - **Cross-origin isolation.** The fast path uses `SharedArrayBuffer` for multi-threaded performance, which a browser only allows on a [cross-origin isolated](https://developer.mozilla.org/en-US/docs/Web/API/Window/crossOriginIsolated) page — served with `Cross-Origin-Opener-Policy: same-origin`. **This is optional:** without it, cloud-topo automatically falls back to a slower single-worker.
+
+## Why not just use TopoJSON?
+
+|                       | TopoJSON (JSON)                                    | cloud-topo (binary)                                                                           |
+|-----------------------|----------------------------------------------------|-----------------------------------------------------------------------------------------------|
+| **Wire size**         | JSON text; gzip helps but can't beat binary + zstd | Varint-encoded arcs + zstd-compressed sections; typically 30–60% smaller                      |
+| **Load strategy**     | Download entire file, parse all JSON               | Two small Range GETs open the container; subsequent sections fetched on demand                |
+| **Merge performance** | Parse full topology, walk every arc                | Binary arc stitching over pre-indexed CSR geometry; only fetches boundary arcs                |
+| **Property access**   | Parse entire file to read one column               | Column-oriented sections; fetch only the property you need                                    |
+| **Compression**       | gzip on the wire (server-side)                     | Per-section zstd (with shared dictionary for arc blocks) or Brotli; client-side decompression |
+
+[Benchmarking](https://github.com/maurizi/cloud-topo-bench) against all US census blocks, block groups, counties and states; the `.topojson` file was 4.8gb and the equivalent `.ctopo` file 1.2gb. Running a `merge` operation to recover US congressional districts from their [block-equivalency files](https://www.census.gov/geographies/mapping-files/2025/dec/rdo/119-congressional-district-bef.html) took 15s and consumed ~190mb.
 
 ## File format
 
